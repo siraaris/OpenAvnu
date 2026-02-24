@@ -58,6 +58,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define OPENAVB_AECP_MESSAGE_TYPE_EXTENDED_COMMAND (14)
 #define OPENAVB_AECP_MESSAGE_TYPE_EXTENDED_RESPONSE (15)
 
+#define OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS (62)
+
 // status field IEEE Std 1722.1-2013 clause 9.2.1.1.6
 #define OPENAVB_AECP_STATUS_SUCCESS (0)
 #define OPENAVB_AECP_STATUS_NOT_IMPLEMENTED (1)
@@ -325,6 +327,79 @@ typedef struct {
 	U16 descriptor_index;
 } openavb_aecp_commandresponse_data_stop_streaming_t;
 
+// GET_AVB_INFO command IEEE Std 1722.1-2013 clause 7.4.40
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+} openavb_aecp_command_data_get_avb_info_t;
+
+// GET_AVB_INFO response IEEE Std 1722.1-2013 clause 7.4.40
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U8 as_grandmaster_id[8];
+	U32 propagation_delay;
+	U8 as_domain_number;
+	U8 flags;
+	U16 msrp_mappings_count;
+	U8 msrp_mappings[64];
+	U16 msrpMappingsCount;		// Not part of spec. Used to track elements in arrays.
+} openavb_aecp_response_data_get_avb_info_t;
+
+// GET_AS_PATH command IEEE Std 1722.1-2013 clause 7.4.41
+typedef struct {
+	U16 descriptor_index;
+	U16 reserved;
+} openavb_aecp_command_data_get_as_path_t;
+
+// GET_AS_PATH response IEEE Std 1722.1-2013 clause 7.4.41
+typedef struct {
+	U16 descriptor_index;
+	U16 as_path_count;
+	U32 path_latency;
+	U8 as_path[64];
+	U16 asPathCount;			// Not part of spec. Used to track elements in arrays.
+} openavb_aecp_response_data_get_as_path_t;
+
+// GET_MAX_TRANSIT_TIME command IEEE Std 1722.1-2013 clause 7.4.43
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+} openavb_aecp_command_data_get_max_transit_time_t;
+
+// GET_MAX_TRANSIT_TIME response IEEE Std 1722.1-2013 clause 7.4.43
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U64 max_transit_time;
+} openavb_aecp_response_data_get_max_transit_time_t;
+
+typedef struct {
+	U16 mapping_stream_index;
+	U16 mapping_stream_channel;
+	U16 mapping_cluster_offset;
+	U16 mapping_cluster_channel;
+} openavb_aecp_audio_mapping_t;
+
+// GET_AUDIO_MAP command IEEE Std 1722.1-2013 clause 7.4.46
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 map_index;
+} openavb_aecp_command_data_get_audio_map_t;
+
+// GET_AUDIO_MAP response IEEE Std 1722.1-2013 clause 7.4.46
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 map_index;
+	U16 number_of_maps;
+	U16 number_of_mappings;
+	U16 reserved;
+	openavb_aecp_audio_mapping_t mappings[OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS];
+	U16 mappingsCount;		// Not part of spec. Used to track elements in arrays.
+} openavb_aecp_response_data_get_audio_map_t;
+
 // GET_COUNTERS command IEEE Std 1722.1-2013 clause 7.4.42
 typedef struct {
 	U16 descriptor_type;
@@ -379,6 +454,14 @@ typedef struct {
 		openavb_aecp_commandresponse_data_start_streaming_t startStreamingRsp;
 		openavb_aecp_commandresponse_data_stop_streaming_t stopStreamingCmd;
 		openavb_aecp_commandresponse_data_stop_streaming_t stopStreamingRsp;
+		openavb_aecp_command_data_get_avb_info_t getAvbInfoCmd;
+		openavb_aecp_response_data_get_avb_info_t getAvbInfoRsp;
+		openavb_aecp_command_data_get_as_path_t getAsPathCmd;
+		openavb_aecp_response_data_get_as_path_t getAsPathRsp;
+		openavb_aecp_command_data_get_max_transit_time_t getMaxTransitTimeCmd;
+		openavb_aecp_response_data_get_max_transit_time_t getMaxTransitTimeRsp;
+		openavb_aecp_command_data_get_audio_map_t getAudioMapCmd;
+		openavb_aecp_response_data_get_audio_map_t getAudioMapRsp;
 		openavb_aecp_command_data_get_counters_t getCountersCmd;
 		openavb_aecp_response_data_get_counters_t getCountersRsp;
 	} command_data;

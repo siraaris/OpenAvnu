@@ -460,6 +460,19 @@ extern DLL_EXPORT bool openavbAvdeccInitialize()
 	return TRUE;
 }
 
+openavb_tl_data_cfg_t *openavbAvdeccGetStreamCfg(U16 streamIndex)
+{
+	openavb_avdecc_configuration_cfg_t *pCfg = pFirstConfigurationCfg;
+	while (pCfg) {
+		if (streamIndex == 0) {
+			return pCfg->stream;
+		}
+		streamIndex--;
+		pCfg = pCfg->next;
+	}
+	return NULL;
+}
+
 // Start the AVDECC protocols.
 extern DLL_EXPORT bool openavbAvdeccStart()
 {

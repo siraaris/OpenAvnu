@@ -97,6 +97,8 @@ U8 openavbAecpCommandGetCountersHandler(
 	pRsp->counters_valid = 0;
 	pRsp->counters_block_length = 128;
 	memset(pRsp->counters_block, 0, sizeof(pRsp->counters_block));
+	pRsp->descriptor_type = pCmd->descriptor_type;
+	pRsp->descriptor_index = pCmd->descriptor_index;
 
 	if (pCmd->descriptor_type == OPENAVB_AEM_DESCRIPTOR_ENTITY) {
 		openavb_aem_descriptor_entity_t *pDescriptorEntity = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pCmd->descriptor_type, pCmd->descriptor_index);
@@ -214,6 +216,15 @@ U8 openavbAecpCommandGetCountersHandler(
 				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_FRAMES_TX]) = htonl(value);
 			}
 			GetEntitySpecificCounters(pDescriptorStreamInput, OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRsp);
+
+			result = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+		}
+	}
+	else if (pCmd->descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		openavb_aem_descriptor_stream_io_t *pDescriptorStreamOutput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pCmd->descriptor_type, pCmd->descriptor_index);
+		if (pDescriptorStreamOutput) {
+			// No stream output counters available yet. Return success with empty counter block.
+			GetEntitySpecificCounters(pDescriptorStreamOutput, OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT, pRsp);
 
 			result = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
 		}

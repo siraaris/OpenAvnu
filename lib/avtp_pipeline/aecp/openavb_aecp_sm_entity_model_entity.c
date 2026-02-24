@@ -50,6 +50,11 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_aecp_sm_entity_model_entity.h"
 #include "openavb_list.h"
 
+#include "openavb_descriptor_avb_interface_pub.h"
+#include "openavb_descriptor_stream_port_io_pub.h"
+#include "openavb_grandmaster_osal_pub.h"
+#include "openavb_avdecc_pub.h"
+
 #include "openavb_avdecc_pipeline_interaction_pub.h"
 #include "openavb_aecp_cmd_get_counters.h"
 
@@ -1063,8 +1068,52 @@ void processCommand()
 		case OPENAVB_AEM_COMMAND_CODE_IDENTIFY_NOTIFICATION:
 			break;
 		case OPENAVB_AEM_COMMAND_CODE_GET_AVB_INFO:
+			{
+				openavb_aecp_command_data_get_avb_info_t *pCmd = &pCommand->entityModelPdu.command_data.getAvbInfoCmd;
+				openavb_aecp_response_data_get_avb_info_t *pRsp = &pCommand->entityModelPdu.command_data.getAvbInfoRsp;
+				U16 descriptor_type = pCmd->descriptor_type;
+				U16 descriptor_index = pCmd->descriptor_index;
+				memset(pRsp, 0, sizeof(*pRsp));
+				pRsp->descriptor_type = descriptor_type;
+				pRsp->descriptor_index = descriptor_index;
+				pRsp->msrp_mappings_count = 0;
+				pRsp->msrpMappingsCount = 0;
+
+				openavb_aem_descriptor_avb_interface_t *pDescriptorAvbInterface =
+					openavbAemGetDescriptor(openavbAemGetConfigIdx(), descriptor_type, descriptor_index);
+				if (pDescriptorAvbInterface) {
+					uint8_t domain_number = 0;
+					if (osalAVBGrandmasterGetCurrent(pRsp->as_grandmaster_id, &domain_number)) {
+						pRsp->as_domain_number = domain_number;
+						pRsp->flags |= OPENAVB_AEM_GET_AVB_INFO_COMMAND_GPTP_ENABLED;
+					}
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+				}
+				else {
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_NO_SUCH_DESCRIPTOR;
+				}
+			}
 			break;
 		case OPENAVB_AEM_COMMAND_CODE_GET_AS_PATH:
+			{
+				openavb_aecp_command_data_get_as_path_t *pCmd = &pCommand->entityModelPdu.command_data.getAsPathCmd;
+				openavb_aecp_response_data_get_as_path_t *pRsp = &pCommand->entityModelPdu.command_data.getAsPathRsp;
+				U16 descriptor_index = pCmd->descriptor_index;
+				memset(pRsp, 0, sizeof(*pRsp));
+				pRsp->descriptor_index = descriptor_index;
+				pRsp->as_path_count = 0;
+				pRsp->path_latency = 0;
+				pRsp->asPathCount = 0;
+
+				openavb_aem_descriptor_avb_interface_t *pDescriptorAvbInterface =
+					openavbAemGetDescriptor(openavbAemGetConfigIdx(), OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, descriptor_index);
+				if (pDescriptorAvbInterface) {
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+				}
+				else {
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_NO_SUCH_DESCRIPTOR;
+				}
+			}
 			break;
 		case OPENAVB_AEM_COMMAND_CODE_GET_COUNTERS:
 			{
@@ -1073,9 +1122,56 @@ void processCommand()
 				pCommand->headers.status = openavbAecpCommandGetCountersHandler(pCmd, pRsp);
 			}
 			break;
-		case OPENAVB_AEM_COMMAND_CODE_REBOOT:
+		case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME:
+		case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021:
+			{
+				openavb_aecp_command_data_get_max_transit_time_t *pCmd = &pCommand->entityModelPdu.command_data.getMaxTransitTimeCmd;
+				openavb_aecp_response_data_get_max_transit_time_t *pRsp = &pCommand->entityModelPdu.command_data.getMaxTransitTimeRsp;
+				U16 descriptor_type = pCmd->descriptor_type;
+				U16 descriptor_index = pCmd->descriptor_index;
+				memset(pRsp, 0, sizeof(*pRsp));
+				pRsp->descriptor_type = descriptor_type;
+				pRsp->descriptor_index = descriptor_index;
+				{
+					openavb_tl_data_cfg_t *pStreamCfg = openavbAvdeccGetStreamCfg(descriptor_index);
+					if (pStreamCfg) {
+						pRsp->max_transit_time = (U64)pStreamCfg->max_transit_usec * 1000ULL;
+					}
+					else {
+						pRsp->max_transit_time = 0;
+					}
+				}
+
+				(void)descriptor_type;
+				pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+			}
 			break;
 		case OPENAVB_AEM_COMMAND_CODE_GET_AUDIO_MAP:
+			{
+				openavb_aecp_command_data_get_audio_map_t *pCmd = &pCommand->entityModelPdu.command_data.getAudioMapCmd;
+				openavb_aecp_response_data_get_audio_map_t *pRsp = &pCommand->entityModelPdu.command_data.getAudioMapRsp;
+				U16 descriptor_type = pCmd->descriptor_type;
+				U16 descriptor_index = pCmd->descriptor_index;
+				U16 map_index = pCmd->map_index;
+				memset(pRsp, 0, sizeof(*pRsp));
+				pRsp->descriptor_type = descriptor_type;
+				pRsp->descriptor_index = descriptor_index;
+				pRsp->map_index = map_index;
+				pRsp->number_of_maps = 0;
+				pRsp->number_of_mappings = 0;
+				pRsp->reserved = 0;
+				pRsp->mappingsCount = 0;
+
+				openavb_aem_descriptor_stream_port_io_t *pDescriptorStreamPort =
+					openavbAemGetDescriptor(openavbAemGetConfigIdx(), descriptor_type, descriptor_index);
+				if (pDescriptorStreamPort) {
+					pRsp->number_of_maps = pDescriptorStreamPort->number_of_maps;
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+				}
+				else {
+					pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_NO_SUCH_DESCRIPTOR;
+				}
+			}
 			break;
 		case OPENAVB_AEM_COMMAND_CODE_ADD_AUDIO_MAPPINGS:
 			break;
