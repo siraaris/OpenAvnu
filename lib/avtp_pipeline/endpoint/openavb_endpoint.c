@@ -486,7 +486,7 @@ int avbEndpointLoop(void)
 			break;
 		}
 
-		if (!openavbShaperInitialize(x_cfg.ifname, x_cfg.shaperPort)) {
+		if (!openavbShaperInitialize(x_cfg.ifname, x_cfg.shaperPort, x_cfg.link_kbit)) {
 			AVB_LOG_ERROR("Failed to initialize Shaper");
 			openavbMaapFinalize();
 			openavbQmgrFinalize();
