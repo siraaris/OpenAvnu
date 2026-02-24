@@ -370,9 +370,10 @@ bool openavbEptSrvrStopStream(int h, AVBStreamID_t *streamID)
 
 	clientStream_t *ps = findStream(streamID);
 	if (!ps || ps->clientHandle != h) {
-		AVB_LOGF_ERROR("Error stopping client: missing record for stream %d", streamID->uniqueID);
+		// Benign: client may send a stop after the server already removed the stream.
+		AVB_LOGF_WARNING("Stop request for unknown stream %d (client %d)", streamID->uniqueID, h);
 		AVB_TRACE_EXIT(AVB_TRACE_ENDPOINT);
-		return FALSE;
+		return TRUE;
 	}
 
 	bool rc = FALSE;
@@ -416,4 +417,3 @@ void openavbEptSrvrCloseClientConnection(int h)
 	}
 	AVB_TRACE_EXIT(AVB_TRACE_ENDPOINT);
 }
-
