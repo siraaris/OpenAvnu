@@ -40,6 +40,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_platform.h"
 
 #include <signal.h>
+#include <errno.h>
 
 #define	AVB_LOG_COMPONENT	"ACMP"
 #include "openavb_log.h"
@@ -65,6 +66,19 @@ static openavb_acmp_ACMPCommandResponse_t *pRcvdCmdResp = &rcvdCmdResp;
 static openavb_acmp_sm_talker_vars_t openavbAcmpSMTalkerVars = {0};
 static bool bRunning = FALSE;
 
+static bool openavbAcmpSMTalkerCanQueueCmd(const openavb_acmp_ACMPCommandResponse_t *command, const char *cmdName)
+{
+	if (!command) {
+		AVB_LOGF_WARNING("Ignoring %s: null command", cmdName);
+		return FALSE;
+	}
+	if (!bRunning) {
+		AVB_LOGF_DEBUG("Ignoring %s: talker state machine not running", cmdName);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 extern MUTEX_HANDLE(openavbAcmpMutex);
 #define ACMP_LOCK() { MUTEX_CREATE_ERR(); MUTEX_LOCK(openavbAcmpMutex); MUTEX_LOG_ERR("Mutex lock failure"); }
 #define ACMP_UNLOCK() { MUTEX_CREATE_ERR(); MUTEX_UNLOCK(openavbAcmpMutex); MUTEX_LOG_ERR("Mutex unlock failure"); }
@@ -76,6 +90,24 @@ static MUTEX_HANDLE(openavbAcmpSMTalkerMutex);
 SEM_T(openavbAcmpSMTalkerSemaphore);
 THREAD_TYPE(openavbAcmpSmTalkerThread);
 THREAD_DEFINITON(openavbAcmpSmTalkerThread);
+
+static bool openavbAcmpSMTalkerPostSemaphoreLocked(const char *cmdName)
+{
+	SEM_ERR_T(err);
+	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
+	if (SEM_IS_ERR_NONE(err)) {
+		return TRUE;
+	}
+
+	// During stop, semaphore teardown can race with asynchronous ACMP callbacks.
+	// Avoid logging through the generic macro path that has crashed on teardown.
+	if (!bRunning) {
+		AVB_LOGF_DEBUG("Ignoring %s semaphore post failure during shutdown: ret=%d errno=%d", cmdName, err, errno);
+		return FALSE;
+	}
+	AVB_LOGF_WARNING("%s semaphore post failed: ret=%d errno=%d", cmdName, err, errno);
+	return FALSE;
+}
 
 
 openavb_list_node_t openavbAcmpSMTalker_findListenerPairNodeFromCommand(openavb_acmp_ACMPCommandResponse_t *command)
@@ -118,26 +150,47 @@ bool openavbAcmpSMTalker_validTalkerUnique(U16 talkerUniqueId)
 	return TRUE;
 }
 
-U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command)
+U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command, bool *pDeferredResponse)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
 	U8 retStatus = OPENAVB_ACMP_STATUS_TALKER_MISBEHAVING;
+	if (pDeferredResponse) {
+		*pDeferredResponse = FALSE;
+	}
 
 	openavb_acmp_TalkerStreamInfo_t *pTalkerStreamInfo = openavbArrayDataIdx(openavbAcmpSMTalkerVars.talkerStreamInfos, command->talker_unique_id);
 	if (pTalkerStreamInfo) {
 		openavb_list_node_t node = openavbAcmpSMTalker_findListenerPairNodeFromCommand(command);
 		if (node) {
-			if (memcmp(pTalkerStreamInfo->stream_id, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) == 0 ||
-					memcmp(pTalkerStreamInfo->stream_dest_mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
-				// In the process of connecting.  Ignore this, as we don't yet have a response.
-				AVB_LOG_INFO("Ignoring duplicate CONNECT_TX_COMMAND");
-				retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
+			// Refresh stream state from the talker side in case async update delivery is delayed.
+			U16 configIdx = openavbAemGetConfigIdx();
+			openavb_aem_descriptor_stream_io_t *pDescriptorStreamOutput =
+				openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT, command->talker_unique_id);
+			if (pDescriptorStreamOutput) {
+				openavbAVDECCGetTalkerStreamInfo(pDescriptorStreamOutput, configIdx, pTalkerStreamInfo);
 			}
-			else {
+
+				if (memcmp(pTalkerStreamInfo->stream_id, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) == 0 ||
+						memcmp(pTalkerStreamInfo->stream_dest_mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+					// In the process of connecting. Keep the newest command context so the eventual
+					// CONNECT_TX_RESPONSE uses the latest sequence/controller tuple from retries.
+				if (!pTalkerStreamInfo->waiting_on_talker) {
+					pTalkerStreamInfo->waiting_on_talker = (openavb_acmp_ACMPCommandResponse_t *) malloc(sizeof(openavb_acmp_ACMPCommandResponse_t));
+					if (!pTalkerStreamInfo->waiting_on_talker) {
+						AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+						return OPENAVB_ACMP_STATUS_TALKER_MISBEHAVING;
+					}
+					}
+					memcpy(pTalkerStreamInfo->waiting_on_talker, command, sizeof(*command));
+					pTalkerStreamInfo->waiting_on_talker->connection_count = pTalkerStreamInfo->connection_count;
+					command->connection_count = pTalkerStreamInfo->connection_count;
+					if (pDeferredResponse) {
+						*pDeferredResponse = TRUE;
+					}
+					retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
+				}
+				else {
 				// Already connected, so return the current status.
-				AVB_LOG_DEBUG("Sending immediate response to CONNECT_TX_COMMAND");
-				U16 configIdx = openavbAemGetConfigIdx();
-				openavb_aem_descriptor_stream_io_t *pDescriptorStreamOutput = openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT, command->talker_unique_id);
 				if (pDescriptorStreamOutput) {
 					command->flags = (pDescriptorStreamOutput->acmp_flags &
 							(OPENAVB_ACMP_FLAG_CLASS_B |
@@ -154,12 +207,16 @@ U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command
 				retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
 			}
 		}
-		else {
-			if (!pTalkerStreamInfo->connected_listeners) {
-				pTalkerStreamInfo->connected_listeners = openavbListNewList();
-			}
-			node = openavbListNew(pTalkerStreamInfo->connected_listeners, sizeof(openavb_acmp_ListenerPair_t));
-			if (node) {
+			else {
+				if (!pTalkerStreamInfo->connected_listeners) {
+					pTalkerStreamInfo->connected_listeners = openavbListNewList();
+					if (!pTalkerStreamInfo->connected_listeners) {
+						AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+						return OPENAVB_ACMP_STATUS_TALKER_MISBEHAVING;
+					}
+				}
+				node = openavbListNew(pTalkerStreamInfo->connected_listeners, sizeof(openavb_acmp_ListenerPair_t));
+				if (node) {
 				openavb_acmp_ListenerPair_t *pListenerPair = openavbListData(node);
 				memcpy(pListenerPair->listener_entity_id, command->listener_entity_id, sizeof(pListenerPair->listener_entity_id));
 				pListenerPair->listener_unique_id = command->listener_unique_id;
@@ -172,9 +229,9 @@ U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command
 					return retStatus;
 				}
 
-				if (openavbAVDECCRunTalker(pDescriptorStreamOutput, configIdx, pTalkerStreamInfo)) {
+					if (openavbAVDECCRunTalker(pDescriptorStreamOutput, configIdx, pTalkerStreamInfo)) {
 
-					command->connection_count = pTalkerStreamInfo->connection_count;
+						command->connection_count = pTalkerStreamInfo->connection_count;
 
 					// Wait for the Talker to supply us with updated stream information.
 					if (!pTalkerStreamInfo->waiting_on_talker) {
@@ -184,12 +241,21 @@ U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command
 							return OPENAVB_ACMP_STATUS_TALKER_MISBEHAVING;
 						}
 					}
-					memcpy(pTalkerStreamInfo->waiting_on_talker, command, sizeof(openavb_acmp_ACMPCommandResponse_t));
-					retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
+							memcpy(pTalkerStreamInfo->waiting_on_talker, command, sizeof(openavb_acmp_ACMPCommandResponse_t));
+							if (pDeferredResponse) {
+								*pDeferredResponse = TRUE;
+							}
+							retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
+						}
+					else {
+						// Stream startup can race the AVDECC message client attachment.
+						// Roll back provisional listener registration so a retry command can reconnect cleanly.
+						openavbListDelete(pTalkerStreamInfo->connected_listeners, node);
+						pTalkerStreamInfo->connection_count--;
+					}
 				}
 			}
 		}
-	}
 	else {
 		retStatus = OPENAVB_ACMP_STATUS_TALKER_UNKNOWN_ID;
 	}
@@ -268,7 +334,9 @@ U8 openavbAcmpSMTalker_getState(openavb_acmp_ACMPCommandResponse_t *command)
 		memcpy(command->stream_id, pTalkerStreamInfo->stream_id, sizeof(command->stream_id));
 		memcpy(command->stream_dest_mac, pTalkerStreamInfo->stream_dest_mac, sizeof(command->stream_dest_mac));
 		command->stream_vlan_id = pTalkerStreamInfo->stream_vlan_id;
-		command->connection_count = pTalkerStreamInfo->connection_count;
+		// Milan 1.3 requires GET_TX_STATE to advertise 0 connection_count.
+		// Controllers are expected to use GET_TX_CONNECTION for per-listener detail.
+		command->connection_count = 0;
 		retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
 	}
 
@@ -361,14 +429,15 @@ void openavbAcmpSMTalkerStateMachine()
 				}
 				break;
 
-			case OPENAVB_ACMP_SM_TALKER_STATE_CONNECT:
-				{
-					AVB_TRACE_LINE(AVB_TRACE_ACMP);
-					AVB_LOG_DEBUG("State:  OPENAVB_ACMP_SM_TALKER_STATE_CONNECT");
+				case OPENAVB_ACMP_SM_TALKER_STATE_CONNECT:
+					{
+						AVB_TRACE_LINE(AVB_TRACE_ACMP);
+						AVB_LOG_DEBUG("State:  OPENAVB_ACMP_SM_TALKER_STATE_CONNECT");
 
-					U8 error;
-					openavb_acmp_ACMPCommandResponse_t response;
-					memcpy(&response, pRcvdCmdResp, sizeof(response));
+							U8 error;
+							bool deferredResponse = FALSE;
+							openavb_acmp_ACMPCommandResponse_t response;
+						memcpy(&response, pRcvdCmdResp, sizeof(response));
 					if (!openavbAcmpSMTalker_validTalkerUnique(pRcvdCmdResp->talker_unique_id)) {
 						// Talker ID is not recognized.
 						error = OPENAVB_ACMP_STATUS_TALKER_UNKNOWN_ID;
@@ -378,15 +447,20 @@ void openavbAcmpSMTalkerStateMachine()
 					}
 
 					// Try and start the Talker.
-					error = openavbAcmpSMTalker_connectTalker(&response);
-					if (error != OPENAVB_ACMP_STATUS_SUCCESS) {
-						openavbAcmpSMTalker_txResponse(OPENAVB_ACMP_MESSAGE_TYPE_CONNECT_TX_RESPONSE, &response, error);
-						state = OPENAVB_ACMP_SM_TALKER_STATE_WAITING;
-						break;
-					}
+						error = openavbAcmpSMTalker_connectTalker(&response, &deferredResponse);
+						if (error != OPENAVB_ACMP_STATUS_SUCCESS) {
+							openavbAcmpSMTalker_txResponse(OPENAVB_ACMP_MESSAGE_TYPE_CONNECT_TX_RESPONSE, &response, error);
+							state = OPENAVB_ACMP_SM_TALKER_STATE_WAITING;
+							break;
+						}
 
-					// openavbAcmpSMTalker_connectTalker() either sent a response, or updated the state
-					// to indicate we are waiting for information from the Talker.
+						// Avoid listener timeout while stream details are still being populated asynchronously.
+						if (deferredResponse) {
+							openavbAcmpSMTalker_txResponse(OPENAVB_ACMP_MESSAGE_TYPE_CONNECT_TX_RESPONSE, &response, OPENAVB_ACMP_STATUS_SUCCESS);
+						}
+
+						// openavbAcmpSMTalker_connectTalker() either sent a response, or updated the state
+						// to indicate we are waiting for information from the Talker.
 					// Either way, there is nothing else to do for now.
 					state = OPENAVB_ACMP_SM_TALKER_STATE_WAITING;
 				}
@@ -431,16 +505,16 @@ void openavbAcmpSMTalkerStateMachine()
 				}
 				break;
 
-			case OPENAVB_ACMP_SM_TALKER_STATE_GET_CONNECTION:
-				{
-					AVB_LOG_DEBUG("State:  OPENAVB_ACMP_SM_TALKER_STATE_GET_CONNECTION");
+				case OPENAVB_ACMP_SM_TALKER_STATE_GET_CONNECTION:
+					{
+						AVB_LOG_DEBUG("State:  OPENAVB_ACMP_SM_TALKER_STATE_GET_CONNECTION");
 
-					U8 error;
-					openavb_acmp_ACMPCommandResponse_t response;
-					memcpy(&response, pRcvdCmdResp, sizeof(response));
-					if (openavbAcmpSMTalker_validTalkerUnique(pRcvdCmdResp->talker_unique_id)) {
-						error = openavbAcmpSMTalker_getConnection(&response);
-					}
+						U8 error;
+						openavb_acmp_ACMPCommandResponse_t response;
+						memcpy(&response, pRcvdCmdResp, sizeof(response));
+						if (openavbAcmpSMTalker_validTalkerUnique(pRcvdCmdResp->talker_unique_id)) {
+							error = openavbAcmpSMTalker_getConnection(&response);
+						}
 					else {
 						error = OPENAVB_ACMP_STATUS_TALKER_UNKNOWN_ID;
 					}
@@ -491,6 +565,8 @@ bool openavbAcmpSMTalkerStart()
 	SEM_INIT(openavbAcmpSMTalkerSemaphore, 1, err);
 	SEM_LOG_ERR(err);
 
+	openavbAcmpSMTalkerVars.doTerminate = FALSE;
+
 	// Start the State Machine
 	bool errResult;
 	bRunning = TRUE;
@@ -511,11 +587,16 @@ void openavbAcmpSMTalkerStop()
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
 
 	if (bRunning) {
-		openavbAcmpSMTalkerSet_doTerminate(TRUE);
+		ACMP_SM_LOCK();
+		openavbAcmpSMTalkerVars.doTerminate = TRUE;
+		bRunning = FALSE;
+		(void)openavbAcmpSMTalkerPostSemaphoreLocked("TALKER_STOP");
+		ACMP_SM_UNLOCK();
 
 		THREAD_JOIN(openavbAcmpSmTalkerThread, NULL);
 	}
 
+	ACMP_SM_LOCK();
 	SEM_ERR_T(err);
 	SEM_DESTROY(openavbAcmpSMTalkerSemaphore, err);
 	SEM_LOG_ERR(err);
@@ -524,15 +605,19 @@ void openavbAcmpSMTalkerStop()
 	while (node) {
 		openavb_acmp_TalkerStreamInfo_t *pTalkerStreamInfo = openavbArrayData(node);
 		if (pTalkerStreamInfo != NULL) {
-			openavbListDeleteList(pTalkerStreamInfo->connected_listeners);
+				openavbListDeleteListShallow(pTalkerStreamInfo->connected_listeners);
+			pTalkerStreamInfo->connected_listeners = NULL;
 			if (pTalkerStreamInfo->waiting_on_talker) {
 				free(pTalkerStreamInfo->waiting_on_talker);
 				pTalkerStreamInfo->waiting_on_talker = NULL;
 			}
+			pTalkerStreamInfo->connection_count = 0;
 		}
 		node = openavbArrayIterNext(openavbAcmpSMTalkerVars.talkerStreamInfos);
 	}
 	openavbArrayDeleteArray(openavbAcmpSMTalkerVars.talkerStreamInfos);
+	openavbAcmpSMTalkerVars.talkerStreamInfos = NULL;
+	ACMP_SM_UNLOCK();
 
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
 }
@@ -540,14 +625,20 @@ void openavbAcmpSMTalkerStop()
 void openavbAcmpSMTalkerSet_rcvdConnectTXCmd(openavb_acmp_ACMPCommandResponse_t *command)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
+	if (!openavbAcmpSMTalkerCanQueueCmd(command, "CONNECT_TX_COMMAND")) {
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 	ACMP_SM_LOCK();
+	if (!bRunning) {
+		ACMP_SM_UNLOCK();
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 
 	memcpy(pRcvdCmdResp, command, sizeof(*command));
 	openavbAcmpSMTalkerVars.rcvdConnectTX = TRUE;
-
-	SEM_ERR_T(err);
-	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
-	SEM_LOG_ERR(err);
+	(void)openavbAcmpSMTalkerPostSemaphoreLocked("CONNECT_TX_COMMAND");
 
 	ACMP_SM_UNLOCK();
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
@@ -556,14 +647,20 @@ void openavbAcmpSMTalkerSet_rcvdConnectTXCmd(openavb_acmp_ACMPCommandResponse_t 
 void openavbAcmpSMTalkerSet_rcvdDisconnectTXCmd(openavb_acmp_ACMPCommandResponse_t *command)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
+	if (!openavbAcmpSMTalkerCanQueueCmd(command, "DISCONNECT_TX_COMMAND")) {
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 	ACMP_SM_LOCK();
+	if (!bRunning) {
+		ACMP_SM_UNLOCK();
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 
 	memcpy(pRcvdCmdResp, command, sizeof(*command));
 	openavbAcmpSMTalkerVars.rcvdDisconnectTX = TRUE;
-
-	SEM_ERR_T(err);
-	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
-	SEM_LOG_ERR(err);
+	(void)openavbAcmpSMTalkerPostSemaphoreLocked("DISCONNECT_TX_COMMAND");
 
 	ACMP_SM_UNLOCK();
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
@@ -572,14 +669,20 @@ void openavbAcmpSMTalkerSet_rcvdDisconnectTXCmd(openavb_acmp_ACMPCommandResponse
 void openavbAcmpSMTalkerSet_rcvdGetTXState(openavb_acmp_ACMPCommandResponse_t *command)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
+	if (!openavbAcmpSMTalkerCanQueueCmd(command, "GET_TX_STATE_COMMAND")) {
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 	ACMP_SM_LOCK();
+	if (!bRunning) {
+		ACMP_SM_UNLOCK();
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 
 	memcpy(pRcvdCmdResp, command, sizeof(*command));
 	openavbAcmpSMTalkerVars.rcvdGetTXState = TRUE;
-
-	SEM_ERR_T(err);
-	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
-	SEM_LOG_ERR(err);
+	(void)openavbAcmpSMTalkerPostSemaphoreLocked("GET_TX_STATE_COMMAND");
 
 	ACMP_SM_UNLOCK();
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
@@ -588,14 +691,20 @@ void openavbAcmpSMTalkerSet_rcvdGetTXState(openavb_acmp_ACMPCommandResponse_t *c
 void openavbAcmpSMTalkerSet_rcvdGetTXConnectionCmd(openavb_acmp_ACMPCommandResponse_t *command)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
+	if (!openavbAcmpSMTalkerCanQueueCmd(command, "GET_TX_CONNECTION_COMMAND")) {
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 	ACMP_SM_LOCK();
+	if (!bRunning) {
+		ACMP_SM_UNLOCK();
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 
 	memcpy(pRcvdCmdResp, command, sizeof(*command));
 	openavbAcmpSMTalkerVars.rcvdGetTXConnection = TRUE;
-
-	SEM_ERR_T(err);
-	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
-	SEM_LOG_ERR(err);
+	(void)openavbAcmpSMTalkerPostSemaphoreLocked("GET_TX_CONNECTION_COMMAND");
 
 	ACMP_SM_UNLOCK();
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
@@ -605,10 +714,16 @@ void openavbAcmpSMTalkerSet_doTerminate(bool value)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
 	openavbAcmpSMTalkerVars.doTerminate = value;
+	if (!bRunning) {
+		AVB_TRACE_EXIT(AVB_TRACE_ACMP);
+		return;
+	}
 
-	SEM_ERR_T(err);
-	SEM_POST(openavbAcmpSMTalkerSemaphore, err);
-	SEM_LOG_ERR(err);
+	ACMP_SM_LOCK();
+	if (bRunning) {
+		(void)openavbAcmpSMTalkerPostSemaphoreLocked("TALKER_TERMINATE");
+	}
+	ACMP_SM_UNLOCK();
 
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
 }

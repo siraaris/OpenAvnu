@@ -213,6 +213,24 @@ void *openavbAemFindDescriptor(U16 configIdx, U16 descriptorType, U16 descriptor
 				retDescriptor = pConfig->pDescriptorConfiguration;
 			}
 		}
+
+		// Some controllers issue READ_DESCRIPTOR(CONFIGURATION) with an
+		// unspecified configuration index (0xFFFF). Support that by searching
+		// the configuration table by descriptor index.
+		if (!retDescriptor) {
+			S32 configCount = openavbArrayCount(pAemEntityModel->aemConfigurations);
+			S32 i1;
+			for (i1 = 0; i1 < configCount; ++i1) {
+				openavb_aem_configuration_t *pConfig =
+					openavbArrayDataIdx(pAemEntityModel->aemConfigurations, i1);
+				if (pConfig &&
+						pConfig->pDescriptorConfiguration &&
+						pConfig->pDescriptorConfiguration->descriptor_index == descriptorIdx) {
+					retDescriptor = pConfig->pDescriptorConfiguration;
+					break;
+				}
+			}
+		}
 	}
 	else {
 		openavb_array_t descriptors = NULL;

@@ -38,6 +38,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "openavb_rawsock.h"
 #include "openavb_avtp.h"
+#include <stdio.h>
 
 #define	AVB_LOG_COMPONENT	"AVDECC"
 #include "openavb_log.h"
@@ -60,6 +61,588 @@ static U8 talker_stream_sources = 0;
 static U8 listener_stream_sources = 0;
 static bool first_talker = 1;
 static bool first_listener = 1;
+static U16 talker_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+static U16 listener_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+static U16 audio_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+static U16 s_identifyControlIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+static U8 *s_entityLogoData = NULL;
+static U64 s_entityLogoLength = 0;
+
+#define OPENAVB_AVDECC_ENTITY_LOGO_PATH "/root/src/OpenAvnu/avnu_logo.png"
+#define OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS (0x4f41564c4f474f00ULL)
+
+static void openavbAvdeccFreeEntityLogo(void)
+{
+	if (s_entityLogoData) {
+		free(s_entityLogoData);
+		s_entityLogoData = NULL;
+	}
+	s_entityLogoLength = 0;
+}
+
+static bool openavbAvdeccLoadEntityLogo(void)
+{
+	FILE *fp = NULL;
+	long fileSize = 0;
+	U8 *pData = NULL;
+	size_t bytesRead = 0;
+
+	openavbAvdeccFreeEntityLogo();
+
+	fp = fopen(OPENAVB_AVDECC_ENTITY_LOGO_PATH, "rb");
+	if (!fp) {
+		AVB_LOGF_WARNING("Entity logo not loaded: %s", OPENAVB_AVDECC_ENTITY_LOGO_PATH);
+		return FALSE;
+	}
+
+	if (fseek(fp, 0, SEEK_END) != 0) {
+		fclose(fp);
+		AVB_LOGF_WARNING("Entity logo load failed seeking %s", OPENAVB_AVDECC_ENTITY_LOGO_PATH);
+		return FALSE;
+	}
+
+	fileSize = ftell(fp);
+	if (fileSize < 0) {
+		fclose(fp);
+		AVB_LOGF_WARNING("Entity logo load failed sizing %s", OPENAVB_AVDECC_ENTITY_LOGO_PATH);
+		return FALSE;
+	}
+	if (fseek(fp, 0, SEEK_SET) != 0) {
+		fclose(fp);
+		AVB_LOGF_WARNING("Entity logo load failed rewinding %s", OPENAVB_AVDECC_ENTITY_LOGO_PATH);
+		return FALSE;
+	}
+
+	if (fileSize > 0) {
+		pData = malloc((size_t)fileSize);
+		if (!pData) {
+			fclose(fp);
+			AVB_LOG_ERROR("Entity logo load out of memory");
+			return FALSE;
+		}
+
+		bytesRead = fread(pData, 1, (size_t)fileSize, fp);
+		if (bytesRead != (size_t)fileSize) {
+			fclose(fp);
+			free(pData);
+			AVB_LOGF_WARNING("Entity logo load failed reading %s", OPENAVB_AVDECC_ENTITY_LOGO_PATH);
+			return FALSE;
+		}
+	}
+
+	fclose(fp);
+	s_entityLogoData = pData;
+	s_entityLogoLength = (U64)fileSize;
+	AVB_LOGF_INFO("Loaded entity logo: %s (%llu bytes)",
+		OPENAVB_AVDECC_ENTITY_LOGO_PATH,
+		(unsigned long long)s_entityLogoLength);
+	return TRUE;
+}
+
+static bool openavbAvdeccIsCrfStream(const openavb_tl_data_cfg_t *stream)
+{
+	if (!stream) {
+		return FALSE;
+	}
+	return (strcmp(stream->map_fn, "openavbMapCrfInitialize") == 0);
+}
+
+static bool openavbAvdeccIsAudioMappedStream(const openavb_tl_data_cfg_t *stream)
+{
+	if (!stream) {
+		return FALSE;
+	}
+
+	return (strcmp(stream->map_fn, "openavbMapAVTPAudioInitialize") == 0 ||
+		strcmp(stream->map_fn, "openavbMapUncmpAudioInitialize") == 0 ||
+		strcmp(stream->map_fn, "openavbMapNullInitialize") == 0);
+}
+
+static bool openavbAvdeccUsesSharedAudioClockDomain(const openavb_avdecc_configuration_cfg_t *pCfg)
+{
+	return (pCfg &&
+		pCfg->stream &&
+		!pCfg->stream_is_crf &&
+		openavbAvdeccIsAudioMappedStream(pCfg->stream));
+}
+
+static void openavbAvdeccFreeConfigurationCfgList(void)
+{
+	while (pFirstConfigurationCfg) {
+		openavb_avdecc_configuration_cfg_t *pDel = pFirstConfigurationCfg;
+		pFirstConfigurationCfg = pFirstConfigurationCfg->next;
+		free(pDel);
+	}
+}
+
+static void openavbAvdeccRefreshClockDomain(
+	U16 nConfigIdx,
+	U16 clockDomainIdx,
+	const openavb_avdecc_configuration_cfg_t *pCfg)
+{
+	if (clockDomainIdx == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return;
+	}
+
+	openavb_aem_descriptor_clock_domain_t *pClockDomain =
+		openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, clockDomainIdx);
+	if (!pClockDomain) {
+		AVB_LOGF_WARNING("Unable to refresh missing clock domain idx=%u", clockDomainIdx);
+		return;
+	}
+
+	if (!openavbAemDescriptorClockDomainInitialize(pClockDomain, nConfigIdx, pCfg)) {
+		AVB_LOGF_WARNING("Unable to refresh clock domain idx=%u", clockDomainIdx);
+	}
+}
+
+static void openavbAvdeccPreferClockDomainSource(
+	U16 nConfigIdx,
+	U16 clockDomainIdx,
+	U16 preferredClockSourceIdx,
+	bool forceSelection)
+{
+	openavb_aem_descriptor_clock_domain_t *pClockDomain;
+	openavb_aem_descriptor_clock_source_t *pCurrentClockSource = NULL;
+	bool currentIsStreamSource = FALSE;
+
+	if (clockDomainIdx == OPENAVB_AEM_DESCRIPTOR_INVALID ||
+			preferredClockSourceIdx == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return;
+	}
+
+	pClockDomain = openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, clockDomainIdx);
+	if (!pClockDomain) {
+		AVB_LOGF_WARNING("Unable to prefer source %u on missing clock domain %u",
+			preferredClockSourceIdx, clockDomainIdx);
+		return;
+	}
+
+	if (pClockDomain->clock_source_index != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		pCurrentClockSource = openavbAemGetDescriptor(
+			nConfigIdx,
+			OPENAVB_AEM_DESCRIPTOR_CLOCK_SOURCE,
+			pClockDomain->clock_source_index);
+		if (pCurrentClockSource &&
+				(pCurrentClockSource->clock_source_flags & OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID)) {
+			currentIsStreamSource = TRUE;
+		}
+	}
+
+	if (forceSelection || !currentIsStreamSource) {
+		pClockDomain->clock_source_index = preferredClockSourceIdx;
+		AVB_LOGF_INFO("Clock domain %u default source set to CRF source %u",
+			clockDomainIdx, preferredClockSourceIdx);
+	}
+}
+
+static bool openavbAvdeccAddClockSource(
+	U16 nConfigIdx,
+	openavb_avdecc_configuration_cfg_t *pCfg,
+	U16 *pOutClockSourceIdx)
+{
+	U16 nResultIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_clock_source_t *pNewClockSource = openavbAemDescriptorClockSourceNew();
+	if (!openavbAemAddDescriptor(pNewClockSource, nConfigIdx, &nResultIdx) ||
+			!openavbAemDescriptorClockSourceInitialize(pNewClockSource, nConfigIdx, pCfg)) {
+		AVB_LOG_ERROR("Error adding AVDECC Clock Source to configuration");
+		return FALSE;
+	}
+	if (pOutClockSourceIdx) {
+		*pOutClockSourceIdx = nResultIdx;
+	}
+
+	// Keep existing clock domains in sync with newly-added sources (e.g. CRF).
+	openavbAvdeccRefreshClockDomain(nConfigIdx, talker_clock_domain_idx, pCfg);
+	openavbAvdeccRefreshClockDomain(nConfigIdx, listener_clock_domain_idx, pCfg);
+	openavbAvdeccRefreshClockDomain(nConfigIdx, audio_clock_domain_idx, pCfg);
+	return TRUE;
+}
+
+static bool openavbAvdeccEnsureSharedAudioClockDomain(
+	U16 nConfigIdx,
+	openavb_avdecc_configuration_cfg_t *pCfg)
+{
+	U16 nResultIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_clock_domain_t *pNewClockDomain = NULL;
+
+	if (audio_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return TRUE;
+	}
+
+	pNewClockDomain = openavbAemDescriptorClockDomainNew();
+	if (!openavbAemAddDescriptor(pNewClockDomain, nConfigIdx, &nResultIdx) ||
+			!openavbAemDescriptorClockDomainInitialize(pNewClockDomain, nConfigIdx, pCfg)) {
+		AVB_LOG_ERROR("Error adding shared AVDECC audio clock domain to configuration");
+		return FALSE;
+	}
+
+	audio_clock_domain_idx = nResultIdx;
+	return TRUE;
+}
+
+static void openavbAvdeccLogStreamDescriptorSummary(
+	U16 nConfigIdx,
+	const openavb_avdecc_configuration_cfg_t *pCfg)
+{
+	openavb_aem_descriptor_stream_io_t *pStreamDescriptor;
+	U8 currentFormat[8];
+	U8 supportedFormat[8];
+	const char *descriptorLabel;
+	const char *roleLabel;
+
+	if (!pCfg) {
+		return;
+	}
+
+	pStreamDescriptor = openavbAemGetDescriptor(
+		nConfigIdx,
+		pCfg->stream_descriptor_type,
+		pCfg->stream_descriptor_index);
+	if (!pStreamDescriptor) {
+		return;
+	}
+
+	memset(currentFormat, 0, sizeof(currentFormat));
+	memset(supportedFormat, 0, sizeof(supportedFormat));
+	openavbAemStreamFormatToBuf(&pStreamDescriptor->current_format, currentFormat);
+	if (pStreamDescriptor->number_of_formats > 0) {
+		openavbAemStreamFormatToBuf(&pStreamDescriptor->stream_formats[0], supportedFormat);
+	}
+
+	descriptorLabel =
+		(pCfg->stream_descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) ?
+			"STREAM_INPUT" : "STREAM_OUTPUT";
+	roleLabel = (pCfg->stream && pCfg->stream->role == AVB_ROLE_LISTENER) ? "listener" : "talker";
+
+	AVB_LOGF_INFO(
+		"%s %u summary: role=%s map=%s crf=%u domain=%u formats=%u current=%02x%02x%02x%02x%02x%02x%02x%02x supported0=%02x%02x%02x%02x%02x%02x%02x%02x",
+		descriptorLabel,
+		pCfg->stream_descriptor_index,
+		roleLabel,
+		(pCfg->stream && pCfg->stream->map_fn[0]) ? pCfg->stream->map_fn : "<unknown>",
+		pCfg->stream_is_crf ? 1 : 0,
+		pStreamDescriptor->clock_domain_index,
+		pStreamDescriptor->number_of_formats,
+		currentFormat[0], currentFormat[1], currentFormat[2], currentFormat[3],
+		currentFormat[4], currentFormat[5], currentFormat[6], currentFormat[7],
+		supportedFormat[0], supportedFormat[1], supportedFormat[2], supportedFormat[3],
+		supportedFormat[4], supportedFormat[5], supportedFormat[6], supportedFormat[7]);
+}
+
+static bool openavbAvdeccAddGptpTimingChain(U16 nConfigIdx)
+{
+	U16 timingIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 ptpInstanceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 ptpPortIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 gptpClockSourceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_timing_t *pTiming = NULL;
+	openavb_aem_descriptor_ptp_instance_t *pPtpInstance = NULL;
+	openavb_aem_descriptor_ptp_port_t *pPtpPort = NULL;
+	openavb_aem_descriptor_clock_source_t *pClockSource = NULL;
+
+	pTiming = openavbAemDescriptorTimingNew();
+	pPtpInstance = openavbAemDescriptorPtpInstanceNew();
+	pPtpPort = openavbAemDescriptorPtpPortNew();
+	pClockSource = openavbAemDescriptorClockSourceNew();
+	if (!pTiming || !pPtpInstance || !pPtpPort || !pClockSource) {
+		AVB_LOG_ERROR("Error allocating Milan gPTP timing descriptors");
+		return FALSE;
+	}
+
+	if (!openavbAemAddDescriptor(pTiming, nConfigIdx, &timingIdx) ||
+			!openavbAemAddDescriptor(pPtpInstance, nConfigIdx, &ptpInstanceIdx) ||
+			!openavbAemAddDescriptor(pPtpPort, nConfigIdx, &ptpPortIdx) ||
+			!openavbAemAddDescriptor(pClockSource, nConfigIdx, &gptpClockSourceIdx)) {
+		AVB_LOG_ERROR("Error adding Milan gPTP timing descriptors to configuration");
+		return FALSE;
+	}
+
+	if (!openavbAemDescriptorTimingInitialize(pTiming, ptpInstanceIdx) ||
+			!openavbAemDescriptorPtpInstanceInitialize(pPtpInstance, ptpPortIdx) ||
+			!openavbAemDescriptorPtpPortInitialize(pPtpPort, 0) ||
+			!openavbAemDescriptorClockSourceInitializeForTiming(pClockSource, timingIdx)) {
+		AVB_LOG_ERROR("Error initializing Milan gPTP timing descriptors");
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static bool openavbAvdeccAddIdentifyControl(
+	U16 nConfigIdx,
+	const openavb_avdecc_configuration_cfg_t *pCfg)
+{
+	U16 identifyControlIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_control_t *pControl = openavbAemDescriptorControlNew();
+	if (!pControl) {
+		AVB_LOG_ERROR("Error allocating AVDECC IDENTIFY control");
+		return FALSE;
+	}
+
+	if (!openavbAemAddDescriptor(pControl, nConfigIdx, &identifyControlIdx) ||
+			!openavbAemDescriptorDescriptorControlInitialize(pControl, nConfigIdx, pCfg)) {
+		AVB_LOG_ERROR("Error adding AVDECC IDENTIFY control");
+		return FALSE;
+	}
+
+	openavbAemSetString(pControl->object_name, "Identify");
+	pControl->control_value_type = OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT8;
+	pControl->control_type = OPENAVB_AEM_CONTROL_TYPE_IDENTIFY;
+	pControl->number_of_values = 1;
+	pControl->signal_type = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pControl->signal_index = 0;
+	pControl->signal_output = 0;
+	pControl->value_details.linear_uint8[0].minimum = 0;
+	pControl->value_details.linear_uint8[0].maximum = 255;
+	pControl->value_details.linear_uint8[0].step = 255;
+	pControl->value_details.linear_uint8[0].default_value = 0;
+	pControl->value_details.linear_uint8[0].current = 0;
+	pControl->value_details.linear_uint8[0].unit = 0;
+	pControl->value_details.linear_uint8[0].string.offset = OPENAVB_AEM_NO_STRING_OFFSET;
+	pControl->value_details.linear_uint8[0].string.index = OPENAVB_AEM_NO_STRING_INDEX;
+
+	s_identifyControlIndex = identifyControlIdx;
+	return TRUE;
+}
+
+static bool openavbAvdeccAddEntityLogoMemoryObject(U16 nConfigIdx)
+{
+	U16 memoryObjectIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_memory_object_t *pMemoryObject;
+
+	if (!openavbAvdeccHasEntityLogo()) {
+		return TRUE;
+	}
+
+	pMemoryObject = openavbAemDescriptorMemoryObjectNew();
+	if (!pMemoryObject) {
+		AVB_LOG_ERROR("Error allocating AVDECC entity logo memory object");
+		return FALSE;
+	}
+
+	if (!openavbAemAddDescriptor(pMemoryObject, nConfigIdx, &memoryObjectIdx) ||
+			!openavbAemDescriptorMemoryObjectInitialize(
+				pMemoryObject,
+				OPENAVB_AEM_MEMORY_OBJECT_TYPE_PNG_ENTITY,
+				OPENAVB_AEM_DESCRIPTOR_ENTITY,
+				0,
+				OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS,
+				s_entityLogoLength,
+				s_entityLogoLength,
+				"Entity Logo")) {
+		AVB_LOG_ERROR("Error adding AVDECC entity logo memory object");
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static void openavbAvdeccLogConfigurationDescriptorCounts(U16 nConfigIdx)
+{
+	openavb_aem_descriptor_configuration_t *pConfiguration;
+	U16 i1;
+
+	pConfiguration = openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_CONFIGURATION, nConfigIdx);
+	if (!pConfiguration) {
+		AVB_LOGF_WARNING("Unable to log descriptor counts for configuration %u", nConfigIdx);
+		return;
+	}
+
+	AVB_LOGF_INFO("Configuration %u descriptor_counts_count=%u",
+		nConfigIdx,
+		pConfiguration->descriptor_counts_count);
+	for (i1 = 0; i1 < pConfiguration->descriptor_counts_count; ++i1) {
+		AVB_LOGF_INFO("Configuration %u descriptor_count[%u]: type=0x%04x count=%u",
+			nConfigIdx,
+			i1,
+			pConfiguration->descriptor_counts[i1].descriptor_type,
+			pConfiguration->descriptor_counts[i1].count);
+	}
+}
+
+static openavb_avdecc_configuration_cfg_t *openavbAvdeccFindRepresentativeAudioConfig(avb_role_t role)
+{
+	openavb_avdecc_configuration_cfg_t *pCfg = pFirstConfigurationCfg;
+
+	while (pCfg) {
+		if (pCfg->stream &&
+				pCfg->stream->role == role &&
+				!pCfg->stream_is_crf &&
+				openavbAvdeccIsAudioMappedStream(pCfg->stream)) {
+			return pCfg;
+		}
+		pCfg = pCfg->next;
+	}
+
+	return NULL;
+}
+
+static U16 openavbAvdeccGetAudioChannelCount(const openavb_aem_descriptor_stream_io_t *pStreamDescriptor)
+{
+	if (!pStreamDescriptor) {
+		return 0;
+	}
+
+	switch (pStreamDescriptor->current_format.subtype) {
+		case OPENAVB_AEM_STREAM_FORMAT_AVTP_AUDIO_SUBTYPE:
+			return (pStreamDescriptor->current_format.subtypes.avtp_audio.channels_per_frame != 0) ?
+				pStreamDescriptor->current_format.subtypes.avtp_audio.channels_per_frame : 2;
+
+		case OPENAVB_AEM_STREAM_FORMAT_61883_IIDC_SUBTYPE:
+			if (pStreamDescriptor->current_format.subtypes.iec_61883.fmt == OPENAVB_AEM_STREAM_FORMAT_FMT_61883_6) {
+				return (pStreamDescriptor->current_format.subtypes.iec_61883_6.dbs != 0) ?
+					pStreamDescriptor->current_format.subtypes.iec_61883_6.dbs : 2;
+			}
+			break;
+
+		default:
+			break;
+	}
+
+	return 0;
+}
+
+static void openavbAvdeccPopulateDynamicAudioMappings(
+	openavb_aem_descriptor_stream_port_io_t *pStreamPort,
+	U16 channelCount)
+{
+	U16 mappingCount;
+	U16 i;
+
+	if (!pStreamPort) {
+		return;
+	}
+
+	memset(pStreamPort->dynamic_mappings, 0, sizeof(pStreamPort->dynamic_mappings));
+	pStreamPort->dynamic_mappings_supported = (channelCount != 0);
+	pStreamPort->dynamic_number_of_maps = (channelCount != 0) ? 1 : 0;
+	pStreamPort->dynamic_stream_channels = channelCount;
+	pStreamPort->dynamic_cluster_channels = channelCount;
+
+	if (channelCount == 0) {
+		pStreamPort->dynamic_number_of_mappings = 0;
+		return;
+	}
+
+	mappingCount = channelCount;
+	if (mappingCount > OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS) {
+		AVB_LOGF_WARNING("Clipping dynamic audio mappings from %u to %u",
+			mappingCount,
+			OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS);
+		mappingCount = OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS;
+	}
+
+	pStreamPort->dynamic_number_of_mappings = mappingCount;
+	for (i = 0; i < mappingCount; i++) {
+		pStreamPort->dynamic_mappings[i].mapping_stream_index = 0;
+		pStreamPort->dynamic_mappings[i].mapping_stream_channel = i;
+		pStreamPort->dynamic_mappings[i].mapping_cluster_offset = 0;
+		pStreamPort->dynamic_mappings[i].mapping_cluster_channel = i;
+	}
+}
+
+static bool openavbAvdeccConfigureAudioStreamPort(U16 nConfigIdx, avb_role_t role)
+{
+	openavb_avdecc_configuration_cfg_t *pCfg;
+	openavb_aem_descriptor_stream_port_io_t *pStreamPort;
+	openavb_aem_descriptor_stream_io_t *pStreamDescriptor;
+	openavb_aem_descriptor_audio_cluster_t *pCluster;
+	U16 streamPortType;
+	U16 clockDomainIdx;
+	U16 clusterIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 channelCount;
+
+	pCfg = openavbAvdeccFindRepresentativeAudioConfig(role);
+	streamPortType = (role == AVB_ROLE_TALKER) ?
+		OPENAVB_AEM_DESCRIPTOR_STREAM_PORT_OUTPUT :
+		OPENAVB_AEM_DESCRIPTOR_STREAM_PORT_INPUT;
+	if (audio_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		clockDomainIdx = audio_clock_domain_idx;
+	}
+	else {
+		clockDomainIdx = (role == AVB_ROLE_TALKER) ?
+			talker_clock_domain_idx :
+			listener_clock_domain_idx;
+	}
+
+	pStreamPort = openavbAemGetDescriptor(nConfigIdx, streamPortType, 0);
+	if (!pStreamPort) {
+		return TRUE;
+	}
+
+	pStreamPort->clock_domain_index = clockDomainIdx;
+	pStreamPort->number_of_controls = 0;
+	pStreamPort->base_control = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pStreamPort->number_of_clusters = 0;
+	pStreamPort->base_cluster = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pStreamPort->number_of_maps = 0;
+	pStreamPort->base_map = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavbAvdeccPopulateDynamicAudioMappings(pStreamPort, 0);
+
+	if (!pCfg) {
+		return TRUE;
+	}
+
+	pStreamDescriptor = openavbAemGetDescriptor(nConfigIdx, pCfg->stream_descriptor_type, pCfg->stream_descriptor_index);
+	if (!pStreamDescriptor) {
+		AVB_LOG_WARNING("Representative stream descriptor missing for dynamic audio mappings");
+		return FALSE;
+	}
+
+	channelCount = openavbAvdeccGetAudioChannelCount(pStreamDescriptor);
+	if (channelCount == 0) {
+		return TRUE;
+	}
+
+	pCluster = openavbAemDescriptorAudioClusterNew();
+	if (!pCluster || !openavbAemAddDescriptor(pCluster, OPENAVB_AEM_DESCRIPTOR_INVALID, &clusterIdx)) {
+		AVB_LOG_ERROR("Error adding AVDECC Audio Cluster for dynamic audio mappings");
+		return FALSE;
+	}
+
+	if (role == AVB_ROLE_TALKER) {
+		openavbAemSetString(pCluster->object_name, "Output Audio Cluster");
+	}
+	else {
+		openavbAemSetString(pCluster->object_name, "Input Audio Cluster");
+	}
+	pCluster->signal_type = streamPortType;
+	pCluster->signal_index = 0;
+	pCluster->signal_output = 0;
+	pCluster->channel_count = channelCount;
+	pCluster->format = 0;
+
+	pStreamPort->number_of_clusters = 1;
+	pStreamPort->base_cluster = clusterIdx;
+	openavbAvdeccPopulateDynamicAudioMappings(pStreamPort, channelCount);
+	return TRUE;
+}
+
+static void openavbAvdeccFinalizeAudioUnit(U16 nConfigIdx)
+{
+	openavb_aem_descriptor_audio_unit_t *pAudioUnit =
+		openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_AUDIO_UNIT, 0);
+
+	if (!pAudioUnit) {
+		return;
+	}
+
+	if (audio_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		pAudioUnit->clock_domain_index = audio_clock_domain_idx;
+	}
+	else if (talker_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		pAudioUnit->clock_domain_index = talker_clock_domain_idx;
+	}
+	else if (listener_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		pAudioUnit->clock_domain_index = listener_clock_domain_idx;
+	}
+
+	pAudioUnit->number_of_stream_input_ports = gAvdeccCfg.bListener ? 1 : 0;
+	pAudioUnit->base_stream_input_port = gAvdeccCfg.bListener ? 0 : OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pAudioUnit->number_of_stream_output_ports = gAvdeccCfg.bTalker ? 1 : 0;
+	pAudioUnit->base_stream_output_port = gAvdeccCfg.bTalker ? 0 : OPENAVB_AEM_DESCRIPTOR_INVALID;
+}
 
 bool openavbAvdeccStartAdp()
 {
@@ -151,6 +734,9 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 
 	// Add a pointer to the supplied stream information.
 	pCfg->stream = stream;
+	pCfg->stream_is_crf = openavbAvdeccIsCrfStream(stream);
+	pCfg->stream_descriptor_type = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pCfg->stream_descriptor_index = OPENAVB_AEM_DESCRIPTOR_INVALID;
 
 	// Add the new config to the end of the list of configurations.
 	if (pFirstConfigurationCfg == NULL) {
@@ -206,6 +792,18 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}
+		if (!openavbAvdeccAddGptpTimingChain(nConfigIdx)) {
+			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+			return FALSE;
+		}
+		if (!openavbAvdeccAddIdentifyControl(nConfigIdx, pCfg)) {
+			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+			return FALSE;
+		}
+		if (!openavbAvdeccAddEntityLogoMemoryObject(nConfigIdx)) {
+			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+			return FALSE;
+		}
 	}
 	else
 	{
@@ -242,27 +840,68 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}
-		if (first_talker)
-		{
-			first_talker = 0;
-			openavb_aem_descriptor_clock_source_t *pNewClockSource = openavbAemDescriptorClockSourceNew();
-			if (!openavbAemAddDescriptor(pNewClockSource, nConfigIdx, &nResultIdx) ||
-					!openavbAemDescriptorClockSourceInitialize(pNewClockSource, nConfigIdx, pCfg)) {
-				AVB_LOG_ERROR("Error adding AVDECC Clock Source to configuration");
-				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-				return FALSE;
-			}
-			openavb_aem_descriptor_clock_domain_t *pNewClockDomain = openavbAemDescriptorClockDomainNew();
-			if (!openavbAemAddDescriptor(pNewClockDomain, nConfigIdx, &nResultIdx) ||
-					!openavbAemDescriptorClockDomainInitialize(pNewClockDomain, nConfigIdx, pCfg)) {
-				AVB_LOG_ERROR("Error adding AVDECC Clock Domain to configuration");
-				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-				return FALSE;
-			}
-		}
+		pCfg->stream_descriptor_type = OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT;
+		pCfg->stream_descriptor_index = nResultIdx;
 
-		// AVDECC_TODO:  Add other descriptors as needed.  Future options include:
-		//  JACK_INPUT
+			if (openavbAvdeccUsesSharedAudioClockDomain(pCfg) ||
+					(pCfg->stream_is_crf && audio_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID)) {
+				U16 crfClockSourceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+				if (!openavbAvdeccEnsureSharedAudioClockDomain(nConfigIdx, pCfg)) {
+					AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+					return FALSE;
+				}
+				pNewStreamOutput->clock_domain_index = audio_clock_domain_idx;
+				if (pCfg->stream_is_crf) {
+					if (!openavbAvdeccAddClockSource(nConfigIdx, pCfg, &crfClockSourceIdx)) {
+						AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+						return FALSE;
+					}
+					openavbAvdeccPreferClockDomainSource(
+						nConfigIdx,
+						audio_clock_domain_idx,
+						crfClockSourceIdx,
+						TRUE);
+				}
+			}
+			else {
+			if (first_talker)
+			{
+				first_talker = 0;
+				openavb_aem_descriptor_clock_domain_t *pNewClockDomain = openavbAemDescriptorClockDomainNew();
+				if (!openavbAemAddDescriptor(pNewClockDomain, nConfigIdx, &nResultIdx) ||
+						!openavbAemDescriptorClockDomainInitialize(pNewClockDomain, nConfigIdx, pCfg)) {
+					AVB_LOG_ERROR("Error adding AVDECC Clock Domain to configuration");
+				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+				return FALSE;
+				}
+				talker_clock_domain_idx = nResultIdx;
+				}
+				if (pCfg->stream_is_crf) {
+				U16 crfClockSourceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+				if (!openavbAvdeccAddClockSource(nConfigIdx, pCfg, &crfClockSourceIdx)) {
+					AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+					return FALSE;
+				}
+				if (talker_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID &&
+						crfClockSourceIdx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+					openavb_aem_descriptor_clock_domain_t *pClockDomain =
+						openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, talker_clock_domain_idx);
+					if (pClockDomain) {
+						pClockDomain->clock_source_index = crfClockSourceIdx;
+						AVB_LOGF_INFO("Clock domain %u default source set to CRF talker source %u",
+							talker_clock_domain_idx, crfClockSourceIdx);
+					}
+					}
+				}
+			if (talker_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+				pNewStreamOutput->clock_domain_index = talker_clock_domain_idx;
+			}
+			}
+
+		openavbAvdeccLogStreamDescriptorSummary(nConfigIdx, pCfg);
+
+			// AVDECC_TODO:  Add other descriptors as needed.  Future options include:
+			//  JACK_INPUT
 		talker_stream_sources++;
 
 		// Add the class specific to the talker.
@@ -281,26 +920,68 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}
-		if (first_listener)
-		{
-			openavb_aem_descriptor_clock_source_t *pNewClockSource = openavbAemDescriptorClockSourceNew();
-			if (!openavbAemAddDescriptor(pNewClockSource, nConfigIdx, &nResultIdx) ||
-					!openavbAemDescriptorClockSourceInitialize(pNewClockSource, nConfigIdx, pCfg)) {
-				AVB_LOG_ERROR("Error adding AVDECC Clock Source to configuration");
-				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-				return FALSE;
-			}
-			openavb_aem_descriptor_clock_domain_t *pNewClockDomain = openavbAemDescriptorClockDomainNew();
-			if (!openavbAemAddDescriptor(pNewClockDomain, nConfigIdx, &nResultIdx) ||
-					!openavbAemDescriptorClockDomainInitialize(pNewClockDomain, nConfigIdx, pCfg)) {
-				AVB_LOG_ERROR("Error adding AVDECC Clock Domain to configuration");
-				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-				return FALSE;
-			}
-		}
+		pCfg->stream_descriptor_type = OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT;
+		pCfg->stream_descriptor_index = nResultIdx;
 
-		// AVDECC_TODO:  Add other descriptors as needed.  Future options include:
-		//  JACK_OUTPUT
+			if (openavbAvdeccUsesSharedAudioClockDomain(pCfg) ||
+					(pCfg->stream_is_crf && audio_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID)) {
+				U16 crfClockSourceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+				if (!openavbAvdeccEnsureSharedAudioClockDomain(nConfigIdx, pCfg)) {
+					AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+					return FALSE;
+				}
+				pNewStreamInput->clock_domain_index = audio_clock_domain_idx;
+				if (pCfg->stream_is_crf) {
+					if (!openavbAvdeccAddClockSource(nConfigIdx, pCfg, &crfClockSourceIdx)) {
+						AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+						return FALSE;
+					}
+					openavbAvdeccPreferClockDomainSource(
+						nConfigIdx,
+						audio_clock_domain_idx,
+						crfClockSourceIdx,
+						FALSE);
+				}
+			}
+			else {
+			if (first_listener)
+			{
+				first_listener = 0;
+				openavb_aem_descriptor_clock_domain_t *pNewClockDomain = openavbAemDescriptorClockDomainNew();
+				if (!openavbAemAddDescriptor(pNewClockDomain, nConfigIdx, &nResultIdx) ||
+						!openavbAemDescriptorClockDomainInitialize(pNewClockDomain, nConfigIdx, pCfg)) {
+					AVB_LOG_ERROR("Error adding AVDECC Clock Domain to configuration");
+				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+				return FALSE;
+				}
+				listener_clock_domain_idx = nResultIdx;
+				}
+				if (pCfg->stream_is_crf) {
+				U16 crfClockSourceIdx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+				if (!openavbAvdeccAddClockSource(nConfigIdx, pCfg, &crfClockSourceIdx)) {
+					AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+					return FALSE;
+				}
+				if (listener_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID &&
+						crfClockSourceIdx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+					openavb_aem_descriptor_clock_domain_t *pClockDomain =
+						openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, listener_clock_domain_idx);
+					if (pClockDomain) {
+						pClockDomain->clock_source_index = crfClockSourceIdx;
+						AVB_LOGF_INFO("Clock domain %u default source set to CRF listener source %u",
+							listener_clock_domain_idx, crfClockSourceIdx);
+					}
+					}
+				}
+			if (listener_clock_domain_idx != OPENAVB_AEM_DESCRIPTOR_INVALID) {
+				pNewStreamInput->clock_domain_index = listener_clock_domain_idx;
+			}
+			}
+
+		openavbAvdeccLogStreamDescriptorSummary(nConfigIdx, pCfg);
+
+			// AVDECC_TODO:  Add other descriptors as needed.  Future options include:
+			//  JACK_OUTPUT
 		listener_stream_sources++;
 
 		// Listeners support both Class A and Class B.
@@ -320,6 +1001,8 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 		}
 	}
 
+	openavbAvdeccLogConfigurationDescriptorCounts(nConfigIdx);
+
 	return TRUE;
 }
 
@@ -330,6 +1013,22 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 extern DLL_EXPORT bool openavbAvdeccInitialize()
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC);
+
+	// If initialize is called again in-process, force a fresh descriptor/model
+	// build to avoid stale configuration pointers.
+	openavbAvdeccFreeConfigurationCfgList();
+	pConfiguration = NULL;
+
+	// Ensure model-scoped state starts cleanly for each initialize.
+	talker_stream_sources = 0;
+	listener_stream_sources = 0;
+	first_talker = 1;
+	first_listener = 1;
+	talker_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	listener_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	audio_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	s_identifyControlIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavbAvdeccLoadEntityLogo();
 
 	gAvdeccCfg.pDescriptorEntity = openavbAemDescriptorEntityNew();
 	if (!gAvdeccCfg.pDescriptorEntity) {
@@ -398,26 +1097,29 @@ extern DLL_EXPORT bool openavbAvdeccInitialize()
 
 	// Add non-top-level descriptors.  These are independent of the configurations.
 	// STRINGS are handled by gAvdeccCfg.pAemDescriptorLocaleStringsHandler, so not included here.
-	U16 nResultIdx;
-	if (!openavbAemAddDescriptor(openavbAemDescriptorAudioClusterNew(), OPENAVB_AEM_DESCRIPTOR_INVALID, &nResultIdx)) {
-		AVB_LOG_ERROR("Error adding AVDECC Audio Cluster");
-		AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-		return FALSE;
-	}
 	if (gAvdeccCfg.bTalker) {
+		U16 nResultIdx;
 		if (!openavbAemAddDescriptor(openavbAemDescriptorStreamPortOutputNew(), OPENAVB_AEM_DESCRIPTOR_INVALID, &nResultIdx)) {
 			AVB_LOG_ERROR("Error adding AVDECC Output Stream Port");
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}
 	}
+
 	if (gAvdeccCfg.bListener) {
+		U16 nResultIdx;
 		if (!openavbAemAddDescriptor(openavbAemDescriptorStreamPortInputNew(), OPENAVB_AEM_DESCRIPTOR_INVALID, &nResultIdx)) {
 			AVB_LOG_ERROR("Error adding AVDECC Input Stream Port");
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}
 	}
+	if (!openavbAvdeccConfigureAudioStreamPort(0, AVB_ROLE_LISTENER) ||
+			!openavbAvdeccConfigureAudioStreamPort(0, AVB_ROLE_TALKER)) {
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+		return FALSE;
+	}
+	openavbAvdeccFinalizeAudioUnit(0);
 
 	// AVDECC_TODO:  Add other descriptors as needed.  Future options include:
 	//  EXTERNAL_PORT_INPUT
@@ -426,7 +1128,6 @@ extern DLL_EXPORT bool openavbAvdeccInitialize()
 	//  INTERNAL_PORT_OUTPUT
 	//  VIDEO_CLUSTER
 	//  SENSOR_CLUSTER
-	//  AUDIO_MAP
 	//  VIDEO_MAP
 	//  SENSOR_MAP
 
@@ -438,8 +1139,12 @@ extern DLL_EXPORT bool openavbAvdeccInitialize()
 	}
 	openavbAemDescriptorEntitySet_entity_capabilities(gAvdeccCfg.pDescriptorEntity,
 		OPENAVB_ADP_ENTITY_CAPABILITIES_AEM_SUPPORTED |
+		OPENAVB_ADP_ENTITY_CAPABILITIES_VENDOR_UNIQUE_SUPPORTED |
+		OPENAVB_ADP_ENTITY_CAPABILITIES_AEM_INTERFACE_INDEX_VALID |
+		(openavbAvdeccHasEntityLogo() ? OPENAVB_ADP_ENTITY_CAPABILITIES_ADDRESS_ACCESS_SUPPORTED : 0) |
 		(gAvdeccCfg.bClassASupported ? OPENAVB_ADP_ENTITY_CAPABILITIES_CLASS_A_SUPPORTED : 0) |
 		(gAvdeccCfg.bClassBSupported ? OPENAVB_ADP_ENTITY_CAPABILITIES_CLASS_B_SUPPORTED : 0) |
+		(s_identifyControlIndex != OPENAVB_AEM_DESCRIPTOR_INVALID ? OPENAVB_ADP_ENTITY_CAPABILITIES_AEM_IDENTIFY_CONTROL_INDEX_VALID : 0) |
 		OPENAVB_ADP_ENTITY_CAPABILITIES_GPTP_SUPPORTED);
 
 	if (gAvdeccCfg.bTalker) {
@@ -471,6 +1176,72 @@ openavb_tl_data_cfg_t *openavbAvdeccGetStreamCfg(U16 streamIndex)
 		pCfg = pCfg->next;
 	}
 	return NULL;
+}
+
+U16 openavbAvdeccGetIdentifyControlIndex(void)
+{
+	return s_identifyControlIndex;
+}
+
+bool openavbAvdeccHasEntityLogo(void)
+{
+	return (s_entityLogoData != NULL && s_entityLogoLength != 0);
+}
+
+U64 openavbAvdeccGetEntityLogoStartAddress(void)
+{
+	return OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS;
+}
+
+U64 openavbAvdeccGetEntityLogoLength(void)
+{
+	return s_entityLogoLength;
+}
+
+bool openavbAvdeccReadEntityLogo(U64 address, U16 requestedLength, U8 *pBuf, U16 *pReadLength, U16 *pStatus)
+{
+	U64 offset;
+
+	if (pReadLength) {
+		*pReadLength = 0;
+	}
+
+	if (!pStatus) {
+		return FALSE;
+	}
+
+	if (!openavbAvdeccHasEntityLogo()) {
+		*pStatus = OPENAVB_AECP_AA_STATUS_UNSUPPORTED;
+		return FALSE;
+	}
+
+	if (address < OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS) {
+		*pStatus = OPENAVB_AECP_AA_STATUS_ADDRESS_TOO_LOW;
+		return FALSE;
+	}
+
+	offset = address - OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS;
+	if (offset > s_entityLogoLength) {
+		*pStatus = OPENAVB_AECP_AA_STATUS_ADDRESS_TOO_HIGH;
+		return FALSE;
+	}
+	if ((U64)requestedLength > (s_entityLogoLength - offset)) {
+		*pStatus = OPENAVB_AECP_AA_STATUS_ADDRESS_TOO_HIGH;
+		return FALSE;
+	}
+	if (requestedLength != 0 && !pBuf) {
+		*pStatus = OPENAVB_AECP_AA_STATUS_DATA_INVALID;
+		return FALSE;
+	}
+
+	if (requestedLength != 0) {
+		memcpy(pBuf, s_entityLogoData + offset, requestedLength);
+	}
+	if (pReadLength) {
+		*pReadLength = requestedLength;
+	}
+	*pStatus = OPENAVB_AECP_AA_STATUS_SUCCESS;
+	return TRUE;
 }
 
 // Start the AVDECC protocols.
@@ -506,11 +1277,17 @@ extern DLL_EXPORT bool openavbAvdeccCleanup(void)
 
 	openavbRC rc = openavbAemDestroy();
 
-	while (pFirstConfigurationCfg) {
-		openavb_avdecc_configuration_cfg_t *pDel = pFirstConfigurationCfg;
-		pFirstConfigurationCfg = pFirstConfigurationCfg->next;
-		free(pDel);
-	}
+	openavbAvdeccFreeConfigurationCfgList();
+	pConfiguration = NULL;
+	talker_stream_sources = 0;
+	listener_stream_sources = 0;
+	first_talker = 1;
+	first_listener = 1;
+	talker_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	listener_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	audio_clock_domain_idx = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	s_identifyControlIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavbAvdeccFreeEntityLogo();
 
 	if (IS_OPENAVB_FAILURE(rc)) {
 		AVB_TRACE_EXIT(AVB_TRACE_AVDECC);

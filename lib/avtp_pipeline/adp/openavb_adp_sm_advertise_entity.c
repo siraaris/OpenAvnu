@@ -90,10 +90,6 @@ void openavbAdpSMAdvertiseEntityStateMachine()
 					AVB_TRACE_LINE(AVB_TRACE_ADP);
 					AVB_LOG_DEBUG("State:  OPENAVB_ADP_SM_ADVERTISE_ENTITY_STATE_INITIALIZE");
 
-					ADP_LOCK();
-					openavbAdpSMGlobalVars.entityInfo.pdu.available_index = 0;
-					ADP_UNLOCK();
-
 					// The advertise interface will send the first advertisement on startup.
 					// This entity will be responsible for sending subsequent advertisements.
 					// This allows the advertise entity and advertise interface to startup without any inter-dependencies.
@@ -137,7 +133,6 @@ void openavbAdpSMAdvertiseEntityStateMachine()
 
 					ADP_LOCK();
 					openavbAdpSMAdvertiseInterfaceSet_rcvdDiscover(FALSE);
-					openavbAdpSMGlobalVars.entityInfo.pdu.available_index++;
 					ADP_UNLOCK();
 
 					// Wait for change in state

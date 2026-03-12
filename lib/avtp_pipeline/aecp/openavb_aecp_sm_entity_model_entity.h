@@ -48,6 +48,11 @@ typedef struct {
 	bool rcvdAEMCommand;
 	openavb_aecp_AEMCommandResponse_t unsolicited;
 	bool doUnsolicited;
+	bool unsolicitedControllerRegistered;
+	U8 unsolicitedControllerEntityId[8];
+	U8 unsolicitedControllerMac[ETH_ALEN];
+	U16 unsolicitedAemSequenceId;
+	U16 unsolicitedMvuSequenceId;
 
 	// Not part of spec
 	bool doTerminate;
@@ -67,5 +72,6 @@ void openavbAecpSMEntityModelEntitySet_rcvdCommand(openavb_aecp_AEMCommandRespon
 void openavbAecpSMEntityModelEntitySet_unsolicited(openavb_aecp_AEMCommandResponse_t *unsolicited);
 	// Note:  doUnsolicited is set during the call to openavbAecpSMEntityModelEntitySet_unsolicited()
 void openavbAecpSMEntityModelEntitySet_doTerminate(bool value);
+void openavbAecpSMEntityModelEntityNotifyStreamState(U16 descriptor_type, U16 descriptor_index);
 
 #endif // OPENAVB_AECP_SM_ENTITY_MODEL_ENTITY_H

@@ -272,11 +272,11 @@ static void openavbAdpMessageRxFrameReceive(U32 timeoutUsec)
 					}
 				}
 			}
-			else {
-				AVB_LOG_WARNING("Received non-AVTP frame!");
-				AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
-				AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
-			}
+				else {
+					AVB_LOG_DEBUG("Received non-AVTP frame.");
+					AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
+					AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+				}
 		}
 
 		// Release the frame
@@ -318,6 +318,15 @@ void openavbAdpMessageTxFrame(U8 msgType, U8 *destAddr)
 		memcpy(pBuf, destAddr, ETH_ALEN);
 
 	ADP_LOCK();
+	/*
+	 * Keep available_index tightly coupled to the serialized frame.
+	 * Incrementing here (instead of pre-send) avoids races where
+	 * concurrent sends can transmit stale/duplicate indices.
+	 */
+	if (msgType == OPENAVB_ADP_MESSAGE_TYPE_ENTITY_AVAILABLE) {
+		openavbAdpSMGlobalVars.entityInfo.pdu.available_index++;
+	}
+
 	U8 *pDst = pBuf + hdrlen;
 	{
 		// AVTP Control Header
@@ -461,4 +470,3 @@ openavbRC openavbAdpMessageSend(U8 messageType)
 	openavbAdpMessageTxFrame(messageType, NULL);
 	AVB_RC_TRACE_RET(OPENAVB_AVDECC_SUCCESS, AVB_TRACE_ADP);
 }
-

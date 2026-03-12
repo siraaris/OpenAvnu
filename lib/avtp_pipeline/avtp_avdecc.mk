@@ -1,5 +1,5 @@
 AVB_FEATURE_AVDECC ?= 1
-PLATFORM_TOOLCHAIN ?= generic
+PLATFORM_TOOLCHAIN ?= x86_i210_linux
 
 .PHONY: all clean
 
@@ -23,4 +23,3 @@ build_avdecc/Makefile:
 	      -DCMAKE_TOOLCHAIN_FILE=../platform/Linux/$(PLATFORM_TOOLCHAIN).cmake \
 	      -DAVB_FEATURE_AVDECC=$(AVB_FEATURE_AVDECC) \
 	      ..
-

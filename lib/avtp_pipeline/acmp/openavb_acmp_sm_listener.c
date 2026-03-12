@@ -51,6 +51,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_acmp_message.h"
 #include "openavb_acmp_sm_talker.h"
 #include "openavb_acmp_sm_listener.h"
+#include "openavb_aecp_sm_entity_model_entity.h"
 #include "openavb_avdecc_pipeline_interaction_pub.h"
 #include "openavb_time.h"
 
@@ -246,6 +247,23 @@ void openavbAcmpSMListener_txResponse(U8 messageType, openavb_acmp_ACMPCommandRe
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
 }
 
+static void openavbAcmpSMListenerClearStreamInputRuntimeState(
+	openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput)
+{
+	if (!pDescriptorStreamInput) {
+		return;
+	}
+
+	memset(pDescriptorStreamInput->acmp_stream_id, 0, sizeof(pDescriptorStreamInput->acmp_stream_id));
+	memset(pDescriptorStreamInput->acmp_dest_addr, 0, sizeof(pDescriptorStreamInput->acmp_dest_addr));
+	pDescriptorStreamInput->acmp_stream_vlan_id = 0;
+	pDescriptorStreamInput->acmp_flags = 0;
+	pDescriptorStreamInput->msrp_failure_code = 0;
+	memset(pDescriptorStreamInput->msrp_failure_bridge_id, 0, sizeof(pDescriptorStreamInput->msrp_failure_bridge_id));
+	pDescriptorStreamInput->stream_info_flags_ex &= ~OPENAVB_STREAM_INFO_FLAGS_EX_REGISTERING;
+	pDescriptorStreamInput->mvu_acmp_status = 0;
+}
+
 U8 openavbAcmpSMListener_connectListener(openavb_acmp_ACMPCommandResponse_t *response)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
@@ -345,17 +363,55 @@ U8 openavbAcmpSMListener_getState(openavb_acmp_ACMPCommandResponse_t *command)
 	AVB_TRACE_ENTRY(AVB_TRACE_ACMP);
 
 	U8 retStatus = OPENAVB_ACMP_STATUS_LISTENER_MISBEHAVING;
+	static const U8 sNullStreamId[8] = {0};
+	static const U8 sNullEntityId[8] = {0};
 
 	openavb_acmp_ListenerStreamInfo_t *pListenerStreamInfo = openavbArrayDataIdx(openavbAcmpSMListenerVars.listenerStreamInfos, command->listener_unique_id);
 	if (pListenerStreamInfo) {
+		bool haveTalkerId = FALSE;
+
 		memcpy(command->stream_id, pListenerStreamInfo->stream_id, sizeof(command->stream_id));
 		memcpy(command->talker_entity_id, pListenerStreamInfo->talker_entity_id, sizeof(command->talker_entity_id));
 		command->talker_unique_id = pListenerStreamInfo->talker_unique_id;
 		//command->listener_unique_id = command->listener_unique_id;				// Overwriting data in passed in structure
 		memcpy(command->stream_dest_mac, pListenerStreamInfo->stream_dest_mac, sizeof(command->stream_dest_mac));
-		command->connection_count = pListenerStreamInfo->connected ? 1 : 0;			// AVDECC_TODO - questionable information in spec.
 		command->flags = pListenerStreamInfo->flags;
 		command->stream_vlan_id = pListenerStreamInfo->stream_vlan_id;
+
+		if (memcmp(command->talker_entity_id, sNullEntityId, sizeof(command->talker_entity_id)) != 0) {
+			haveTalkerId = TRUE;
+		}
+		else {
+			U16 configIdx = openavbAemGetConfigIdx();
+			openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput =
+				openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, command->listener_unique_id);
+			if (pDescriptorStreamInput && pDescriptorStreamInput->mvu_bound &&
+					memcmp(pDescriptorStreamInput->mvu_talker_entity_id, sNullEntityId, sizeof(pDescriptorStreamInput->mvu_talker_entity_id)) != 0) {
+				memcpy(command->talker_entity_id,
+					pDescriptorStreamInput->mvu_talker_entity_id,
+					sizeof(command->talker_entity_id));
+				command->talker_unique_id = pDescriptorStreamInput->mvu_talker_stream_index;
+				haveTalkerId = TRUE;
+
+				if (memcmp(command->stream_id, sNullStreamId, sizeof(command->stream_id)) == 0) {
+					memcpy(command->stream_id,
+						pDescriptorStreamInput->mvu_talker_entity_id,
+						sizeof(pDescriptorStreamInput->mvu_talker_entity_id));
+					command->stream_id[6] = (U8)(pDescriptorStreamInput->mvu_talker_stream_index >> 8);
+					command->stream_id[7] = (U8)(pDescriptorStreamInput->mvu_talker_stream_index & 0xff);
+				}
+			}
+		}
+
+		command->connection_count = (pListenerStreamInfo->connected && haveTalkerId) ? 1 : 0;			// AVDECC_TODO - questionable information in spec.
+		if (command->connection_count == 0) {
+			memset(command->stream_id, 0, sizeof(command->stream_id));
+			memset(command->talker_entity_id, 0, sizeof(command->talker_entity_id));
+			command->talker_unique_id = 0;
+			memset(command->stream_dest_mac, 0, sizeof(command->stream_dest_mac));
+			command->flags = 0;
+			command->stream_vlan_id = 0;
+		}
 		retStatus = OPENAVB_ACMP_STATUS_SUCCESS;
 	}
 
@@ -495,6 +551,7 @@ void openavbAcmpSMListenerStateMachine()
 					U8 status;
 					if (openavbAcmpSMListener_validListenerUnique(pRcvdCmdResp->listener_unique_id)) {
 						openavb_acmp_ACMPCommandResponse_t response;
+						openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput = NULL;
 						memcpy(&response, pRcvdCmdResp, sizeof(response));
 						if (pRcvdCmdResp->status == OPENAVB_ACMP_STATUS_SUCCESS) {
 							status = openavbAcmpSMListener_connectListener(&response);
@@ -506,7 +563,7 @@ void openavbAcmpSMListenerStateMachine()
 						// Save the state for this connection, so it can potentially be fast connected later.
 						// TODO:  Add fast connect support for STREAMING_WAIT connections by handling START_STREAMING and STOP_STREAMING commands.
 						if (status == OPENAVB_ACMP_STATUS_SUCCESS) {
-							openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRcvdCmdResp->listener_unique_id);
+							pDescriptorStreamInput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRcvdCmdResp->listener_unique_id);
 							if (pDescriptorStreamInput != NULL && pDescriptorStreamInput->stream != NULL) {
 								if (gAvdeccCfg.bFastConnectSupported &&
 										(pRcvdCmdResp->flags & OPENAVB_ACMP_FLAG_STREAMING_WAIT) == 0) {
@@ -526,12 +583,24 @@ void openavbAcmpSMListenerStateMachine()
 
 								// Save the response flags for reference later.
 								pDescriptorStreamInput->acmp_flags = response.flags;
+								pDescriptorStreamInput->mvu_acmp_status = status;
 
 								// Save the stream information for reference later.
 								memcpy(pDescriptorStreamInput->acmp_stream_id, pRcvdCmdResp->stream_id, 8);
 								memcpy(pDescriptorStreamInput->acmp_dest_addr, pRcvdCmdResp->stream_dest_mac, 6);
 								pDescriptorStreamInput->acmp_stream_vlan_id = pRcvdCmdResp->stream_vlan_id;
 							}
+						}
+						else {
+							pDescriptorStreamInput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRcvdCmdResp->listener_unique_id);
+							if (pDescriptorStreamInput != NULL) {
+								pDescriptorStreamInput->mvu_acmp_status = status;
+							}
+						}
+						if (pDescriptorStreamInput != NULL) {
+							openavbAecpSMEntityModelEntityNotifyStreamState(
+								OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+								pRcvdCmdResp->listener_unique_id);
 						}
 
 						openavb_list_node_t node = openavbAcmpSMListener_findInflightNodeFromCommand(pRcvdCmdResp);
@@ -574,6 +643,7 @@ void openavbAcmpSMListenerStateMachine()
 
 					if (openavbAcmpSMListener_validListenerUnique(pRcvdCmdResp->listener_unique_id)) {
 						U8 status;
+						bool notifyStreamState = FALSE;
 
 						openavb_acmp_ACMPCommandResponse_t response;
 						memcpy(&response, pRcvdCmdResp, sizeof(response));
@@ -589,10 +659,29 @@ void openavbAcmpSMListenerStateMachine()
 						if (gAvdeccCfg.bFastConnectSupported) {
 							U16 configIdx = openavbAemGetConfigIdx();
 							openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput = openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRcvdCmdResp->listener_unique_id);
-							if (pDescriptorStreamInput != NULL && pDescriptorStreamInput->stream != NULL) {
+							if (pDescriptorStreamInput != NULL) {
 								pDescriptorStreamInput->fast_connect_status = OPENAVB_FAST_CONNECT_STATUS_NOT_AVAILABLE;
-								openavbAvdeccClearSavedState(pDescriptorStreamInput->stream);
+								if (pDescriptorStreamInput->stream != NULL) {
+									openavbAvdeccClearSavedState(pDescriptorStreamInput->stream);
+								}
+								if (status == OPENAVB_ACMP_STATUS_SUCCESS) {
+									openavbAcmpSMListenerClearStreamInputRuntimeState(pDescriptorStreamInput);
+									notifyStreamState = TRUE;
+								}
 							}
+						}
+						else if (status == OPENAVB_ACMP_STATUS_SUCCESS) {
+							U16 configIdx = openavbAemGetConfigIdx();
+							openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput = openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRcvdCmdResp->listener_unique_id);
+							if (pDescriptorStreamInput != NULL) {
+								openavbAcmpSMListenerClearStreamInputRuntimeState(pDescriptorStreamInput);
+								notifyStreamState = TRUE;
+							}
+						}
+						if (notifyStreamState) {
+							openavbAecpSMEntityModelEntityNotifyStreamState(
+								OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+								pRcvdCmdResp->listener_unique_id);
 						}
 					}
 					else {
@@ -640,6 +729,10 @@ void openavbAcmpSMListenerStateMachine()
 								if (pDescriptorStreamInput != NULL &&
 										pDescriptorStreamInput->fast_connect_status == OPENAVB_FAST_CONNECT_STATUS_IN_PROGRESS) {
 									pDescriptorStreamInput->fast_connect_status = OPENAVB_FAST_CONNECT_STATUS_TIMED_OUT;
+									pDescriptorStreamInput->mvu_acmp_status = OPENAVB_ACMP_STATUS_LISTENER_TALKER_TIMEOUT;
+									openavbAecpSMEntityModelEntityNotifyStreamState(
+										OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+										pInflightActive->command.listener_unique_id);
 								}
 #if 0
 								// Wait another CONNECT_TX_COMMAND timeout period and then try again.
@@ -770,7 +863,7 @@ void openavbAcmpSMListenerStop()
 	SEM_DESTROY(openavbAcmpSMListenerSemaphore, err);
 	SEM_LOG_ERR(err);
 
-	openavbListDeleteList(openavbAcmpSMListenerVars.inflight);
+	openavbListDeleteListShallow(openavbAcmpSMListenerVars.inflight);
 	openavbArrayDeleteArray(openavbAcmpSMListenerVars.listenerStreamInfos);
 
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
@@ -901,6 +994,7 @@ void openavbAcmpSMListenerSet_doFastConnect(const openavb_tl_data_cfg_t *pListen
 	pDescriptor->fast_connect_status = OPENAVB_FAST_CONNECT_STATUS_IN_PROGRESS;
 	memcpy(pDescriptor->fast_connect_talker_entity_id, talker_entity_id, sizeof(pDescriptor->fast_connect_talker_entity_id));
 	CLOCK_GETTIME(OPENAVB_CLOCK_REALTIME, &pDescriptor->fast_connect_start_time);
+	openavbAecpSMEntityModelEntityNotifyStreamState(OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, listenerUniqueId);
 
 	// Create a fake CONNECT_RX_COMMAND to kick off the fast connect process.
 	// The FAST_CONNECT flag is used to indicate internally that the controller didn't initiate this.
@@ -930,6 +1024,128 @@ void openavbAcmpSMListenerSet_doFastConnect(const openavb_tl_data_cfg_t *pListen
 
 	// Start processing the faked command.
 	openavbAcmpSMListenerSet_rcvdConnectRXCmd(&command);
+}
+
+bool openavbAcmpSMListenerSet_doConnect(
+	const openavb_tl_data_cfg_t *pListener,
+	U16 flags,
+	U16 talker_unique_id,
+	const U8 talker_entity_id[8],
+	const U8 controller_entity_id[8])
+{
+	openavb_acmp_ACMPCommandResponse_t command;
+	openavb_aem_descriptor_stream_io_t *pDescriptor;
+	U16 listenerUniqueId;
+	static U16 s_sequence_id = 0;
+
+	if (!pListener || !talker_entity_id || !controller_entity_id) {
+		return FALSE;
+	}
+
+	for (listenerUniqueId = 0; listenerUniqueId < 0xFFFF; ++listenerUniqueId) {
+		pDescriptor = openavbAemGetDescriptor(
+			openavbAemGetConfigIdx(),
+			OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+			listenerUniqueId);
+		if (!pDescriptor) {
+			AVB_LOG_ERROR("Unable to find listener_unique_id for connect");
+			return FALSE;
+		}
+		if (pDescriptor->stream &&
+				strcmp(pDescriptor->stream->friendly_name, pListener->friendly_name) == 0) {
+			break;
+		}
+	}
+
+	memset(&command, 0, sizeof(command));
+	command.message_type = OPENAVB_ACMP_MESSAGE_TYPE_CONNECT_RX_COMMAND;
+	memset(command.stream_id, 0xFF, sizeof(command.stream_id));
+	memcpy(command.controller_entity_id, controller_entity_id, sizeof(command.controller_entity_id));
+	memcpy(command.talker_entity_id, talker_entity_id, sizeof(command.talker_entity_id));
+	memcpy(command.listener_entity_id, openavbAcmpSMGlobalVars.my_id, sizeof(command.listener_entity_id));
+	command.talker_unique_id = talker_unique_id;
+	command.listener_unique_id = listenerUniqueId;
+	memset(command.stream_dest_mac, 0xFF, sizeof(command.stream_dest_mac));
+	command.sequence_id = ++s_sequence_id;
+	command.flags = flags;
+
+	AVB_LOGF_INFO("Listener %s attempting connect to flags=0x%04x, talker_unique_id=0x%04x, talker_entity_id=" ENTITYID_FORMAT ", controller_entity_id=" ENTITYID_FORMAT,
+			pListener->friendly_name,
+			flags,
+			talker_unique_id,
+			ENTITYID_ARGS(talker_entity_id),
+			ENTITYID_ARGS(controller_entity_id));
+
+	openavbAcmpSMListenerSet_rcvdConnectRXCmd(&command);
+	return TRUE;
+}
+
+bool openavbAcmpSMListenerSet_doDisconnect(
+	const openavb_tl_data_cfg_t *pListener,
+	const U8 controller_entity_id[8])
+{
+	openavb_acmp_ACMPCommandResponse_t command;
+	openavb_aem_descriptor_stream_io_t *pDescriptor;
+	openavb_acmp_ListenerStreamInfo_t *pListenerStreamInfo;
+	U16 listenerUniqueId;
+	static U16 s_sequence_id = 0;
+
+	if (!pListener) {
+		return FALSE;
+	}
+
+	for (listenerUniqueId = 0; listenerUniqueId < 0xFFFF; ++listenerUniqueId) {
+		pDescriptor = openavbAemGetDescriptor(openavbAemGetConfigIdx(),
+			OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+			listenerUniqueId);
+		if (!pDescriptor) {
+			AVB_LOG_ERROR("Unable to find listener_unique_id for disconnect");
+			return FALSE;
+		}
+		if (pDescriptor->stream &&
+				strcmp(pDescriptor->stream->friendly_name, pListener->friendly_name) == 0) {
+			break;
+		}
+	}
+
+	pListenerStreamInfo = openavbArrayDataIdx(
+		openavbAcmpSMListenerVars.listenerStreamInfos,
+		listenerUniqueId);
+	if (!pListenerStreamInfo || !pListenerStreamInfo->connected) {
+		return FALSE;
+	}
+
+	memset(&command, 0, sizeof(command));
+	command.message_type = OPENAVB_ACMP_MESSAGE_TYPE_DISCONNECT_RX_COMMAND;
+	memcpy(command.stream_id, pListenerStreamInfo->stream_id, sizeof(command.stream_id));
+	if (controller_entity_id) {
+		memcpy(command.controller_entity_id, controller_entity_id, sizeof(command.controller_entity_id));
+	}
+	else {
+		memcpy(command.controller_entity_id,
+			pListenerStreamInfo->controller_entity_id,
+			sizeof(command.controller_entity_id));
+	}
+	memcpy(command.talker_entity_id,
+		pListenerStreamInfo->talker_entity_id,
+		sizeof(command.talker_entity_id));
+	memcpy(command.listener_entity_id, openavbAcmpSMGlobalVars.my_id, sizeof(command.listener_entity_id));
+	command.talker_unique_id = pListenerStreamInfo->talker_unique_id;
+	command.listener_unique_id = listenerUniqueId;
+	memcpy(command.stream_dest_mac,
+		pListenerStreamInfo->stream_dest_mac,
+		sizeof(command.stream_dest_mac));
+	command.sequence_id = ++s_sequence_id;
+	command.flags = pListenerStreamInfo->flags;
+	command.stream_vlan_id = pListenerStreamInfo->stream_vlan_id;
+
+	AVB_LOGF_INFO("Listener %s requesting disconnect from talker_unique_id=0x%04x, talker_entity_id=" ENTITYID_FORMAT,
+		pListener->friendly_name,
+		command.talker_unique_id,
+		ENTITYID_ARGS(command.talker_entity_id));
+
+	openavbAcmpSMListenerSet_rcvdDisconnectRXCmd(&command);
+	return TRUE;
 }
 
 // Assist function to detect if Talker available for fast connect

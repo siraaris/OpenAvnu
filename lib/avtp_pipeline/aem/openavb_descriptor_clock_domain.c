@@ -188,10 +188,15 @@ extern DLL_EXPORT bool openavbAemDescriptorClockDomainInitialize(openavb_aem_des
 {
 	int i;
 	openavb_aem_descriptor_clock_source_t *pClockSourceDescriptor;
+	U16 previousClockSource = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	bool previousClockSourceValid = FALSE;
 
 	if (!pDescriptor || !pConfig) {
 		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVDECC_FAILURE | OPENAVB_RC_INVALID_ARGUMENT), AVB_TRACE_AEM);
 	}
+
+	previousClockSource = pDescriptor->clock_source_index;
+	pDescriptor->clock_sources_count = 0;
 
 	// Specify a name.
 	strcpy((char *)(pDescriptor->object_name), "Clock Domain");
@@ -203,6 +208,18 @@ extern DLL_EXPORT bool openavbAemDescriptorClockDomainInitialize(openavb_aem_des
 		if (pClockSourceDescriptor == NULL) { break; }
 		pDescriptor->clock_sources[i] = pClockSourceDescriptor->descriptor_index;
 		pDescriptor->clock_sources_count = i + 1;
+		if (pDescriptor->clock_sources[i] == previousClockSource) {
+			previousClockSourceValid = TRUE;
+		}
+	}
+
+	if (pDescriptor->clock_sources_count > 0) {
+		if (!previousClockSourceValid) {
+			pDescriptor->clock_source_index = pDescriptor->clock_sources[0];
+		}
+	}
+	else {
+		pDescriptor->clock_source_index = OPENAVB_AEM_DESCRIPTOR_INVALID;
 	}
 
 	return TRUE;

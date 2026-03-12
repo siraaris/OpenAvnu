@@ -29,30 +29,19 @@ Complete license and copyright information can be found at
 https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 *************************************************************************************************************/
 
-#ifndef OPENAVB_AVDECC_MSG_SERVER_H
-#define OPENAVB_AVDECC_MSG_SERVER_H
+/*
+ ******************************************************************
+ * MODULE : AEM - AVDECC Timing Descriptor
+ * MODULE SUMMARY : Interface for the Timing Descriptor
+ ******************************************************************
+ */
 
-#include "openavb_types.h"
-#include "openavb_avdecc_msg.h"
+#ifndef OPENAVB_DESCRIPTOR_TIMING_H
+#define OPENAVB_DESCRIPTOR_TIMING_H 1
 
-typedef struct openavb_tl_data_cfg openavb_tl_data_cfg_t;
+#include "openavb_descriptor_timing_pub.h"
 
-struct _avdecc_msg_state {
+#define OPENAVB_DESCRIPTOR_TIMING_BASE_LENGTH (76)
+#define OPENAVB_DESCRIPTOR_TIMING_PTP_INSTANCE_LENGTH (2)
 
-	// Handle to the AVDECC Msg handle for the connection to the server.
-	int avdeccMsgHandle;
-
-	// TRUE if a Talker, FALSE if a Listener.
-	bool bTalker;
-
-	// Local stream that matches the client's Talker/Listener.
-	// Do not free this pointer; it is for reference only.
-	openavb_tl_data_cfg_t * stream;
-
-	// Talker/Listener state information.
-	openavbAvdeccMsgStateType_t lastRequestedState;
-	openavbAvdeccMsgStateType_t lastReportedState;
-	openavb_avtp_diag_counters_t counters;
-};
-
-#endif // OPENAVB_AVDECC_MSG_SERVER_H
+#endif // OPENAVB_DESCRIPTOR_TIMING_H

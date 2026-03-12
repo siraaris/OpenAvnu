@@ -37,6 +37,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define OPENAVB_AVDECC_MSG_H
 
 #include "openavb_types.h"
+#include "openavb_avtp.h"
 
 #define AVB_AVDECC_MSG_HANDLE_INVALID	(-1)
 #define AVDECC_MSG_RECONNECT_SECONDS	10
@@ -89,13 +90,16 @@ typedef enum {
 	OPENAVB_AVDECC_MSG_VERSION_REQUEST,
 	OPENAVB_AVDECC_MSG_CLIENT_INIT_IDENTIFY,
 	OPENAVB_AVDECC_MSG_C2S_TALKER_STREAM_ID,
+	OPENAVB_AVDECC_MSG_C2S_LISTENER_SRP_INFO,
 	OPENAVB_AVDECC_MSG_CLIENT_CHANGE_NOTIFICATION,
+	OPENAVB_AVDECC_MSG_C2S_COUNTERS_UPDATE,
 
 	// Server-to-Client messages
 	OPENAVB_AVDECC_MSG_VERSION_CALLBACK,
 	OPENAVB_AVDECC_MSG_LISTENER_STREAM_ID,
 	OPENAVB_AVDECC_MSG_S2C_TALKER_STREAM_ID,
 	OPENAVB_AVDECC_MSG_CLIENT_CHANGE_REQUEST,
+	OPENAVB_AVDECC_MSG_CLOCK_SOURCE_UPDATE,
 } openavbAvdeccMsgType_t;
 
 //////////////////////////////
@@ -118,8 +122,18 @@ typedef struct {
 } openavbAvdeccMsgParams_C2S_TalkerStreamID_t;
 
 typedef struct {
+	U8 talker_decl; // openavbSrpAttribType_t value
+	U8 msrp_failure_code; // IEEE 802.1Q MSRP failure code (when talker_decl == TalkerFailed)
+	U8 msrp_failure_bridge_id[8]; // Bridge ID from SRP TalkerFailed
+} openavbAvdeccMsgParams_C2S_ListenerSrpInfo_t;
+
+typedef struct {
 	U8 current_state; // Convert to openavbAvdeccMsgStateType_t
 } openavbAvdeccMsgParams_ClientChangeNotification_t;
+
+typedef struct {
+	openavb_avtp_diag_counters_t counters;
+} openavbAvdeccMsgParams_C2S_CountersUpdate_t;
 
 //////////////////////////////
 // Server-to-Client messages parameters
@@ -150,6 +164,15 @@ typedef struct {
 typedef struct {
 	U8 desired_state; // Convert to openavbAvdeccMsgStateType_t
 } openavbAvdeccMsgParams_ClientChangeRequest_t;
+
+typedef struct {
+	U16 clock_domain_index;
+	U16 clock_source_index;
+	U16 clock_source_flags;
+	U16 clock_source_type;
+	U16 clock_source_location_type;
+	U16 clock_source_location_index;
+} openavbAvdeccMsgParams_ClockSourceUpdate_t;
 
 #define OPENAVB_AVDECC_MSG_LEN sizeof(openavbAvdeccMessage_t)
 
@@ -189,6 +212,10 @@ bool openavbAvdeccMsgSrvrHndlInitIdentifyFromClient(int avdeccMsgHandle, char * 
 bool openavbAvdeccMsgClntTalkerStreamID(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id);
 bool openavbAvdeccMsgSrvrHndlTalkerStreamIDFromClient(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id);
 
+// Listener notifies server about SRP declaration state/failure details.
+bool openavbAvdeccMsgClntListenerSrpInfo(int avdeccMsgHandle, U8 talker_decl, U8 msrp_failure_code, const U8 msrp_failure_bridge_id[8]);
+bool openavbAvdeccMsgSrvrHndlListenerSrpInfoFromClient(int avdeccMsgHandle, U8 talker_decl, U8 msrp_failure_code, const U8 msrp_failure_bridge_id[8]);
+
 // Server notify the client of the stream values for the Listener to use.
 bool openavbAvdeccMsgSrvrListenerStreamID(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id);
 bool openavbAvdeccMsgClntHndlListenerStreamIDFromServer(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id);
@@ -212,5 +239,27 @@ bool openavbAvdeccMsgSrvrChangeRequest(int avdeccMsgHandle, openavbAvdeccMsgStat
 bool openavbAvdeccMsgClntHndlChangeRequestFromServer(int avdeccMsgHandle, openavbAvdeccMsgStateType_t desiredState);
 bool openavbAvdeccMsgClntChangeNotification(int avdeccMsgHandle, openavbAvdeccMsgStateType_t currentState);
 bool openavbAvdeccMsgSrvrHndlChangeNotificationFromClient(int avdeccMsgHandle, openavbAvdeccMsgStateType_t currentState);
+
+// Client publishes cumulative counters to the AVDECC Msg server.
+bool openavbAvdeccMsgClntCountersUpdate(int avdeccMsgHandle, const openavb_avtp_diag_counters_t *pCounters);
+bool openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(int avdeccMsgHandle, const openavb_avtp_diag_counters_t *pCounters);
+
+// Server notifies the client that selected clock source changed.
+bool openavbAvdeccMsgSrvrClockSourceUpdate(
+	int avdeccMsgHandle,
+	U16 clock_domain_index,
+	U16 clock_source_index,
+	U16 clock_source_flags,
+	U16 clock_source_type,
+	U16 clock_source_location_type,
+	U16 clock_source_location_index);
+bool openavbAvdeccMsgClntHndlClockSourceUpdateFromServer(
+	int avdeccMsgHandle,
+	U16 clock_domain_index,
+	U16 clock_source_index,
+	U16 clock_source_flags,
+	U16 clock_source_type,
+	U16 clock_source_location_type,
+	U16 clock_source_location_index);
 
 #endif // OPENAVB_AVDECC_MSG_H
