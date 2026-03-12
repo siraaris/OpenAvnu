@@ -175,18 +175,19 @@ static int cfgCallback(void *user, const char *section, const char *name, const 
 			return 0;
 		}
 	}
-	else if (MATCH(section, "maap"))
-	{
-		if (MATCH(name, "port")) {
-			errno = 0;
-			unsigned temp = strtoul(value, &pEnd, 10);
-			if (*pEnd == '\0' && errno == 0) {
-				if (temp >= 1 && temp <= 65535) {
-					pCfg->maapPort = temp;
-					valOK = TRUE;
+		else if (MATCH(section, "maap"))
+		{
+			if (MATCH(name, "port")) {
+				errno = 0;
+				unsigned temp = strtoul(value, &pEnd, 10);
+				if (*pEnd == '\0' && errno == 0) {
+					// 0 disables MAAP usage; otherwise valid TCP/UDP port range.
+					if (temp <= 65535) {
+						pCfg->maapPort = temp;
+						valOK = TRUE;
+					}
 				}
 			}
-		}
 		else {
 			// unmatched item, fail
 			AVB_LOGF_ERROR("Unrecognized configuration item: section=%s, name=%s", section, name);
@@ -194,18 +195,19 @@ static int cfgCallback(void *user, const char *section, const char *name, const 
 			return 0;
 		}
 	}
-	else if (MATCH(section, "shaper"))
-	{
-		if (MATCH(name, "port")) {
-			errno = 0;
-			unsigned temp = strtoul(value, &pEnd, 10);
-			if (*pEnd == '\0' && errno == 0) {
-				if (temp >= 1 && temp <= 65535) {
-					pCfg->shaperPort = temp;
-					valOK = TRUE;
+		else if (MATCH(section, "shaper"))
+		{
+			if (MATCH(name, "port")) {
+				errno = 0;
+				unsigned temp = strtoul(value, &pEnd, 10);
+				if (*pEnd == '\0' && errno == 0) {
+					// 0 disables Shaper usage; otherwise valid TCP/UDP port range.
+					if (temp <= 65535) {
+						pCfg->shaperPort = temp;
+						valOK = TRUE;
+					}
 				}
 			}
-		}
 		else {
 			// unmatched item, fail
 			AVB_LOGF_ERROR("Unrecognized configuration item: section=%s, name=%s", section, name);

@@ -38,9 +38,16 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 typedef struct {
 	base_rawsock_t base;
 	pcap_t *handle;
+	U8 txBuffer[1518];
+	struct pcap_pkthdr *rxHeader;
 	device_t *igb_dev;
 	struct igb_packet *tx_packet;
 	int queue;
+	U32 txDebugLogCount;
+	U64 txDiagPackets;
+	U64 txDiagBytes;
+	U64 txDiagErrors;
+	int txLastMark;
 	unsigned long txOutOfBuffer;
 	unsigned long txOutOfBufferCyclic;
 } igb_rawsock_t;

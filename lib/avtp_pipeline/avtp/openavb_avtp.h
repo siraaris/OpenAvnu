@@ -81,6 +81,50 @@ typedef struct {
 	media_q_t 				mediaq;
 } avtp_state_t;
 
+typedef struct
+{
+	U32 stream_start;
+	U32 stream_stop;
+	U32 stream_interrupted;
+	U32 media_locked;
+	U32 media_unlocked;
+	U32 seq_num_mismatch;
+	U32 media_reset;
+	U32 timestamp_uncertain;
+	U32 timestamp_valid;
+	U32 timestamp_not_valid;
+	U32 unsupported_format;
+	U32 late_timestamp;
+	U32 early_timestamp;
+	U32 frames_rx;
+	U32 frames_tx;
+} openavb_avtp_diag_counters_t;
+
+static inline void openavbAvtpDiagCountersAccumulate(
+	openavb_avtp_diag_counters_t *pDst,
+	const openavb_avtp_diag_counters_t *pSrc)
+{
+	if (!pDst || !pSrc) {
+		return;
+	}
+
+	pDst->stream_start += pSrc->stream_start;
+	pDst->stream_stop += pSrc->stream_stop;
+	pDst->stream_interrupted += pSrc->stream_interrupted;
+	pDst->media_locked += pSrc->media_locked;
+	pDst->media_unlocked += pSrc->media_unlocked;
+	pDst->seq_num_mismatch += pSrc->seq_num_mismatch;
+	pDst->media_reset += pSrc->media_reset;
+	pDst->timestamp_uncertain += pSrc->timestamp_uncertain;
+	pDst->timestamp_valid += pSrc->timestamp_valid;
+	pDst->timestamp_not_valid += pSrc->timestamp_not_valid;
+	pDst->unsupported_format += pSrc->unsupported_format;
+	pDst->late_timestamp += pSrc->late_timestamp;
+	pDst->early_timestamp += pSrc->early_timestamp;
+	pDst->frames_rx += pSrc->frames_rx;
+	pDst->frames_tx += pSrc->frames_tx;
+}
+
 
 /* Info associated with an AVTP stream (RX or TX).
  *
@@ -113,6 +157,8 @@ typedef struct
 	U16 frameLen;
 	// AVTP sequence number
 	U8 avtp_sequence_num;
+	// AVTP MR bit state; toggled when media clock source changes.
+	bool media_restart_toggle;
 	// Paused state of the stream
 	bool bPause;
 	// Encapsulation-specific state information
@@ -140,6 +186,17 @@ typedef struct
 	int nLost;
 	// Bytes sent or recieved
 	U64 bytes;
+	// Per-stream launch debug line count
+	U32 tx_launch_log_count;
+
+	// Milan / AECP diagnostic counters for the current AVTP session.
+	openavb_avtp_diag_counters_t diag;
+	bool rx_mr_valid;
+	bool rx_last_mr;
+	bool rx_tu_valid;
+	bool rx_last_tu;
+	bool tx_tu_valid;
+	bool tx_last_tu;
 	
 } avtp_stream_t;
 
@@ -177,6 +234,7 @@ openavbRC openavbAvtpRx(void *handle);
 void openavbAvtpConfigTimsstampEval(void *handle, U32 tsInterval, U32 reportInterval, bool smoothing, U32 tsMaxJitter, U32 tsMaxDrift);
 
 void openavbAvtpPause(void *handle, bool bPause);
+void openavbAvtpRequestMediaRestart(void *handle);
 
 void openavbAvtpShutdownTalker(void *handle);
 void openavbAvtpShutdownListener(void *handle);
@@ -188,5 +246,7 @@ int openavbAvtpRxBufferLevel(void *handle);
 int openavbAvtpLost(void *handle);
 
 U64 openavbAvtpBytes(void *handle);
+
+void openavbAvtpGetDiagCounters(void *handle, openavb_avtp_diag_counters_t *pCounters);
 
 #endif //AVB_AVTP_H

@@ -428,6 +428,9 @@ EXTERN_DLL_EXPORT bool openavbTLConfigure(tl_handle_t handle, openavb_tl_cfg_t *
 	pTLState->cfg.stream_addr.mac = &pTLState->cfg.stream_addr.buffer;
 
 	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
+	pTLState->pMediaQ->debug_stream_uid = pCfg->stream_uid;
+	strncpy(pTLState->pMediaQ->debug_friendly_name, pCfg->friendly_name, sizeof(pTLState->pMediaQ->debug_friendly_name) - 1);
+	pTLState->pMediaQ->debug_friendly_name[sizeof(pTLState->pMediaQ->debug_friendly_name) - 1] = '\0';
 
 	if (!((pCfg->role == AVB_ROLE_TALKER) || (pCfg->role == AVB_ROLE_LISTENER))) {
 		AVB_LOG_ERROR("Talker - Listener Config Error: invalid role");
@@ -762,6 +765,5 @@ EXTERN_DLL_EXPORT void openavbTLPauseStream(tl_handle_t handle, bool bPause)
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 }
-
 
 

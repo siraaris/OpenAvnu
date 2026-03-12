@@ -49,6 +49,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <string.h>
 
 #include "openavb_endpoint.h"
+#include "openavb_srp.h"
 #include "openavb_trace.h"
 
 //#define AVB_LOG_LEVEL  AVB_LOG_LEVEL_DEBUG
@@ -263,11 +264,19 @@ bool openavbEptSrvrRegisterStream(int h,
 
 	// If the Shaper is available, enable it.
 	if (openavbShaperDaemonAvailable() && ps->txRate) {
+		int measurement_interval = (ps->srClass == SR_CLASS_A)
+			? (MICROSECONDS_PER_SECOND / SR_CLASS_A_FPS)
+			: (MICROSECONDS_PER_SECOND / SR_CLASS_B_FPS);
+		int max_frames_per_interval = ps->tSpec.maxIntervalFrames;
+		if (max_frames_per_interval <= 0) {
+			max_frames_per_interval = 1;
+		}
+
 		ps->hndShaper = openavbShaperHandle(
 			ps->srClass,
-			MICROSECONDS_PER_SECOND / ps->txRate, /* Note that division rounds down, which is what we want. */
+			measurement_interval,
 			tSpec->maxFrameSize + 18 /* Header size */,
-			1,
+			max_frames_per_interval,
 			ps->destAddr);
 		if (!ps->hndShaper) {
 			AVB_LOG_ERROR("Unable to start Shaping");

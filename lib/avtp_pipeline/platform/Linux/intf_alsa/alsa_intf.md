@@ -21,6 +21,12 @@ intf_nv_allow_resampling  | If 1 software resampling allowed, disallowed otherwi
 intf_nv_start_threshold_periods | Playback start threshold measured in ALSA periods (2 by default)
 intf_nv_period_time       | Approximate ALSA period duration in microseconds
 intf_nv_clock_skew_ppb    | Estimate of media clock skew in Parts Per Billion (nanoseconds per second)
+intf_nv_drift_log_interval_sec | If >0, logs measured drift between ALSA frame progression and AVTP timestamp progression every N seconds (talker side)
+intf_nv_drift_comp_enable | If 1, enables adaptive fixed-timestamp skew compensation from measured drift
+intf_nv_drift_comp_gain | Compensation loop gain (typical 0.1 to 0.5)
+intf_nv_drift_comp_max_step_skew_ppb | Max skew adjustment per update interval
+intf_nv_drift_comp_min_skew_ppb | Minimum allowed skew value
+intf_nv_drift_comp_max_skew_ppb | Maximum allowed skew value
 
 <br>
 # Notes
@@ -38,4 +44,3 @@ assigned directly
 
 Values assigned in the intf_cfg_cb function will override any values set in the 
 initialization function. 
-

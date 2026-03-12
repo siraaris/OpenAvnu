@@ -66,5 +66,8 @@ bool osalClockGettime(openavb_clockId_t openavbClockId, struct timespec *getTime
 // Gets current time as U64 nSec. Returns 0 on success otherwise -1
 bool osalClockGettime64(openavb_clockId_t openavbClockId, U64 *timeNsec);
 
+// Monotonic generation counter bumped when GPTP walltime enters holdover due to a discontinuity.
+U32 osalClockGetWalltimeRecoveryGeneration(void);
+
 
 #endif // _OPENAVB_TIME_OSAL_PUB_H

@@ -32,17 +32,39 @@
 ******************************************************************************/
 
 /* control debug logging output on stdout */
+#ifndef LOG_MRP
 #define LOG_MRP 0
+#endif
+#ifndef LOG_MVRP
 #define LOG_MVRP 0
+#endif
+#ifndef LOG_MMRP
 #define LOG_MMRP 0
+#endif
+#ifndef LOG_MSRP
 #define LOG_MSRP 0
+#endif
+#ifndef LOG_POLL_EVENTS
 #define LOG_POLL_EVENTS 0
+#endif
+#ifndef LOG_TIMERS
 #define LOG_TIMERS 0
+#endif
+#ifndef LOG_MSRP_GARBAGE_COLLECTION
 #define LOG_MSRP_GARBAGE_COLLECTION 0
+#endif
+#ifndef LOG_TXNOW
 #define LOG_TXNOW 0
+#endif
+#ifndef LOG_CLIENT_RECV
 #define LOG_CLIENT_RECV 0
+#endif
+#ifndef LOG_CLIENT_SEND
 #define LOG_CLIENT_SEND 0
-#define LOG_ERRORS	0
+#endif
+#ifndef LOG_ERRORS
+#define LOG_ERRORS 0
+#endif
 
 #define MRP_DEFAULT_POINT_TO_POINT_MAC	1	/* operPointToPointMAC */
 #define MRP_ENCODE_YES		0	/* must send */

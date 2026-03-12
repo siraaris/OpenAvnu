@@ -146,6 +146,29 @@ static int cfgCallback(void *user, const char *section, const char *name, const 
 			return 0;
 		}
 	}
+	else if (MATCH(section, "identify"))
+	{
+		if (MATCH(name, "control_timeout_sec")) {
+			unsigned long timeoutSec;
+
+			errno = 0;
+			timeoutSec = strtoul(value, &pEnd, 10);
+			if (*pEnd == '\0' && errno == 0) {
+				if (timeoutSec < 1 || timeoutSec > 65535UL) {
+					AVB_LOG_ERROR("control_timeout_sec must be between 1 and 65535 (inclusive)");
+					AVB_TRACE_EXIT(AVB_TRACE_ENDPOINT);
+					return 0;
+				}
+				pCfg->identify_control_timeout_sec = (U16)timeoutSec;
+				valOK = TRUE;
+			}
+		}
+		else {
+			AVB_LOGF_ERROR("Unrecognized configuration item: section=%s, name=%s", section, name);
+			AVB_TRACE_EXIT(AVB_TRACE_ENDPOINT);
+			return 0;
+		}
+	}
 	else if (MATCH(section, "descriptor_entity"))
 	{
 		if (MATCH(name, "avdeccId")) {
@@ -251,6 +274,7 @@ int openavbReadAvdeccConfig(const char *ini_file, openavb_avdecc_cfg_t *pCfg)
 	// defaults - most are handled by setting everything to 0
 	memset(pCfg, 0, sizeof(openavb_avdecc_cfg_t));
 	pCfg->valid_time = 31; // See IEEE Std 1722.1-2013 clause 6.2.1.6
+	pCfg->identify_control_timeout_sec = 10;
 	pCfg->avdeccId = 0xfffe;
 
 	int result = ini_parse(ini_file, cfgCallback, pCfg);

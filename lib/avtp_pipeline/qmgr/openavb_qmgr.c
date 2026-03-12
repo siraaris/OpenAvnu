@@ -86,6 +86,15 @@ pthread_mutex_t qmgr_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 #define LOCK()  	pthread_mutex_lock(&qmgr_mutex)
 #define UNLOCK()	pthread_mutex_unlock(&qmgr_mutex)
 
+static bool qmgrUsesHardwareQueues(void)
+{
+	return (qdisc_data.mode == AVB_SHAPER_HWQ_PER_CLASS
+#ifdef AVB_ENABLE_HWQ_PER_STREAM
+		|| qdisc_data.mode == AVB_SHAPER_HWQ_PER_STREAM
+#endif
+		);
+}
+
 // Information for each SR class
 typedef struct {
 	unsigned classBytesPerSec;
@@ -181,10 +190,10 @@ U16 openavbQmgrAddStream(SRClassIdx_t nClass, unsigned classRate, unsigned maxIn
 			AVB_LOGF_ERROR("Adding stream; too many streams in class %d", nClass);
 		} else {
 
-			if (qdisc_data.mode != AVB_SHAPER_DISABLED) {
-				if (!setupHWQueue(nClass, qmgr_classes[nClass].classBytesPerSec + streamBytesPerSec)) {
-					fwmark = INVALID_FWMARK;
-				}
+				if (qmgrUsesHardwareQueues()) {
+					if (!setupHWQueue(nClass, qmgr_classes[nClass].classBytesPerSec + streamBytesPerSec)) {
+						fwmark = INVALID_FWMARK;
+					}
 			}
 
 			if (fwmark != INVALID_FWMARK) {
@@ -233,9 +242,9 @@ void openavbQmgrRemoveStream(U16 fwmark)
 		AVB_LOG_ERROR("Removing stream; invalid argument or data");
 	}
 	else {
-		if (qdisc_data.mode != AVB_SHAPER_DISABLED) {
-			setupHWQueue(nClass, qmgr_classes[nClass].classBytesPerSec - qmgr_streams[idx].streamBytesPerSec);
-		}
+			if (qmgrUsesHardwareQueues()) {
+				setupHWQueue(nClass, qmgr_classes[nClass].classBytesPerSec - qmgr_streams[idx].streamBytesPerSec);
+			}
 
 		// update class
 		qmgr_classes[nClass].classBytesPerSec -= qmgr_streams[idx].streamBytesPerSec;
@@ -278,18 +287,18 @@ bool openavbQmgrInitialize(int mode, int ifindex, const char* ifname, unsigned m
 				   qdisc_data.mode, ifindex, mtu, link_kbit, nsr_kbit);
 
 #if (AVB_FEATURE_IGB)
-	if ( qdisc_data.mode != AVB_SHAPER_DISABLED
-	     && (qdisc_data.igb_dev = igbAcquireDevice()) == 0)
-	{
-		AVB_LOG_ERROR("Initializing QMgr; unable to acquire igb device");
+		if ( qmgrUsesHardwareQueues()
+		     && (qdisc_data.igb_dev = igbAcquireDevice()) == 0)
+		{
+			AVB_LOG_ERROR("Initializing QMgr; unable to acquire igb device");
 	}
 	else
 #endif
 #if (AVB_FEATURE_ATL)
-	if ( qdisc_data.mode != AVB_SHAPER_DISABLED
-	     && (qdisc_data.atl_dev = atlAcquireDevice(ifname)) == 0)
-	{
-		AVB_LOG_ERROR("Initializing QMgr; unable to acquire atl device");
+		if ( qmgrUsesHardwareQueues()
+		     && (qdisc_data.atl_dev = atlAcquireDevice(ifname)) == 0)
+		{
+			AVB_LOG_ERROR("Initializing QMgr; unable to acquire atl device");
 	}
 	else
 #endif
@@ -336,14 +345,16 @@ void openavbQmgrFinalize(void)
 			}
 		}
 
+		if (qmgrUsesHardwareQueues()) {
 #if (AVB_FEATURE_IGB)
-		igbReleaseDevice(qdisc_data.igb_dev);
-		qdisc_data.igb_dev = NULL;
+			igbReleaseDevice(qdisc_data.igb_dev);
+			qdisc_data.igb_dev = NULL;
 #endif
 #if (AVB_FEATURE_ATL)
-		atlReleaseDevice(qdisc_data.atl_dev);
-		qdisc_data.atl_dev = NULL;
+			atlReleaseDevice(qdisc_data.atl_dev);
+			qdisc_data.atl_dev = NULL;
 #endif
+		}
 	}
 
 	UNLOCK();

@@ -67,21 +67,67 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 
 	static const U8 emptyMAC[ETH_ALEN] = { 0, 0, 0, 0, 0, 0 };
 	tl_state_t *pTLState = TLHandleListGet(endpointHandle);
-	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
-	listener_data_t *pListenerData = pTLState->pPvtListenerData;
 
 	if (!pTLState) {
 		AVB_LOG_WARNING("Unable to get listener from endpoint handle.");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
+		return;
+	}
+	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
+	listener_data_t *pListenerData = pTLState->pPvtListenerData;
+	if (!pListenerData) {
+		AVB_LOG_WARNING("Listener private data unavailable for endpoint callback.");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return;
 	}
 
 	// If not a listener, ignore this callback.
 	if (pTLState->cfg.role != AVB_ROLE_LISTENER) {
 		AVB_LOG_DEBUG("Ignoring Listener callback");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return;
 	}
 
 	AVB_LOGF_DEBUG("%s streaming=%d, tlkrDecl=%d", __FUNCTION__, pTLState->bStreaming, tlkrDecl);
+	AVB_LOGF_INFO("Listener SRP callback: stream=" STREAMID_FORMAT " tlkrDecl=0x%02x dest=" ETH_FORMAT " class=%u max_interval=%u max_frame=%u latency=%u",
+		STREAMID_ARGS(streamID),
+		(U8)tlkrDecl,
+		ETH_OCTETS(destAddr),
+		srClassID,
+		tSpec ? tSpec->maxIntervalFrames : 0,
+		tSpec ? tSpec->maxFrameSize : 0,
+		latency);
+
+	// Publish SRP declaration/failure details to AVDECC only when the value changes.
+	// This keeps MSRP flags information current without continuously pushing duplicates.
+	U8 failureBridgeId[8] = {0};
+	U8 failureCode = 0;
+	if (failInfo) {
+		memcpy(failureBridgeId, failInfo->BridgeID, sizeof(failureBridgeId));
+		failureCode = failInfo->FailureCode;
+	}
+	bool srpInfoChanged =
+		(!pListenerData->srpInfoPublished) ||
+		(pListenerData->srpTalkerDecl != (U8)tlkrDecl) ||
+		(pListenerData->srpFailureCode != failureCode) ||
+		(memcmp(pListenerData->srpFailureBridgeId, failureBridgeId, sizeof(failureBridgeId)) != 0);
+	if (srpInfoChanged &&
+			pTLState->bAvdeccMsgRunning &&
+			pTLState->avdeccMsgHandle != AVB_AVDECC_MSG_HANDLE_INVALID) {
+		if (openavbAvdeccMsgClntListenerSrpInfo(
+				pTLState->avdeccMsgHandle,
+				(U8)tlkrDecl,
+				failureCode,
+				failureBridgeId)) {
+			pListenerData->srpInfoPublished = TRUE;
+			pListenerData->srpTalkerDecl = (U8)tlkrDecl;
+			pListenerData->srpFailureCode = failureCode;
+			memcpy(pListenerData->srpFailureBridgeId, failureBridgeId, sizeof(failureBridgeId));
+		}
+		else {
+			AVB_LOGF_WARNING("Failed to publish listener SRP info to AVDECC (decl=0x%02x)", tlkrDecl);
+		}
+	}
 
 	if (!pTLState->bStreaming
 		&& tlkrDecl == openavbSrp_AtTyp_TalkerAdvertise) {
@@ -124,7 +170,9 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 			}
 
 			// We should start streaming
-			AVB_LOGF_INFO("Starting stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
+			AVB_LOGF_INFO("Starting stream: "STREAMID_FORMAT " dest=" ETH_FORMAT,
+				STREAMID_ARGS(streamID),
+				ETH_OCTETS(pListenerData->destAddr));
 			listenerStartStream(pTLState);
 		}
 		else {
@@ -134,6 +182,7 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 	else if (pTLState->bStreaming
 		&& tlkrDecl != openavbSrp_AtTyp_TalkerAdvertise) {
 		AVB_LOGF_INFO("Stopping stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
+		pListenerData->aecpCounters.stream_interrupted++;
 		listenerStopStream(pTLState);
 
 		// We're still interested in the stream

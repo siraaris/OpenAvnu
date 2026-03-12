@@ -80,7 +80,95 @@ int send_mrp_msg(char *notify_data, int notify_len)
 	inet_aton("127.0.0.1", &addr.sin_addr);
 	addr_len = sizeof(addr);
 	return sendto(control_socket, notify_data, notify_len, 0,
-			 (struct sockaddr *)&addr, addr_len);
+				 (struct sockaddr *)&addr, addr_len);
+}
+
+static void log_listener_askfailed_line(
+	const char *buf,
+	int buflen,
+	int offset,
+	const unsigned char recovered_streamid[8],
+	const char *context)
+{
+	int end = offset;
+	int lineLen;
+	char line[384];
+
+	while (end < buflen && buf[end] != '\0' && buf[end] != '\n') {
+		end++;
+	}
+	lineLen = end - offset;
+	if (lineLen < 0) {
+		lineLen = 0;
+	}
+	if (lineLen > (int)sizeof(line) - 1) {
+		lineLen = sizeof(line) - 1;
+	}
+	memcpy(line, &buf[offset], lineLen);
+	line[lineLen] = '\0';
+
+	AVB_LOGF_WARNING(
+		"SRP listener askfailed (%s): stream_id=%02x%02x%02x%02x%02x%02x%02x%02x line='%s'",
+		context,
+		recovered_streamid[0], recovered_streamid[1],
+		recovered_streamid[2], recovered_streamid[3],
+		recovered_streamid[4], recovered_streamid[5],
+		recovered_streamid[6], recovered_streamid[7],
+		line);
+}
+
+static void log_talker_failed_line(
+	const char *buf,
+	int buflen,
+	int offset,
+	const unsigned char recovered_streamid[8])
+{
+	int end = offset;
+	int lineLen;
+	char line[384];
+	unsigned int failureCode = 0xFFFFFFFF;
+	int gotFailureCode = 0;
+	const char *cPos;
+
+	while (end < buflen && buf[end] != '\0' && buf[end] != '\n') {
+		end++;
+	}
+	lineLen = end - offset;
+	if (lineLen < 0) {
+		lineLen = 0;
+	}
+	if (lineLen > (int)sizeof(line) - 1) {
+		lineLen = sizeof(line) - 1;
+	}
+	memcpy(line, &buf[offset], lineLen);
+	line[lineLen] = '\0';
+
+	cPos = strstr(line, ",C=");
+	if (cPos) {
+		if (sscanf(cPos + 3, "%u", &failureCode) == 1) {
+			gotFailureCode = 1;
+		}
+	}
+
+	if (gotFailureCode) {
+		AVB_LOGF_WARNING(
+			"SRP talker-failed: stream_id=%02x%02x%02x%02x%02x%02x%02x%02x failureCode=%u line='%s'",
+			recovered_streamid[0], recovered_streamid[1],
+			recovered_streamid[2], recovered_streamid[3],
+			recovered_streamid[4], recovered_streamid[5],
+			recovered_streamid[6], recovered_streamid[7],
+			failureCode,
+			line);
+	}
+	else {
+		AVB_LOGF_WARNING(
+			"SRP talker-failed: stream_id=%02x%02x%02x%02x%02x%02x%02x%02x line='%s'",
+			recovered_streamid[0], recovered_streamid[1],
+			recovered_streamid[2], recovered_streamid[3],
+			recovered_streamid[4], recovered_streamid[5],
+			recovered_streamid[6], recovered_streamid[7],
+			line);
+	}
 }
 
 int process_mrp_msg(char *buf, int buflen)
@@ -159,6 +247,8 @@ int process_mrp_msg(char *buf, int buflen)
 				break;
 			case 1:
 				AVB_LOG_DEBUG("with state askfailed");
+				log_listener_askfailed_line(
+					buf, buflen, offset, recovered_streamid, "attribute");
 				break;
 			case 2:
 				AVB_LOG_DEBUG("with state ready");
@@ -234,6 +324,11 @@ int process_mrp_msg(char *buf, int buflen)
 				   &priority_and_rank,
 				   &latency);
 
+			/* TalkerFailed lines include failure bridge/code fields: ",B=...,C=..." */
+			if (strstr(&buf[offset], ",C=") != NULL) {
+				log_talker_failed_line(buf, buflen, offset, recovered_streamid);
+			}
+
 			mrp_register_cb(recovered_streamid, 0, dest_addr, max_frame_size, max_interval_frames, vid, latency);
 			break;
 
@@ -266,6 +361,8 @@ int process_mrp_msg(char *buf, int buflen)
 					break;
 				case 1:
 					AVB_LOG_DEBUG("with state askfailed");
+					log_listener_askfailed_line(
+						buf, buflen, offset, recovered_streamid, "event");
 					break;
 				case 2:
 					AVB_LOG_DEBUG("with state ready");

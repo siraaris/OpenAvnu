@@ -58,6 +58,15 @@ attach points and handles via:
 - `SHAPER_CLASSA_HANDLE` (default `2`)
 - `SHAPER_CLASSB_HANDLE` (default `3`)
 
+For packet-socket talkers where taprio priority-map classification is not
+deterministic, you can enable explicit egress queue steering filters:
+
+- `SHAPER_EGRESS_QMAP=1` to enable clsact egress queue mapping filters
+- `SHAPER_CLASSA_QMAP` queue index for Class A fwmark traffic (`0x0100/0xff00`)
+- `SHAPER_CLASSB_QMAP` queue index for Class B fwmark traffic (`0x0200/0xff00`)
+- `SHAPER_DEFAULT_QMAP` fallback queue index for unmatched traffic
+- `SHAPER_GPTP_QMAP` queue index for gPTP ethertype (`0x88f7`)
+
 Future Updates
 --------------
 

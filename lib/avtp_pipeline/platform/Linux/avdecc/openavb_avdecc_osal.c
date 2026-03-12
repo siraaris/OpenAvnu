@@ -31,6 +31,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
 #include "openavb_platform.h"
 #include "openavb_trace.h"
 #include "openavb_avdecc_cfg.h"
@@ -53,6 +55,45 @@ static void* avdeccServerThread(void *arg);
 
 static bool avdeccInitSucceeded;
 
+static bool fileReadable(const char *path)
+{
+	return (path && path[0] != '\0' && access(path, R_OK) == 0);
+}
+
+static bool buildSiblingPath(const char *path, const char *name, char *outPath, size_t outPathLen)
+{
+	if (!path || !name || !outPath || outPathLen == 0) {
+		return FALSE;
+	}
+
+	const char *slash = strrchr(path, '/');
+	if (!slash) {
+		return FALSE;
+	}
+
+	size_t dirLen = (size_t)(slash - path);
+	if (dirLen == 0 || dirLen + 1 + strlen(name) + 1 > outPathLen) {
+		return FALSE;
+	}
+
+	memcpy(outPath, path, dirLen);
+	outPath[dirLen] = '/';
+	strcpy(outPath + dirLen + 1, name);
+	return TRUE;
+}
+
+static bool buildExeRelativePath(const char *name, char *outPath, size_t outPathLen)
+{
+	char exePath[PATH_MAX];
+	ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+	if (len <= 0 || len >= (ssize_t)sizeof(exePath)) {
+		return FALSE;
+	}
+
+	exePath[len] = '\0';
+	return buildSiblingPath(exePath, name, outPath, outPathLen);
+}
+
 bool startAvdecc(const char* ifname, const char **inifiles, int numfiles)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC);
@@ -68,7 +109,18 @@ bool startAvdecc(const char* ifname, const char **inifiles, int numfiles)
 
 	// Get the AVDECC configuration
 	memset(&gAvdeccCfg, 0, sizeof(openavb_avdecc_cfg_t));
-	openavbReadAvdeccConfig(DEFAULT_AVDECC_INI_FILE, &gAvdeccCfg);
+	char avdeccIniResolved[PATH_MAX] = {0};
+	const char *avdeccIni = getenv("OPENAVB_AVDECC_INI");
+	if (!avdeccIni || avdeccIni[0] == '\0') {
+		avdeccIni = DEFAULT_AVDECC_INI_FILE;
+		if (!fileReadable(avdeccIni) &&
+			buildExeRelativePath(DEFAULT_AVDECC_INI_FILE, avdeccIniResolved, sizeof(avdeccIniResolved)) &&
+			fileReadable(avdeccIniResolved)) {
+			avdeccIni = avdeccIniResolved;
+		}
+	}
+	AVB_LOGF_INFO("AVDECC config: ini=%s", avdeccIni);
+	openavbReadAvdeccConfig(avdeccIni, &gAvdeccCfg);
 
 	// Determine which interface to use.
 	if (ifname) {

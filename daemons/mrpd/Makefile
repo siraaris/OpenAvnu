@@ -1,6 +1,7 @@
 OPT=-O2
 #CFLAGS=$(OPT) -Wall -Wextra -Wno-parentheses -Wstrict-prototypes -Wmissing-prototypes -ggdb
-CFLAGS=$(OPT) -Wall -Wextra -Wno-parentheses -ggdb -D_GNU_SOURCE
+#CFLAGS=$(OPT) -Wall -Wextra -Wno-parentheses -ggdb -D_GNU_SOURCE
+CFLAGS?=$(OPT) -Wall -Wextra -Wno-parentheses -ggdb -D_GNU_SOURCE
 
 ifeq ($(ARCH),arm)
 CC?=arm-none-linux-gnueabi-gcc
@@ -34,4 +35,3 @@ clean:
 indent:
 	indent --linux-style mrpd.c mrpd.h mvrp.c mvrp.h msrp.c msrp.h mmrp.c mmrp.h mrp.c mrp.h \
 		mrpw.c que.c que.h ../common/parse.c ../common/parse.h ../common/eui64set.c ../common/eui64set.h
-

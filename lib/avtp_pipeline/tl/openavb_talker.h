@@ -37,6 +37,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define OPENAVB_TL_TALKER_H 1
 
 #include "openavb_tl.h"
+#include "openavb_avtp.h"
 
 typedef struct {
 	// Data from callback
@@ -62,8 +63,12 @@ typedef struct {
 	U64 			intervalNS;
 	U64 			nextReportNS;
 	U64				nextSecondNS;
+	bool			useWallTimePacing;
 	unsigned long	lastReportFrames;
 	talker_stats_t	stats;
+
+	// Cumulative Milan / AECP counters for this talker across AVTP restarts.
+	openavb_avtp_diag_counters_t aecpCounters;
 } talker_data_t;
 
 
