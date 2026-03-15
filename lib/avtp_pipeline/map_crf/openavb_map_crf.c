@@ -520,10 +520,12 @@ static void crfDiagTxLeadMaybeLog(
 	}
 
 	S64 avgLeadErrNs = pPvtData->diagTxLeadErrSumNs / (S64)pPvtData->diagTxLeadWindowPackets;
+	S64 avgActualLeadNs = targetLeadNs + avgLeadErrNs;
 	pPvtData->diagTxLeadLogCount++;
 	AVB_LOGF_INFO(
-		"CRF TX lead delta: avg_err=%lldns min_err=%lldns max_err=%lldns abs_max=%lldns target_lead=%lldns launch_skew_abs_max=%lldns packets=%llu logs=%llu",
+		"CRF TX lead error: avg_err=%lldns avg_actual=%lldns min_err=%lldns max_err=%lldns abs_max=%lldns target_lead=%lldns launch_skew_abs_max=%lldns packets=%llu logs=%llu",
 		(long long)avgLeadErrNs,
+		(long long)avgActualLeadNs,
 		(long long)pPvtData->diagTxLeadErrMinNs,
 		(long long)pPvtData->diagTxLeadErrMaxNs,
 		(long long)pPvtData->diagTxLeadErrAbsMaxNs,
@@ -630,6 +632,26 @@ tx_cb_ret_t openavbMapCrfTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 	pPvtData->nextCrfTimeNs = baseCrfTime + pduPeriodNs;
 	pPvtData->lastLaunchTimeNs = launchTimeNs;
 	pPvtData->lastLaunchValid = TRUE;
+
+	if (pPvtData->diagTxLeadLogCount < 16 || launchTimeNs < nowNs) {
+		S64 launchDeltaNs = (launchTimeNs >= nowNs)
+			? (S64)(launchTimeNs - nowNs)
+			: -((S64)(nowNs - launchTimeNs));
+		S64 crfLeadNs = (baseCrfTime >= nowNs)
+			? (S64)(baseCrfTime - nowNs)
+			: -((S64)(nowNs - baseCrfTime));
+		AVB_LOGF_INFO(
+			"CRF TX calc: now=%" PRIu64 " base=%" PRIu64 " crf_lead=%" PRId64 "ns launch=%" PRIu64 " launch_delta=%" PRId64 "ns rounded_mtt=%" PRIu64 "ns launch_lead=%" PRIu64 "ns next_valid=%d seq=%u",
+			nowNs,
+			baseCrfTime,
+			crfLeadNs,
+			launchTimeNs,
+			launchDeltaNs,
+			pPvtData->roundedMttNs,
+			pPvtData->launchLeadNs,
+			pPvtData->nextCrfTimeValid ? 1 : 0,
+			(unsigned)txSeq);
+	}
 
 	U32 subtypeData = 0;
 	subtypeData |= ((U32)(AVTP_CRF_SUBTYPE & 0x7F) << 24);

@@ -26,10 +26,24 @@ typedef struct {
 } openavb_clock_source_runtime_time_t;
 
 typedef struct {
+	bool valid;
+	U64 anchorNs;
+	U32 selectionGeneration;
+	U32 recoveryGeneration;
+	U32 sourceGeneration;
+} openavb_clock_source_runtime_anchor_t;
+
+typedef struct {
 	openavb_clock_source_runtime_time_t *pEntries;
 	U16 entryCount;
 	openavb_clock_source_runtime_time_t fallback;
 } openavb_clock_source_runtime_time_bank_t;
+
+typedef struct {
+	openavb_clock_source_runtime_anchor_t *pEntries;
+	U16 entryCount;
+	openavb_clock_source_runtime_anchor_t fallback;
+} openavb_clock_source_runtime_anchor_bank_t;
 
 typedef struct {
 	openavb_clock_source_runtime_t selection;
@@ -37,6 +51,8 @@ typedef struct {
 	openavb_clock_source_runtime_time_bank_t crfOutput;
 	openavb_clock_source_runtime_time_bank_t mediaInput;
 	openavb_clock_source_runtime_time_bank_t mediaOutput;
+	openavb_clock_source_runtime_anchor_bank_t warmupAnchorInput;
+	openavb_clock_source_runtime_anchor_bank_t warmupAnchorOutput;
 } openavb_clock_source_runtime_state_t;
 
 static pthread_mutex_t gClockSourceRuntimeMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -54,6 +70,19 @@ static openavb_clock_source_runtime_time_bank_t *clockSourceRuntimeTimeBankForLo
 		return mediaClock ? &pState->mediaOutput : &pState->crfOutput;
 	}
 	return mediaClock ? &pState->mediaInput : &pState->crfInput;
+}
+
+static openavb_clock_source_runtime_anchor_bank_t *clockSourceRuntimeAnchorBankForLocation(
+	openavb_clock_source_runtime_state_t *pState,
+	U16 clock_source_location_type)
+{
+	if (!pState) {
+		return NULL;
+	}
+	if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		return &pState->warmupAnchorOutput;
+	}
+	return &pState->warmupAnchorInput;
 }
 
 static void clockSourceRuntimeClearTimeValue(openavb_clock_source_runtime_time_t *pTime)
@@ -111,6 +140,60 @@ static void clockSourceRuntimeTimeBankClearAll(openavb_clock_source_runtime_time
 	clockSourceRuntimeClearTimeValue(&pBank->fallback);
 	for (U16 idx = 0; idx < pBank->entryCount; idx++) {
 		clockSourceRuntimeClearTimeValue(&pBank->pEntries[idx]);
+	}
+}
+
+static void clockSourceRuntimeClearAnchorValue(openavb_clock_source_runtime_anchor_t *pAnchor)
+{
+	if (!pAnchor) {
+		return;
+	}
+	memset(pAnchor, 0, sizeof(*pAnchor));
+}
+
+static openavb_clock_source_runtime_anchor_t *clockSourceRuntimeAnchorGetSlot(
+	openavb_clock_source_runtime_anchor_bank_t *pBank,
+	U16 clock_source_location_index,
+	bool create)
+{
+	if (!pBank) {
+		return NULL;
+	}
+
+	if (clock_source_location_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return &pBank->fallback;
+	}
+
+	if (clock_source_location_index >= pBank->entryCount) {
+		if (!create) {
+			return NULL;
+		}
+
+		U16 oldCount = pBank->entryCount;
+		U32 newCount = (U32)clock_source_location_index + 1U;
+		openavb_clock_source_runtime_anchor_t *pNewEntries = (openavb_clock_source_runtime_anchor_t *)realloc(
+			pBank->pEntries,
+			newCount * sizeof(*pBank->pEntries));
+		if (!pNewEntries) {
+			return NULL;
+		}
+		pBank->pEntries = pNewEntries;
+		pBank->entryCount = (U16)newCount;
+		memset(&pBank->pEntries[oldCount], 0, (newCount - oldCount) * sizeof(*pBank->pEntries));
+	}
+
+	return &pBank->pEntries[clock_source_location_index];
+}
+
+static void clockSourceRuntimeAnchorBankClearAll(openavb_clock_source_runtime_anchor_bank_t *pBank)
+{
+	if (!pBank) {
+		return;
+	}
+
+	clockSourceRuntimeClearAnchorValue(&pBank->fallback);
+	for (U16 idx = 0; idx < pBank->entryCount; idx++) {
+		clockSourceRuntimeClearAnchorValue(&pBank->pEntries[idx]);
 	}
 }
 
@@ -360,6 +443,48 @@ void openavbClockSourceRuntimeClearMediaClockForLocation(
 	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
 }
 
+bool openavbClockSourceRuntimeAcquireWarmupAnchorForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U32 selectionGeneration,
+	U32 recoveryGeneration,
+	U32 sourceGeneration,
+	U64 proposedAnchorNs,
+	U64 *pAnchorNs,
+	bool *pWasCreated)
+{
+	bool ret = FALSE;
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_anchor_bank_t *pBank =
+		clockSourceRuntimeAnchorBankForLocation(&gClockSourceRuntime, clock_source_location_type);
+	openavb_clock_source_runtime_anchor_t *pAnchor =
+		clockSourceRuntimeAnchorGetSlot(pBank, clock_source_location_index, TRUE);
+	if (pAnchor) {
+		bool create = !pAnchor->valid ||
+			(pAnchor->selectionGeneration != selectionGeneration) ||
+			(pAnchor->recoveryGeneration != recoveryGeneration) ||
+			(pAnchor->sourceGeneration != sourceGeneration);
+		if (create) {
+			pAnchor->valid = TRUE;
+			pAnchor->anchorNs = proposedAnchorNs;
+			pAnchor->selectionGeneration = selectionGeneration;
+			pAnchor->recoveryGeneration = recoveryGeneration;
+			pAnchor->sourceGeneration = sourceGeneration;
+		}
+		if (pAnchorNs) {
+			*pAnchorNs = pAnchor->anchorNs;
+		}
+		if (pWasCreated) {
+			*pWasCreated = create;
+		}
+		ret = TRUE;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+
+	return ret;
+}
+
 void openavbClockSourceRuntimeReset(void)
 {
 	pthread_mutex_lock(&gClockSourceRuntimeMutex);
@@ -367,6 +492,8 @@ void openavbClockSourceRuntimeReset(void)
 	free(gClockSourceRuntime.crfOutput.pEntries);
 	free(gClockSourceRuntime.mediaInput.pEntries);
 	free(gClockSourceRuntime.mediaOutput.pEntries);
+	free(gClockSourceRuntime.warmupAnchorInput.pEntries);
+	free(gClockSourceRuntime.warmupAnchorOutput.pEntries);
 	memset(&gClockSourceRuntime, 0, sizeof(gClockSourceRuntime));
 	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
 }

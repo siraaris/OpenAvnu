@@ -54,6 +54,25 @@ typedef struct {
 	U64 drops;
 } bus32_ring_t;
 
+#define BUS32_META_RING_DEPTH            1024
+
+typedef struct {
+	size_t bytes;
+	U64 captureStartNs;
+} bus32_meta_entry_t;
+
+typedef struct {
+	bus32_meta_entry_t entry[BUS32_META_RING_DEPTH];
+	U32 rd;
+	U32 wr;
+	U32 fill;
+} bus32_meta_ring_t;
+
+typedef struct {
+	bool captureTimeValid;
+	U64 captureStartNs;
+} bus32_item_meta_t;
+
 static bool ringInit(bus32_ring_t *r, size_t size)
 {
 	if (!r) {
@@ -156,6 +175,83 @@ static bool ringRead(bus32_ring_t *r, U8 *dst, size_t len)
 	return TRUE;
 }
 
+static void metaRingReset(bus32_meta_ring_t *r)
+{
+	if (!r) {
+		return;
+	}
+	r->rd = 0;
+	r->wr = 0;
+	r->fill = 0;
+}
+
+static U64 bytesToDurationNs(size_t bytes, U32 bytesPerFrame, U32 sampleRate)
+{
+	U64 frames;
+	if (bytesPerFrame == 0 || sampleRate == 0) {
+		return 0;
+	}
+	frames = bytes / bytesPerFrame;
+	return (frames * NANOSECONDS_PER_SECOND) / sampleRate;
+}
+
+static void metaRingDropOldest(bus32_meta_ring_t *r, size_t len, U32 bytesPerFrame, U32 sampleRate)
+{
+	while (r && len > 0 && r->fill > 0) {
+		bus32_meta_entry_t *pEntry = &r->entry[r->rd];
+		if (len >= pEntry->bytes) {
+			len -= pEntry->bytes;
+			r->rd = (r->rd + 1) % BUS32_META_RING_DEPTH;
+			r->fill--;
+		}
+		else {
+			pEntry->captureStartNs += bytesToDurationNs(len, bytesPerFrame, sampleRate);
+			pEntry->bytes -= len;
+			len = 0;
+		}
+	}
+}
+
+static bool metaRingPush(bus32_meta_ring_t *r, size_t len, U64 captureStartNs)
+{
+	if (!r || len == 0) {
+		return FALSE;
+	}
+	if (r->fill >= BUS32_META_RING_DEPTH) {
+		return FALSE;
+	}
+	r->entry[r->wr].bytes = len;
+	r->entry[r->wr].captureStartNs = captureStartNs;
+	r->wr = (r->wr + 1) % BUS32_META_RING_DEPTH;
+	r->fill++;
+	return TRUE;
+}
+
+static bool metaRingConsume(bus32_meta_ring_t *r, size_t len, U32 bytesPerFrame, U32 sampleRate, U64 *pCaptureStartNs)
+{
+	bool haveStart = FALSE;
+
+	while (r && len > 0 && r->fill > 0) {
+		bus32_meta_entry_t *pEntry = &r->entry[r->rd];
+		if (!haveStart && pCaptureStartNs) {
+			*pCaptureStartNs = pEntry->captureStartNs;
+			haveStart = TRUE;
+		}
+		if (len >= pEntry->bytes) {
+			len -= pEntry->bytes;
+			r->rd = (r->rd + 1) % BUS32_META_RING_DEPTH;
+			r->fill--;
+		}
+		else {
+			pEntry->captureStartNs += bytesToDurationNs(len, bytesPerFrame, sampleRate);
+			pEntry->bytes -= len;
+			len = 0;
+		}
+	}
+
+	return (len == 0) && haveStart;
+}
+
 /* ---- Stream private data ---- */
 typedef struct {
 	bool ignoreTimestamp;
@@ -178,6 +274,7 @@ typedef struct {
 	mcs_t mcs;
 	U16 streamUID;
 	U32 fixedTsRuntimeLeadUsec;
+	bool itemMetaAllocated;
 
 	bool registered;
 } pvt_data_t;
@@ -187,6 +284,7 @@ typedef struct {
 	bool active;
 	pvt_data_t *owner;
 	bus32_ring_t ring;
+	bus32_meta_ring_t meta;
 } bus32_slot_t;
 
 typedef struct {
@@ -239,6 +337,7 @@ static bool mgrInitIfNeeded(void)
 		g_mgr.slot[i].active = FALSE;
 		g_mgr.slot[i].owner = NULL;
 		ringInit(&g_mgr.slot[i].ring, BUS32_RING_BYTES_DEFAULT);
+		metaRingReset(&g_mgr.slot[i].meta);
 	}
 	g_mgr.initDone = TRUE;
 	return TRUE;
@@ -408,9 +507,68 @@ static bool cloneSharedFixedTsToStreamLocked(pvt_data_t *pPvtData)
 	return TRUE;
 }
 
+static void slotWriteCaptureLocked(bus32_slot_t *pSlot, const U8 *pSrc, size_t len, U64 captureStartNs,
+						 U32 bytesPerFrame, U32 sampleRate)
+{
+	size_t dropBytes = 0;
+	size_t keptLen = len;
+	U64 keptStartNs = captureStartNs;
+
+	if (!pSlot || !pSrc || len == 0) {
+		return;
+	}
+
+	if (keptLen > pSlot->ring.size) {
+		dropBytes = keptLen - pSlot->ring.size;
+		pSrc += dropBytes;
+		keptLen = pSlot->ring.size;
+		keptStartNs += bytesToDurationNs(dropBytes, bytesPerFrame, sampleRate);
+	}
+
+	if (keptLen > (pSlot->ring.size - pSlot->ring.fill)) {
+		dropBytes = keptLen - (pSlot->ring.size - pSlot->ring.fill);
+		ringDropOldest(&pSlot->ring, dropBytes);
+		metaRingDropOldest(&pSlot->meta, dropBytes, bytesPerFrame, sampleRate);
+	}
+
+	ringWrite(&pSlot->ring, pSrc, keptLen);
+	if (!metaRingPush(&pSlot->meta, keptLen, keptStartNs)) {
+		/*
+		 * Metadata overflow should not happen in normal operation. If it does,
+		 * fall back to dropping the oldest metadata span and retry so data and
+		 * capture context stay aligned.
+		 */
+		metaRingDropOldest(&pSlot->meta, keptLen, bytesPerFrame, sampleRate);
+		(void)metaRingPush(&pSlot->meta, keptLen, keptStartNs);
+	}
+}
+
+static bool slotReadCaptureLocked(bus32_slot_t *pSlot, U8 *pDst, size_t len, U32 bytesPerFrame,
+						U32 sampleRate, U64 *pCaptureStartNs)
+{
+	if (!pSlot || !pDst || len == 0) {
+		return FALSE;
+	}
+	if (!ringRead(&pSlot->ring, pDst, len)) {
+		return FALSE;
+	}
+	if (!metaRingConsume(&pSlot->meta, len, bytesPerFrame, sampleRate, pCaptureStartNs)) {
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static void setTxItemTimestamp(pvt_data_t *pPvtData, media_q_item_t *pItem)
 {
+	bus32_item_meta_t *pItemMeta = NULL;
+
 	if (!pPvtData || !pItem) {
+		return;
+	}
+
+	pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
+	if (pItemMeta && pItemMeta->captureTimeValid) {
+		openavbAvtpTimeSetToTimestampNS(pItem->pAvtpTime, pItemMeta->captureStartNs);
 		return;
 	}
 
@@ -423,9 +581,13 @@ static void setTxItemTimestamp(pvt_data_t *pPvtData, media_q_item_t *pItem)
 		U64 nowNs = 0;
 		U64 targetNs = 0;
 		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
-		/* Keep one quantum of lead so map-layer transit/packet offsets stay positive. */
-		targetNs = nowNs + pPvtData->mcs.nsPerAdvance
-				 + ((U64)pPvtData->fixedTsRuntimeLeadUsec * NANOSECONDS_PER_USEC);
+		/*
+		 * Keep the shared edge just ahead of wall time plus any explicitly
+		 * configured runtime lead. The map layer already adds packet/transit
+		 * offsets, so forcing an extra full item quantum here biases every
+		 * split stream early together.
+		 */
+		targetNs = nowNs + ((U64)pPvtData->fixedTsRuntimeLeadUsec * NANOSECONDS_PER_USEC);
 		advanceMcsToWallTime(&pPvtData->mcs, targetNs);
 	}
 	else {
@@ -595,18 +757,24 @@ static void *captureThreadFn(void *arg)
 	size_t captureBytes;
 	size_t splitBytes;
 	U32 bytesPerSample;
+	U32 bytesPerFrame;
 	U32 framesPerRead;
+	U32 sampleRate;
 	int rslt;
 	U32 activeMask;
 	U32 frame;
 	U32 s;
 	U8 *srcFrame;
+	U64 captureEndNs;
+	U64 captureStartNs;
 
 	(void)arg;
 
 	pthread_mutex_lock(&g_mgr.lock);
 	bytesPerSample = g_mgr.bytesPerSample;
+	bytesPerFrame = BUS32_STREAM_CHANNELS * bytesPerSample;
 	framesPerRead = g_mgr.framesPerRead;
+	sampleRate = g_mgr.sampleRate;
 	pthread_mutex_unlock(&g_mgr.lock);
 
 	captureBytes = (size_t)framesPerRead * BUS32_CAPTURE_CHANNELS * bytesPerSample;
@@ -671,6 +839,9 @@ static void *captureThreadFn(void *arg)
 			continue;
 		}
 
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &captureEndNs);
+		captureStartNs = captureEndNs - bytesToDurationNs((size_t)rslt * bytesPerFrame, bytesPerFrame, sampleRate);
+
 		/* Split interleaved 32ch -> 4 x interleaved 8ch */
 		for (frame = 0; frame < (U32)rslt; frame++) {
 			srcFrame = captureBuf + ((size_t)frame * BUS32_CAPTURE_CHANNELS * bytesPerSample);
@@ -686,7 +857,13 @@ static void *captureThreadFn(void *arg)
 		pthread_mutex_lock(&g_mgr.lock);
 		for (s = 0; s < BUS32_MAX_STREAMS; s++) {
 			if (g_mgr.slot[s].active) {
-				ringWrite(&g_mgr.slot[s].ring, splitBuf[s], (size_t)rslt * BUS32_STREAM_CHANNELS * bytesPerSample);
+				slotWriteCaptureLocked(
+					&g_mgr.slot[s],
+					splitBuf[s],
+					(size_t)rslt * BUS32_STREAM_CHANNELS * bytesPerSample,
+					captureStartNs,
+					bytesPerFrame,
+					sampleRate);
 			}
 		}
 		pthread_cond_broadcast(&g_mgr.cond);
@@ -775,6 +952,7 @@ static bool registerStream(media_q_t *pMediaQ, pvt_data_t *pPvtData)
 		goto done;
 	}
 	ringReset(&g_mgr.slot[idx].ring);
+	metaRingReset(&g_mgr.slot[idx].meta);
 
 	if (!validateSharedConfigLocked(pPvtData, pInfo, pMediaQ->pMediaQDataFormat)) {
 		goto done;
@@ -830,6 +1008,7 @@ static void unregisterStream(pvt_data_t *pPvtData)
 		g_mgr.slot[idx].active = FALSE;
 		g_mgr.slot[idx].owner = NULL;
 		ringReset(&g_mgr.slot[idx].ring);
+		metaRingReset(&g_mgr.slot[idx].meta);
 		if (g_mgr.activeStreamCount > 0) {
 			g_mgr.activeStreamCount--;
 		}
@@ -999,6 +1178,14 @@ void openavbIntfBus32SplitTxInitCB(media_q_t *pMediaQ)
 		AVB_LOG_ERROR("BUS32 split: public map info missing");
 		return;
 	}
+	if (!pPvtData->itemMetaAllocated) {
+		if (!openavbMediaQAllocItemIntfData(pMediaQ, sizeof(bus32_item_meta_t))) {
+			AVB_LOG_ERROR("BUS32 split: failed to allocate per-item interface metadata");
+			return;
+		}
+		pPvtData->itemMetaAllocated = TRUE;
+	}
+	pPvtData->intervalCounter = 0;
 	if (pPvtData->fixedTimestampEnabled) {
 		pthread_mutex_lock(&g_mgr.lock);
 		if (!ensureSharedFixedTsSeedLocked(pPvtData, pInfo)
@@ -1019,6 +1206,7 @@ bool openavbIntfBus32SplitTxCB(media_q_t *pMediaQ)
 	media_q_item_t *pItem;
 	size_t need;
 	U32 idx;
+	U64 captureStartNs = 0;
 	bool done = FALSE;
 
 	if (!pMediaQ) {
@@ -1049,6 +1237,11 @@ bool openavbIntfBus32SplitTxCB(media_q_t *pMediaQ)
 			AVB_LOG_ERROR("BUS32 split: media queue item too small");
 			break;
 		}
+		if (pItem->dataLen == 0 && pItem->pPvtIntfData) {
+			bus32_item_meta_t *pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
+			pItemMeta->captureTimeValid = FALSE;
+			pItemMeta->captureStartNs = 0;
+		}
 
 		need = pInfo->itemSize - pItem->dataLen;
 		if (need == 0) {
@@ -1066,8 +1259,24 @@ bool openavbIntfBus32SplitTxCB(media_q_t *pMediaQ)
 			continue;
 		}
 
-		ringRead(&g_mgr.slot[idx].ring, pItem->pPubData + pItem->dataLen, need);
+		if (!slotReadCaptureLocked(&g_mgr.slot[idx],
+						 pItem->pPubData + pItem->dataLen,
+						 need,
+						 BUS32_STREAM_CHANNELS * g_mgr.bytesPerSample,
+						 g_mgr.sampleRate,
+						 &captureStartNs)) {
+			pthread_mutex_unlock(&g_mgr.lock);
+			openavbMediaQHeadUnlock(pMediaQ);
+			done = TRUE;
+			continue;
+		}
 		pthread_mutex_unlock(&g_mgr.lock);
+
+		if (pItem->dataLen == 0 && pItem->pPvtIntfData) {
+			bus32_item_meta_t *pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
+			pItemMeta->captureTimeValid = TRUE;
+			pItemMeta->captureStartNs = captureStartNs;
+		}
 
 		pItem->dataLen += need;
 		if (pItem->dataLen < pInfo->itemSize) {
@@ -1215,6 +1424,7 @@ extern DLL_EXPORT bool openavbIntfBus32SplitInitialize(media_q_t *pMediaQ, opena
 	pPvtData->clockSkewPPB = 0;
 	pPvtData->fixedTimestampEnabled = FALSE;
 	pPvtData->fixedTsRuntimeLeadUsec = BUS32_FIXED_TS_RUNTIME_LEAD_USEC_DEFAULT;
+	pPvtData->itemMetaAllocated = FALSE;
 	pPvtData->registered = FALSE;
 	pPvtData->streamUID = 0;
 

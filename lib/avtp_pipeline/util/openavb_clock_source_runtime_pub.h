@@ -73,6 +73,16 @@ void openavbClockSourceRuntimeClearMediaClockForLocation(
 	U16 clock_source_location_type,
 	U16 clock_source_location_index);
 
+bool openavbClockSourceRuntimeAcquireWarmupAnchorForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U32 selectionGeneration,
+	U32 recoveryGeneration,
+	U32 sourceGeneration,
+	U64 proposedAnchorNs,
+	U64 *pAnchorNs,
+	bool *pWasCreated);
+
 void openavbClockSourceRuntimeReset(void);
 
 #endif // OPENAVB_CLOCK_SOURCE_RUNTIME_PUB_H

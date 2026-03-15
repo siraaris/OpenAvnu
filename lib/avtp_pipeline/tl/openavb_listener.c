@@ -39,6 +39,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_platform.h"
 #include "openavb_trace.h"
 #include "openavb_tl.h"
+#include "openavb_endpoint.h"
 #include "openavb_avtp.h"
 #include "openavb_listener.h"
 #include "openavb_avdecc_msg_client.h"
@@ -53,6 +54,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #define LISTENER_EMPTY_RX_BACKOFF_THRESHOLD 64U
 #define LISTENER_EMPTY_RX_BACKOFF_MAX_MSEC 5U
+#define LISTENER_SRP_TRANSIENT_GRACE_NS (1000ULL * 1000ULL * 1000ULL)
 
 static void listenerLockStream(listener_data_t *pListenerData)
 {
@@ -140,6 +142,8 @@ bool listenerStartStream(tl_state_t *pTLState)
 
 	// we're good to go!
 	pTLState->bStreaming = TRUE;
+	pListenerData->srpStopPending = FALSE;
+	pListenerData->srpStopDeadlineNS = 0;
 	started = TRUE;
 	listenerUnlockStream(pListenerData);
 	openavbAvdeccMsgClntPublishCounters(pTLState);
@@ -186,6 +190,8 @@ void listenerStopStream(tl_state_t *pTLState)
 		if (pListenerData->aecpCounters.media_unlocked < pListenerData->aecpCounters.media_locked) {
 			pListenerData->aecpCounters.media_unlocked = pListenerData->aecpCounters.media_locked;
 		}
+		pListenerData->srpStopPending = FALSE;
+		pListenerData->srpStopDeadlineNS = 0;
 		pTLState->bStreaming = FALSE;
 		openavbAvtpShutdownListener(pListenerData->avtpHandle);
 		pListenerData->avtpHandle = NULL;
@@ -273,6 +279,9 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 		}
 
 		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
+		bool stopForSrpLoss = (pListenerData->srpStopPending &&
+			pListenerData->srpStopDeadlineNS != 0 &&
+			nowNS >= pListenerData->srpStopDeadlineNS);
 
 		if (pCfg->report_seconds > 0) {
 			if (nowNS > pListenerData->nextReportNS) {
@@ -299,6 +308,35 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 			bRet = TRUE;
 		}
 		listenerUnlockStream(pListenerData);
+		if (stopForSrpLoss) {
+			bool confirmedStop = FALSE;
+			AVBStreamID_t stopStreamID;
+			memset(&stopStreamID, 0, sizeof(stopStreamID));
+
+			listenerLockStream(pListenerData);
+			if (pTLState->bStreaming &&
+				pListenerData->srpStopPending &&
+				pListenerData->srpStopDeadlineNS != 0 &&
+				nowNS >= pListenerData->srpStopDeadlineNS) {
+				pListenerData->srpStopPending = FALSE;
+				pListenerData->srpStopDeadlineNS = 0;
+				stopStreamID = pListenerData->streamID;
+				confirmedStop = TRUE;
+			}
+			listenerUnlockStream(pListenerData);
+
+			if (confirmedStop) {
+				AVB_LOGF_INFO("Listener SRP loss grace expired for stream " STREAMID_FORMAT "; stopping after %llums without TalkerAdvertise",
+					STREAMID_ARGS(&stopStreamID),
+					(unsigned long long)(LISTENER_SRP_TRANSIENT_GRACE_NS / 1000000ULL));
+				pListenerData->aecpCounters.stream_interrupted++;
+				listenerStopStream(pTLState);
+				openavbEptClntAttachStream(pTLState->endpointHandle, &stopStreamID, openavbSrp_LDSt_Interest);
+				if (pTLState->bAvdeccMsgRunning) {
+					openavbAvdeccMsgClntChangeNotification(pTLState->avdeccMsgHandle, OPENAVB_AVDECC_MSG_STOPPED_UNEXPECTEDLY);
+				}
+			}
+		}
 		if (publishCounters) {
 			openavbAvdeccMsgClntPublishCounters(pTLState);
 		}
