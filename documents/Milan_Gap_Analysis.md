@@ -4,7 +4,7 @@
 
 This assessment is based on:
 
-- [Milan_Specification_Consolidated_v1.3.pdf](/root/avbdocs/Milan_Specification_Consolidated_v1.3.pdf)
+- [Milan_Specification_Consolidated_v1.3.pdf]($HOME/docs/Milan_Specification_Consolidated_v1.3.pdf)
 - Static review of the OpenAvnu tree, primarily `lib/avtp_pipeline/` and `avdecc-lib/`
 
 The focus is Milan conformance for AVDECC/ATDECC end stations. It does not certify runtime timing behavior on hardware, and it does not audit external projects that OpenAvnu may depend on for gPTP.
@@ -13,8 +13,8 @@ The focus is Milan conformance for AVDECC/ATDECC end stations. It does not certi
 
 OpenAvnu has useful Milan building blocks:
 
-- AAF transport code includes 32-bit integer audio support in [openavb_map_aaf_audio.c](/root/src/OpenAvnu/lib/avtp_pipeline/map_aaf_audio/openavb_map_aaf_audio.c#L91)
-- CRF transport exists in [openavb_map_crf.c](/root/src/OpenAvnu/lib/avtp_pipeline/map_crf/openavb_map_crf.c#L57)
+- AAF transport code includes 32-bit integer audio support in [openavb_map_aaf_audio.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/map_aaf_audio/openavb_map_aaf_audio.c#L91)
+- CRF transport exists in [openavb_map_crf.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/map_crf/openavb_map_crf.c#L57)
 - There is partial 1722.1-2021/Milan-oriented work around `GET_STREAM_INFO` extension flags and `GET_MAX_TRANSIT_TIME_2021`
 - The tree already contains Milan-oriented example INIs and launch scripts
 
@@ -46,10 +46,10 @@ Relevant Milan clauses:
 
 Findings:
 
-- The descriptor enum stops at `CONTROL_BLOCK`; there are no `TIMING`, `PTP_INSTANCE`, or `PTP_PORT` descriptor types in [openavb_aem_types_pub.h](/root/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem_types_pub.h#L46).
-- The entity builder creates one configuration per stream rather than one device-centric configuration with a complete descriptor tree in [openavb_avdecc.c](/root/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L506).
-- The same builder adds only one non-top-level `AUDIO_CLUSTER` and at most one stream port per role in [openavb_avdecc.c](/root/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L526).
-- The builder explicitly notes missing descriptor types such as `CONTROL` and `AUDIO_MAP` in [openavb_avdecc.c](/root/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L549).
+- The descriptor enum stops at `CONTROL_BLOCK`; there are no `TIMING`, `PTP_INSTANCE`, or `PTP_PORT` descriptor types in [openavb_aem_types_pub.h]($HOME/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem_types_pub.h#L46).
+- The entity builder creates one configuration per stream rather than one device-centric configuration with a complete descriptor tree in [openavb_avdecc.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L506).
+- The same builder adds only one non-top-level `AUDIO_CLUSTER` and at most one stream port per role in [openavb_avdecc.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L526).
+- The builder explicitly notes missing descriptor types such as `CONTROL` and `AUDIO_MAP` in [openavb_avdecc.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/avdecc/openavb_avdecc.c#L549).
 - `IDENTIFY` control support exists as descriptor code, but it is not instantiated into the entity model.
 
 Impact:
@@ -116,7 +116,7 @@ Findings:
 
 - OpenAvnu implements classic ACMP state machines, but not Milan binding/settlement flows.
 - There is no `BIND_STREAM`, `UNBIND_STREAM`, or `GET_STREAM_INPUT_INFO_EX` handling anywhere in the entity or controller library.
-- The listener ACMP state machine still contains a TODO for `STREAMING_WAIT` fast-connect handling in [openavb_acmp_sm_listener.c](/root/src/OpenAvnu/lib/avtp_pipeline/acmp/openavb_acmp_sm_listener.c#L507).
+- The listener ACMP state machine still contains a TODO for `STREAMING_WAIT` fast-connect handling in [openavb_acmp_sm_listener.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/acmp/openavb_acmp_sm_listener.c#L507).
 
 Impact:
 
@@ -145,11 +145,11 @@ Relevant Milan clauses:
 
 Findings:
 
-- The entity model only stores one acquired controller and one locked controller in [openavb_aem.h](/root/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem.h#L73); there is no registered-controller list.
-- `LOCK_ENTITY` is explicitly unimplemented in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L184).
-- `REGISTER_UNSOLICITED_NOTIFICATION` and `DEREGISTER_UNSOLICITED_NOTIFICATION` are compatibility no-ops that always return success in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1176).
+- The entity model only stores one acquired controller and one locked controller in [openavb_aem.h]($HOME/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem.h#L73); there is no registered-controller list.
+- `LOCK_ENTITY` is explicitly unimplemented in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L184).
+- `REGISTER_UNSOLICITED_NOTIFICATION` and `DEREGISTER_UNSOLICITED_NOTIFICATION` are compatibility no-ops that always return success in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1176).
 - The unsolicited-response state exists, but it does not manage a registered-controller database or per-controller sequence numbers.
-- `ACQUIRE_ENTITY` also contains an explicit TODO for `CONTROLLER_AVAILABLE` handling in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L161).
+- `ACQUIRE_ENTITY` also contains an explicit TODO for `CONTROLLER_AVAILABLE` handling in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L161).
 
 Impact:
 
@@ -180,9 +180,9 @@ Relevant Milan clauses:
 
 Findings:
 
-- The command-code table does not define `GET_DYNAMIC_INFO` or `SET_MAX_TRANSIT_TIME`; it only has a custom alias for `GET_MAX_TRANSIT_TIME_2021` in [openavb_aem_types_pub.h](/root/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem_types_pub.h#L1156).
-- `ADD_AUDIO_MAPPINGS` and `REMOVE_AUDIO_MAPPINGS` are empty stubs in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1292).
-- `GET_AUDIO_MAP` only returns counts; it does not enumerate dynamic mappings in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1265).
+- The command-code table does not define `GET_DYNAMIC_INFO` or `SET_MAX_TRANSIT_TIME`; it only has a custom alias for `GET_MAX_TRANSIT_TIME_2021` in [openavb_aem_types_pub.h]($HOME/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_aem_types_pub.h#L1156).
+- `ADD_AUDIO_MAPPINGS` and `REMOVE_AUDIO_MAPPINGS` are empty stubs in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1292).
+- `GET_AUDIO_MAP` only returns counts; it does not enumerate dynamic mappings in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1265).
 - `SET_CONFIGURATION`, `GET_CONFIGURATION`, `SET_NAME`, and `GET_NAME` are not implemented in the entity command switch.
 - `GET_AS_PATH` returns a zeroed placeholder response.
 
@@ -213,8 +213,8 @@ Relevant Milan clauses:
 Findings:
 
 - `GET_COUNTERS` is only meaningfully implemented for `CLOCK_DOMAIN`.
-- AVB interface counters are still a TODO in [openavb_avdecc_pipeline_interaction.c](/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_pipeline_interaction.c#L722).
-- Stream input counters are also still a TODO in [openavb_avdecc_pipeline_interaction.c](/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_pipeline_interaction.c#L749).
+- AVB interface counters are still a TODO in [openavb_avdecc_pipeline_interaction.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_pipeline_interaction.c#L722).
+- Stream input counters are also still a TODO in [openavb_avdecc_pipeline_interaction.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_pipeline_interaction.c#L749).
 - There is no stream-output mandatory counter implementation for `STREAM_START`, `STREAM_STOP`, `MEDIA_RESET`, `TIMESTAMP_UNCERTAIN`, and `FRAMES_TX`.
 
 Impact:
@@ -242,9 +242,9 @@ Relevant Milan clauses:
 
 Findings:
 
-- The AAF mapper supports 32-bit integer AAF in [openavb_map_aaf_audio.c](/root/src/OpenAvnu/lib/avtp_pipeline/map_aaf_audio/openavb_map_aaf_audio.c#L91), which is good.
-- CRF transport also exists in [openavb_map_crf.c](/root/src/OpenAvnu/lib/avtp_pipeline/map_crf/openavb_map_crf.c#L57), which is also good.
-- But each stream descriptor advertises exactly one format: `number_of_formats = 1` in [openavb_descriptor_stream_io.c](/root/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_descriptor_stream_io.c#L529).
+- The AAF mapper supports 32-bit integer AAF in [openavb_map_aaf_audio.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/map_aaf_audio/openavb_map_aaf_audio.c#L91), which is good.
+- CRF transport also exists in [openavb_map_crf.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/map_crf/openavb_map_crf.c#L57), which is also good.
+- But each stream descriptor advertises exactly one format: `number_of_formats = 1` in [openavb_descriptor_stream_io.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aem/openavb_descriptor_stream_io.c#L529).
 - Milan listeners that advertise a Base sampling rate must advertise all Base channel-count variants for that rate. The current model cannot do that without generating extra descriptors/configurations that do not reflect the actual device.
 
 Impact:
@@ -275,8 +275,8 @@ Relevant Milan clauses:
 Findings:
 
 - Milan requires `TIMING -> PTP_INSTANCE -> PTP_PORT` when gPTP is used as a media clock source; those descriptors are missing.
-- OpenAvnu exposes `GPTP_SUPPORTED` capability but does not populate `identify_control_index` or `interface_index` in ADP in [openavb_adp.c](/root/src/OpenAvnu/lib/avtp_pipeline/adp/openavb_adp.c#L139), and it has no gPTP media-clock descriptor chain.
-- Milan requires current sampling rate and current clock source to be saved in non-volatile memory and restored after power cycle. The only persistence I found is listener fast-connect state in [openavb_avdecc_read_ini.c](/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_read_ini.c#L534).
+- OpenAvnu exposes `GPTP_SUPPORTED` capability but does not populate `identify_control_index` or `interface_index` in ADP in [openavb_adp.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/adp/openavb_adp.c#L139), and it has no gPTP media-clock descriptor chain.
+- Milan requires current sampling rate and current clock source to be saved in non-volatile memory and restored after power cycle. The only persistence I found is listener fast-connect state in [openavb_avdecc_read_ini.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/avdecc/openavb_avdecc_read_ini.c#L534).
 - The current model adds clock sources opportunistically per stream, but it does not enforce Milan’s required CRF-input/output topology per supported media clock domain.
 
 Impact:
@@ -302,7 +302,7 @@ Relevant Milan clauses:
 Findings:
 
 - Milan says `START_STREAMING` and `STOP_STREAMING` shall be supported for `STREAM_INPUT` only, and `STREAM_OUTPUT` shall return `NOT_SUPPORTED`.
-- OpenAvnu currently returns success for both inputs and outputs in [openavb_aecp_sm_entity_model_entity.c](/root/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1106).
+- OpenAvnu currently returns success for both inputs and outputs in [openavb_aecp_sm_entity_model_entity.c]($HOME/src/OpenAvnu/lib/avtp_pipeline/aecp/openavb_aecp_sm_entity_model_entity.c#L1106).
 
 Impact:
 
@@ -327,7 +327,7 @@ Relevant Milan clauses:
 Findings:
 
 - Redundancy is optional for Milan, but the current implementation is not an `R-PAAD`.
-- The ADP capability set in [openavb_adp_pub.h](/root/src/OpenAvnu/lib/avtp_pipeline/adp/openavb_adp_pub.h#L47) has no Milan redundancy feature plumbing.
+- The ADP capability set in [openavb_adp_pub.h]($HOME/src/OpenAvnu/lib/avtp_pipeline/adp/openavb_adp_pub.h#L47) has no Milan redundancy feature plumbing.
 - The descriptor builder creates one AVB interface, not the required primary/secondary pair for redundancy.
 - Descriptor structs still carry legacy backup-stream fields, but there is no actual redundant-pair modeling or per-interface behavior.
 - There is no evidence of per-interface controller registration, per-interface unsolicited notifications, dual gPTP end stations, or independent primary/secondary MAAP state machines as required by Milan Section 8.

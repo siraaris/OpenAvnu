@@ -218,19 +218,19 @@ void avbLogBuffer(
 #define avbLogFn2(level, tag, company, component, path, line, fmt, ...) \
     {\
         if (level <= AVB_LOG_LEVEL) \
-            avbLogFn(0, tag, company, component, path, line, fmt, __VA_ARGS__); \
+            avbLogFn(level, tag, company, component, path, line, fmt, __VA_ARGS__); \
     }
 
 #define avbLogRT2(level, bBegin, bItem, bEnd, pFormat, dataType, pVar) \
     {\
         if (level <= AVB_LOG_LEVEL) \
-            avbLogRT(0, bBegin, bItem, bEnd, pFormat, dataType, pVar); \
+            avbLogRT(level, bBegin, bItem, bEnd, pFormat, dataType, pVar); \
     }
 
 #define avbLogBuffer2(level, pData, dataLen, lineLen, company, component, path, line) \
     {\
         if (level <= AVB_LOG_LEVEL) \
-            avbLogBuffer(0, pData, dataLen, lineLen, company, component, path, line); \
+            avbLogBuffer(level, pData, dataLen, lineLen, company, component, path, line); \
     }
 
 #ifdef AVB_LOG_ON
