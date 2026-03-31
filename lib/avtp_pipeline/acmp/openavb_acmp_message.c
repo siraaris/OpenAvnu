@@ -271,7 +271,6 @@ static void openavbAcmpMessageRxFrameReceive(U32 timeoutUsec)
 				offset += 2;
 			}
 #endif
-
 			// Make sure that this is an AVTP packet
 			// (Should always be AVTP if it's to our AVTP-specific multicast address)
 			if (hdrInfo.ethertype == ETHERTYPE_AVTP) {
