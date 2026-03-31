@@ -139,6 +139,9 @@ bool openavbAvdeccStart(void);
 // Stop the AVDECC protocols. 
 void openavbAvdeccStop(void);
 
+// Returns the stream configuration for the given stream index, or NULL if not found.
+openavb_tl_data_cfg_t *openavbAvdeccGetStreamCfg(U16 streamIndex);
+
 // General Cleanup for AVDECC.
 bool openavbAvdeccCleanup(void);
 

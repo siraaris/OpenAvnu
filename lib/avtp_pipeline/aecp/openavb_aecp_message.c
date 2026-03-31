@@ -443,8 +443,18 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 			case OPENAVB_AEM_COMMAND_CODE_IDENTIFY_NOTIFICATION:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AVB_INFO:
+				{
+					openavb_aecp_command_data_get_avb_info_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getAvbInfoCmd;
+					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AS_PATH:
+				{
+					openavb_aecp_command_data_get_as_path_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getAsPathCmd;
+					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+					OCT_B2DNTOHS(pDst->reserved, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_COUNTERS:
 				{
@@ -453,9 +463,21 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
 				}
 				break;
-			case OPENAVB_AEM_COMMAND_CODE_REBOOT:
+			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME:
+			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021:
+				{
+					openavb_aecp_command_data_get_max_transit_time_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getMaxTransitTimeCmd;
+					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AUDIO_MAP:
+				{
+					openavb_aecp_command_data_get_audio_map_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getAudioMapCmd;
+					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+					OCT_B2DNTOHS(pDst->map_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ADD_AUDIO_MAPPINGS:
 				break;
@@ -649,6 +671,18 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 	}
 
 	if (AEMCommandResponse->headers.message_type == OPENAVB_AECP_MESSAGE_TYPE_AEM_RESPONSE) {
+		if (AEMCommandResponse->entityModelPdu.command_type == OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME ||
+				AEMCommandResponse->entityModelPdu.command_type == OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021) {
+			openavb_aecp_response_data_get_max_transit_time_t *pRsp = &AEMCommandResponse->entityModelPdu.command_data.getMaxTransitTimeRsp;
+			AEMCommandResponse->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
+			if (pRsp->descriptor_type == 0 && pRsp->descriptor_index == 0 && pRsp->max_transit_time == 0) {
+				openavb_aecp_command_data_get_max_transit_time_t *pCmd = &AEMCommandResponse->entityModelPdu.command_data.getMaxTransitTimeCmd;
+				pRsp->descriptor_type = pCmd->descriptor_type;
+				pRsp->descriptor_index = pCmd->descriptor_index;
+				pRsp->max_transit_time = 0;
+			}
+		}
+
 		// Entity Model PDU Fields
 		openavb_aecp_entity_model_data_unit_t *pSrc = &AEMCommandResponse->entityModelPdu;
 		BIT_D2BHTONS(pDst, pSrc->u, 15, 0);
@@ -894,8 +928,30 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 			case OPENAVB_AEM_COMMAND_CODE_IDENTIFY_NOTIFICATION:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AVB_INFO:
+				{
+					openavb_aecp_response_data_get_avb_info_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getAvbInfoRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					OCT_D2BBUFCP(pDst, pSrc->as_grandmaster_id, sizeof(pSrc->as_grandmaster_id));
+					OCT_D2BHTONL(pDst, pSrc->propagation_delay);
+					OCT_D2BHTONB(pDst, pSrc->as_domain_number);
+					OCT_D2BHTONB(pDst, pSrc->flags);
+					OCT_D2BHTONS(pDst, pSrc->msrp_mappings_count);
+					if (pSrc->msrp_mappings_count > 0) {
+						OCT_D2BBUFCP(pDst, pSrc->msrp_mappings, pSrc->msrp_mappings_count * 8);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AS_PATH:
+				{
+					openavb_aecp_response_data_get_as_path_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getAsPathRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					OCT_D2BHTONS(pDst, pSrc->as_path_count);
+					OCT_D2BHTONL(pDst, pSrc->path_latency);
+					if (pSrc->as_path_count > 0) {
+						OCT_D2BBUFCP(pDst, pSrc->as_path, pSrc->as_path_count * 8);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_COUNTERS:
 				{
@@ -906,9 +962,35 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 					OCT_D2BBUFCP(pDst, pSrc->counters_block, pSrc->counters_block_length);
 				}
 				break;
-			case OPENAVB_AEM_COMMAND_CODE_REBOOT:
+			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME:
+			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021:
+				{
+					openavb_aecp_response_data_get_max_transit_time_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getMaxTransitTimeRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					if (AEMCommandResponse->entityModelPdu.command_type == OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021) {
+						U64 max_transit_time = pSrc->max_transit_time;
+						OCT_D2BHTONL(pDst, (U32)(max_transit_time >> 32));
+						OCT_D2BHTONL(pDst, (U32)(max_transit_time & 0xffffffffu));
+					}
+					else {
+						OCT_D2BHTONL(pDst, (U32)(pSrc->max_transit_time & 0xffffffffu));
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_AUDIO_MAP:
+				{
+					openavb_aecp_response_data_get_audio_map_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getAudioMapRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					OCT_D2BHTONS(pDst, pSrc->map_index);
+					OCT_D2BHTONS(pDst, pSrc->number_of_maps);
+					OCT_D2BHTONS(pDst, pSrc->number_of_mappings);
+					OCT_D2BHTONS(pDst, pSrc->reserved);
+					if (pSrc->number_of_mappings > 0) {
+						OCT_D2BBUFCP(pDst, pSrc->mappings, pSrc->number_of_mappings * sizeof(openavb_aecp_audio_mapping_t));
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ADD_AUDIO_MAPPINGS:
 				break;
