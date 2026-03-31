@@ -39,16 +39,14 @@ MAC address filters. Stream destination addresses are used for accounting
 (reserve/unreserve) only. Classification into Class A/B queues should be done
 by socket priority / VLAN PCP mapping in the host configuration.
 
-If your system already configures a TSN root qdisc (for example TAPRIO),
+If your system already configures a TSN root qdisc (for example MQPRIO),
 set `SHAPER_SKIP_ROOT_QDISC=1` so the daemon does not install its own `mqprio`
 root qdisc. In that case, you are responsible for mapping priorities to the
 traffic classes that correspond to Class A/B queues.
 
-Alternatively, you can have the daemon install a TAPRIO root qdisc by setting
-`SHAPER_TAPRIO_CMD` to the arguments that follow `tc qdisc add dev <if> root`.
-Example:
-
-`SHAPER_TAPRIO_CMD="handle 100: taprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 base-time 0 sched-entry S 0x8 1000000 clockid CLOCK_TAI"`
+By default the daemon installs an `mqprio` root qdisc and then attaches
+per-class child qdiscs such as `cbs` or `etf` underneath the configured
+Class A and Class B parents.
 
 When integrating with a non-default root qdisc, you can override the CBS
 attach points and handles via:
@@ -58,7 +56,7 @@ attach points and handles via:
 - `SHAPER_CLASSA_HANDLE` (default `2`)
 - `SHAPER_CLASSB_HANDLE` (default `3`)
 
-For packet-socket talkers where taprio priority-map classification is not
+For packet-socket talkers where priority-map classification is not
 deterministic, you can enable explicit egress queue steering filters:
 
 - `SHAPER_EGRESS_QMAP=1` to enable clsact egress queue mapping filters

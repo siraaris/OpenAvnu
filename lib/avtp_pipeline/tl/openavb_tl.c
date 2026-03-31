@@ -368,6 +368,8 @@ EXTERN_DLL_EXPORT void openavbTLInitCfg(openavb_tl_cfg_t *pCfg)
 	// (These values should match those set in openavbIniCfgInit().)
 	pCfg->role = AVB_ROLE_UNDEFINED;
 	pCfg->initial_state = TL_INIT_STATE_UNSPECIFIED;
+	pCfg->defer_start_until_selected_clock = FALSE;
+	pCfg->defer_start_stable_usec = 500000;
 	//pCfg->map_cb;
 	//pCfg->intf_cb;
 	//pCfg->dest_addr;
@@ -765,5 +767,4 @@ EXTERN_DLL_EXPORT void openavbTLPauseStream(tl_handle_t handle, bool bPause)
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 }
-
 

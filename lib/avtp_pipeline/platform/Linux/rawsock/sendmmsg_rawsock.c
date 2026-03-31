@@ -32,11 +32,13 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "sendmmsg_rawsock.h"
 
 #include "simple_rawsock.h"
+#include "openavb_time_osal_pub.h"
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if_packet.h>
 #include <linux/filter.h>
 #include <linux/net_tstamp.h>
+#include <unistd.h>
 #include <errno.h>
 
 #define AVB_LOG_LEVEL AVB_LOG_LEVEL_INFO
@@ -49,6 +51,90 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #define SR_CLASS_A_DEFAULT_PRIORITY 3
 #define SR_CLASS_B_DEFAULT_PRIORITY 2
+#define SENDMMSG_LAUNCH_OFFSET_REFRESH_NS (10000000ULL)
+#define SENDMMSG_LAUNCH_OFFSET_LOG_LIMIT 16
+
+static bool sendmmsgRawsockGetTaiTime(U64 *pTaiTimeNs)
+{
+	struct timespec ts;
+
+	if (!pTaiTimeNs) {
+		return FALSE;
+	}
+
+	if (clock_gettime(CLOCK_TAI, &ts) != 0) {
+		return FALSE;
+	}
+
+	*pTaiTimeNs = ((U64)ts.tv_sec * NANOSECONDS_PER_SECOND) + (U64)ts.tv_nsec;
+	return TRUE;
+}
+
+static bool sendmmsgRawsockRefreshLaunchOffset(sendmmsg_rawsock_t *rawsock, bool forceRefresh)
+{
+	U64 monoNowNs = 0;
+	U64 wallNowNs = 0;
+	U64 taiNowNs = 0;
+	S64 wallToTaiOffsetNs = 0;
+
+	if (!rawsock) {
+		return FALSE;
+	}
+
+	if (!CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &monoNowNs)) {
+		return FALSE;
+	}
+
+	if (!forceRefresh && rawsock->launchTimeClockOffsetValid &&
+			monoNowNs >= rawsock->launchTimeOffsetLastUpdateMonoNs &&
+			(monoNowNs - rawsock->launchTimeOffsetLastUpdateMonoNs) < SENDMMSG_LAUNCH_OFFSET_REFRESH_NS) {
+		return TRUE;
+	}
+
+	if (!CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &wallNowNs)) {
+		return FALSE;
+	}
+
+	if (!sendmmsgRawsockGetTaiTime(&taiNowNs)) {
+		return FALSE;
+	}
+
+	wallToTaiOffsetNs = (S64)taiNowNs - (S64)wallNowNs;
+	rawsock->launchTimeClockOffsetValid = TRUE;
+	rawsock->launchTimeWallToTaiOffsetNs = wallToTaiOffsetNs;
+	rawsock->launchTimeOffsetLastUpdateMonoNs = monoNowNs;
+
+	if (rawsock->launchTimeOffsetLogCount < SENDMMSG_LAUNCH_OFFSET_LOG_LIMIT) {
+		rawsock->launchTimeOffsetLogCount++;
+		AVB_LOGF_INFO("TX clock alignment: wall=%llu tai=%llu offset=%lldns sample=%u",
+			(unsigned long long)wallNowNs,
+			(unsigned long long)taiNowNs,
+			(long long)wallToTaiOffsetNs,
+			rawsock->launchTimeOffsetLogCount);
+	}
+
+	return TRUE;
+}
+
+static U64 sendmmsgRawsockTranslateLaunchTime(sendmmsg_rawsock_t *rawsock, U64 wallLaunchTimeNs)
+{
+	S64 taiLaunchTimeNs;
+
+	if (!rawsock) {
+		return wallLaunchTimeNs;
+	}
+
+	if (!sendmmsgRawsockRefreshLaunchOffset(rawsock, FALSE)) {
+		return wallLaunchTimeNs;
+	}
+
+	taiLaunchTimeNs = (S64)wallLaunchTimeNs + rawsock->launchTimeWallToTaiOffsetNs;
+	if (taiLaunchTimeNs < 0) {
+		return 0;
+	}
+
+	return (U64)taiLaunchTimeNs;
+}
 
 static bool sendmmsgRawsockSetPriority(sendmmsg_rawsock_t *rawsock, U32 priority, const char *source)
 {
@@ -88,7 +174,7 @@ static void sendmmsgRawsockForceQdiscPath(sendmmsg_rawsock_t *rawsock)
 #ifdef PACKET_QDISC_BYPASS
 	int bypass = 0;
 	if (setsockopt(rawsock->sock, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass)) < 0) {
-		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass taprio/CBS",
+		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass mqprio/CBS/ETF",
 			errno, strerror(errno));
 	}
 	else {
@@ -130,7 +216,15 @@ static bool launchTimeErrnoIsUnsupported(int err)
 static bool sendmmsgRawsockEnableLaunchTime(sendmmsg_rawsock_t *rawsock)
 {
 	struct sock_txtime txtimeCfg;
+	const char *disableLaunchTime = getenv("OPENAVB_DISABLE_SO_TXTIME");
 	memset(&txtimeCfg, 0, sizeof(txtimeCfg));
+
+	if (disableLaunchTime && atoi(disableLaunchTime) > 0) {
+		AVB_LOGF_INFO("SO_TXTIME disabled by OPENAVB_DISABLE_SO_TXTIME on %s",
+			rawsock->base.ifInfo.name);
+		rawsock->launchTimeEnabled = false;
+		return false;
+	}
 
 	// AVTP launch timestamps are in wall-time domain; CLOCK_TAI is the Linux wall clock
 	// that tracks gPTP/802.1AS with leap-second-free semantics.
@@ -200,6 +294,47 @@ static void sendmmsgRawsockResetTxState(sendmmsg_rawsock_t *rawsock, const char 
 	rawsock->buffersReady = 0;
 }
 
+static int sendmmsgRawsockSendBurst(sendmmsg_rawsock_t *rawsock, int *pErrno)
+{
+	int attempt;
+	int sz;
+
+	for (attempt = 0; attempt <= SENDMMSG_ENOBUFS_RETRIES; ++attempt) {
+		sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
+		if (sz >= 0) {
+			if (attempt > 0) {
+				AVB_LOGF_WARNING("sendmmsg recovered after %d ENOBUFS/EAGAIN retries on %s",
+					attempt, rawsock->base.ifInfo.name);
+			}
+			if (pErrno) {
+				*pErrno = 0;
+			}
+			return sz;
+		}
+
+		if (errno != ENOBUFS && errno != EAGAIN) {
+			if (pErrno) {
+				*pErrno = errno;
+			}
+			return sz;
+		}
+
+		if (attempt == SENDMMSG_ENOBUFS_RETRIES) {
+			if (pErrno) {
+				*pErrno = errno;
+			}
+			return sz;
+		}
+
+		usleep(SENDMMSG_ENOBUFS_SLEEP_USEC);
+	}
+
+	if (pErrno) {
+		*pErrno = errno;
+	}
+	return -1;
+}
+
 // Open a rawsock for TX or RX
 void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool rx_mode, bool tx_mode, U16 ethertype, U32 frame_size, U32 num_frames)
 {
@@ -257,6 +392,13 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK);
 		return NULL;
 	}
+
+	temp = SENDMMSG_TX_SNDBUF_BYTES;
+	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_SNDBUF, &temp, sizeof(temp)) < 0) {
+		AVB_LOGF_WARNING("Creating rawsock; failed to set SO_SNDBUF=%d (%d: %s)",
+			SENDMMSG_TX_SNDBUF_BYTES, errno, strerror(errno));
+	}
+
 	sendmmsgRawsockForceQdiscPath(rawsock);
 
 	// Bind to interface
@@ -282,6 +424,10 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 	rawsock->launchTimeEnabled = true;
 	rawsock->launchTimeSockConfigured = false;
 	rawsock->launchTimeFallbackLogged = false;
+	rawsock->launchTimeClockOffsetValid = false;
+	rawsock->launchTimeWallToTaiOffsetNs = 0;
+	rawsock->launchTimeOffsetLastUpdateMonoNs = 0;
+	rawsock->launchTimeOffsetLogCount = 0;
 #endif
 
 	rawsock->buffersOut = 0;
@@ -461,6 +607,7 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 	int bufidx;
 #if USE_LAUNCHTIME
 	bool useLaunchTime = false;
+	U64 kernelLaunchTimeNsec = timeNsec;
 #endif
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
@@ -483,10 +630,13 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 			}
 		}
 		useLaunchTime = (rawsock->launchTimeEnabled && rawsock->launchTimeSockConfigured);
+		if (useLaunchTime) {
+			kernelLaunchTimeNsec = sendmmsgRawsockTranslateLaunchTime(rawsock, timeNsec);
+		}
 	}
 	fillmsghdr(&(rawsock->mmsg[bufidx].msg_hdr), &(rawsock->miov[bufidx]), useLaunchTime,
 			   rawsock->cmsgbuf[bufidx],
-			   timeNsec, rawsock->pktbuf[bufidx], len);
+			   kernelLaunchTimeNsec, rawsock->pktbuf[bufidx], len);
 #else
 	if (timeNsec) {
 		IF_LOG_INTERVAL(1000) AVB_LOG_WARNING("launch time is not enabled but was passed to TxFrameReady");
@@ -497,9 +647,14 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 
 	rawsock->buffersReady += 1;
 
-	if (rawsock->buffersReady >= rawsock->frameCount) {
+	if (rawsock->buffersReady >= SENDMMSG_MAX_BURST) {
+		if (sendmmsgRawsockSend(rawsock) < 0) {
+			AVB_LOGF_WARNING("Auto-flush sendmmsg burst failed on %s (ready=%d max_burst=%d)",
+				rawsock->base.ifInfo.name, rawsock->buffersReady, SENDMMSG_MAX_BURST);
+		}
+	}
+	else if (rawsock->buffersReady >= rawsock->frameCount) {
 		AVB_LOG_DEBUG("All TxFrame slots marked ready");
-		//sendmmsgRawsockSend(rawsock);
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
@@ -512,6 +667,7 @@ int sendmmsgRawsockSend(void *pvRawsock)
 	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
 	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
 	int sz, bytes;
+	int sendErrno = 0;
 #if USE_LAUNCHTIME
 	bool hadLaunchTimeCmsg = false;
 #endif
@@ -540,9 +696,9 @@ int sendmmsgRawsockSend(void *pvRawsock)
 		}
 	}
 #endif
-	sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
+	sz = sendmmsgRawsockSendBurst(rawsock, &sendErrno);
 	if (sz < 0) {
-		int savedErrno = errno;
+		int savedErrno = sendErrno;
 #if USE_LAUNCHTIME
 		AVB_LOGF_WARNING("sendmmsg errno=%d (%s) launchEnabled=%d sockConfigured=%d hadLaunchCmsg=%d first_controllen=%zu first_control=%p",
 			savedErrno, strerror(savedErrno),
@@ -565,9 +721,8 @@ int sendmmsgRawsockSend(void *pvRawsock)
 				fillmsghdr(&(rawsock->mmsg[i].msg_hdr), &(rawsock->miov[i]), false,
 					rawsock->cmsgbuf[i], 0, rawsock->pktbuf[i], rawsock->miov[i].iov_len);
 			}
-			sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
+			sz = sendmmsgRawsockSendBurst(rawsock, &savedErrno);
 			if (sz < 0) {
-				savedErrno = errno;
 				AVB_LOGF_ERROR("Call to sendmmsg failed after launch-time fallback! rc=%d errno=%d (%s)",
 					sz, savedErrno, strerror(savedErrno));
 				bytes = sz;

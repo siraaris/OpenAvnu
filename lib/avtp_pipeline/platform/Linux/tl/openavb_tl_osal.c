@@ -185,6 +185,25 @@ static int openavbTLCfgCallback(void *user, const char *tlSection, const char *n
 			valOK = TRUE;
 		}
 	}
+	else if (MATCH(name, "deferred_start")) {
+		if (MATCH(value, "selected_clock") || MATCH(value, "selected-clock") ||
+				MATCH(value, "1") || MATCH(value, "true") || MATCH(value, "yes")) {
+			pCfg->defer_start_until_selected_clock = TRUE;
+			valOK = TRUE;
+		}
+		else if (MATCH(value, "0") || MATCH(value, "false") || MATCH(value, "no") ||
+				MATCH(value, "none")) {
+			pCfg->defer_start_until_selected_clock = FALSE;
+			valOK = TRUE;
+		}
+	}
+	else if (MATCH(name, "deferred_start_stable_usec")) {
+		errno = 0;
+		pCfg->defer_start_stable_usec = strtol(value, &pEnd, 10);
+		if (*pEnd == '\0' && errno == 0
+			&& pCfg->defer_start_stable_usec <= UINT32_MAX)
+			valOK = TRUE;
+	}
 	else if (MATCH(name, "dest_addr")) {
 		valOK = parse_mac(value, &pCfg->dest_addr);
 	}

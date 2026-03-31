@@ -41,8 +41,12 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "rawsock_impl.h"
 
 #define MSG_COUNT 8
+#define SENDMMSG_MAX_BURST 1
 #define MAX_FRAME_SIZE 1024
 #define USE_LAUNCHTIME 1
+#define SENDMMSG_ENOBUFS_RETRIES 8
+#define SENDMMSG_ENOBUFS_SLEEP_USEC 250
+#define SENDMMSG_TX_SNDBUF_BYTES (1 << 20)
 
 
 // State information for raw socket
@@ -77,6 +81,10 @@ typedef struct {
 	bool launchTimeEnabled;
 	bool launchTimeSockConfigured;
 	bool launchTimeFallbackLogged;
+	bool launchTimeClockOffsetValid;
+	S64 launchTimeWallToTaiOffsetNs;
+	U64 launchTimeOffsetLastUpdateMonoNs;
+	U32 launchTimeOffsetLogCount;
 #endif
 } sendmmsg_rawsock_t;
 

@@ -157,7 +157,10 @@ typedef struct {
 	U32 txLeadLogEveryPackets;
 	U32 txLeadLogCounter;
 	U32 txMinLeadUsec;
+	S32 txLaunchSkewUsec;
+	S32 selectedClockTrimUsec;
 	U32 selectedClockWarmupUsec;
+	U32 selectedClockMuteUsec;
 
 	avb_audio_sparse_mode_t sparseMode;
 
@@ -178,6 +181,10 @@ typedef struct {
 	bool selectedClockWarmupLogged;
 	U64 selectedClockWarmupUntilNs;
 	U64 selectedClockWarmupDropCount;
+	bool selectedClockMuteActive;
+	bool selectedClockMuteLogged;
+	U64 selectedClockMuteUntilNs;
+	U64 selectedClockMutePacketCount;
 	U64 txCadenceSlewEventCount;
 	U64 txCadenceHardRebaseCount;
 
@@ -544,6 +551,16 @@ void openavbMapAVTPAudioCfgCB(media_q_t *pMediaQ, const char *name, const char *
 			char *pEnd;
 			pPvtData->txMinLeadUsec = strtol(value, &pEnd, 10);
 		}
+		else if (strcmp(name, "map_nv_tx_launch_skew_usec") == 0 ||
+				strcmp(name, "map_nv_launch_skew_usec") == 0) {
+			char *pEnd;
+			pPvtData->txLaunchSkewUsec = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "map_nv_selected_clock_trim_usec") == 0 ||
+				strcmp(name, "map_nv_clock_trim_usec") == 0) {
+			char *pEnd;
+			pPvtData->selectedClockTrimUsec = strtol(value, &pEnd, 10);
+		}
 		else if (strcmp(name, "map_nv_selected_clock_follow_updates") == 0 ||
 				strcmp(name, "map_nv_clock_follow_selected_stream") == 0) {
 			char *pEnd;
@@ -556,6 +573,11 @@ void openavbMapAVTPAudioCfgCB(media_q_t *pMediaQ, const char *name, const char *
 				strcmp(name, "map_nv_clock_warmup_usec") == 0) {
 			char *pEnd;
 			pPvtData->selectedClockWarmupUsec = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "map_nv_selected_clock_mute_usec") == 0 ||
+				strcmp(name, "map_nv_clock_mute_usec") == 0) {
+			char *pEnd;
+			pPvtData->selectedClockMuteUsec = strtol(value, &pEnd, 10);
 		}
 	}
 
@@ -660,6 +682,10 @@ void openavbMapAVTPAudioTxInitCB(media_q_t *pMediaQ)
 			pPvtData->selectedClockWarmupLogged = FALSE;
 			pPvtData->selectedClockWarmupUntilNs = 0;
 			pPvtData->selectedClockWarmupDropCount = 0;
+			pPvtData->selectedClockMuteActive = FALSE;
+			pPvtData->selectedClockMuteLogged = FALSE;
+			pPvtData->selectedClockMuteUntilNs = 0;
+			pPvtData->selectedClockMutePacketCount = 0;
 			pPvtData->txCadenceSlewEventCount = 0;
 			pPvtData->txCadenceHardRebaseCount = 0;
 			pPvtData->txDiagPrevPacketTsValid = FALSE;
@@ -878,6 +904,7 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 		pMediaQItem = openavbMediaQTailLock(pMediaQ, TRUE);
 		if (pMediaQItem && pMediaQItem->pPubData && pMediaQItem->dataLen > 0) {
 			bool dropThisPacketForWarmup = FALSE;
+			bool muteThisPacketForSettle = FALSE;
 
 			// timestamp set in the interface module, here just validate
 			// In sparse mode, the timestamp valid flag should be set every eighth AAF AVPTDU.
@@ -896,7 +923,8 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 			}
 			else {
 				// Compute per-packet timestamp from the media queue item's base time.
-				U64 baseNs = openavbAvtpTimeGetAvtpTimeNS(pMediaQItem->pAvtpTime);
+				U64 itemBaseNs = openavbAvtpTimeGetAvtpTimeNS(pMediaQItem->pAvtpTime);
+				U64 baseNs = itemBaseNs;
 				U64 sourceBaseNs = baseNs;
 				U64 intervalNs = 0;
 				U64 itemIntervalNs = 0;
@@ -905,6 +933,7 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				U32 packetIndex = 0;
 				U64 nowNs = 0;
 				bool clamped = FALSE;
+				bool reanchorAfterWarmup = FALSE;
 				bool timestampUncertain = openavbAvtpTimeTimestampIsUncertain(pMediaQItem->pAvtpTime);
 				openavb_clock_source_runtime_t clockSelection = {0};
 				U32 crfGeneration = 0;
@@ -985,6 +1014,19 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 						pPvtData->selectedClockWarmupLogged = FALSE;
 						pPvtData->selectedClockWarmupUntilNs = 0;
 						pPvtData->selectedClockWarmupDropCount = 0;
+						pPvtData->selectedClockMuteActive = FALSE;
+						pPvtData->selectedClockMuteLogged = FALSE;
+						pPvtData->selectedClockMuteUntilNs = 0;
+						pPvtData->selectedClockMutePacketCount = 0;
+						if (usingSelectedInputClock && usingLocalMediaClock &&
+								pPvtData->selectedClockMuteUsec > 0) {
+							CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+							pPvtData->selectedClockMuteActive = TRUE;
+							pPvtData->selectedClockMuteLogged = FALSE;
+							pPvtData->selectedClockMuteUntilNs =
+								nowNs + ((U64)pPvtData->selectedClockMuteUsec * NANOSECONDS_PER_USEC);
+							pPvtData->selectedClockMutePacketCount = 0;
+						}
 					}
 				}
 
@@ -1023,10 +1065,38 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 							 * For the local shared-media-clock path, keep packet cadence
 							 * strictly monotonic once the source is selected. The warm-up
 							 * gate handles the initial lock-on transient; after that the
-							 * safest behavior is to avoid introducing any runtime packet-step
-							 * perturbation from fresh local phase samples.
+							 * safest behavior is to avoid introducing callback-jitter-sized
+							 * packet-step perturbations from fresh local phase samples.
+							 *
+							 * However, packed talkers that maintain cadence independently per
+							 * stream can drift apart by a whole item interval over time. When
+							 * the shared local media phase is already more than an item away
+							 * from the synthesized next step, treat that as lost cadence lock
+							 * and re-anchor to the shared phase instead of preserving the
+							 * stale per-stream base indefinitely.
 							 */
-							pPvtData->selectedClockCadenceBaseNs = nextCadenceNs;
+							S64 cadenceErrNs = (baseNs >= nextCadenceNs)
+								? (S64)(baseNs - nextCadenceNs)
+								: -((S64)(nextCadenceNs - baseNs));
+							S64 reanchorThresholdNs = (S64)itemIntervalNs;
+
+							if (llabs(cadenceErrNs) > reanchorThresholdNs) {
+								pPvtData->txCadenceHardRebaseCount++;
+								if (pPvtData->txCadenceHardRebaseCount <= 16 ||
+										(pPvtData->txCadenceHardRebaseCount % 2000) == 0) {
+									AVB_LOGF_INFO(
+										"AAF TX local cadence re-anchor: err=%lldns expected_step=%lluns gen=%u crf_gen=%u rebases=%llu",
+										(long long)cadenceErrNs,
+										(unsigned long long)itemIntervalNs,
+										clockSelection.generation,
+										crfGeneration,
+										(unsigned long long)pPvtData->txCadenceHardRebaseCount);
+								}
+								pPvtData->selectedClockCadenceBaseNs = baseNs;
+							}
+							else {
+								pPvtData->selectedClockCadenceBaseNs = nextCadenceNs;
+							}
 							pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
 						}
 						else if (freshCrfSample && !followSelectedClockUpdates) {
@@ -1100,6 +1170,21 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				if (usingSelectedInputClock && pPvtData->txMinLeadUsec > 0) {
 					launchTimeNs += ((U64)pPvtData->txMinLeadUsec * NANOSECONDS_PER_USEC);
 				}
+				if (usingSelectedInputClock && pPvtData->selectedClockTrimUsec != 0) {
+					S64 trimNs = (S64)pPvtData->selectedClockTrimUsec * (S64)NANOSECONDS_PER_USEC;
+					if (trimNs >= 0) {
+						launchTimeNs += (U64)trimNs;
+					}
+					else {
+						U64 absTrimNs = (U64)(-trimNs);
+						if (launchTimeNs > absTrimNs) {
+							launchTimeNs -= absTrimNs;
+						}
+						else {
+							launchTimeNs = 0;
+						}
+					}
+				}
 				packetTsNs = launchTimeNs +
 					((U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC);
 
@@ -1152,10 +1237,133 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 						}
 						pPvtData->selectedClockWarmupLogged = FALSE;
 						pPvtData->selectedClockWarmupUntilNs = 0;
+						if (usingSelectedInputClock && usingLocalMediaClock &&
+								pPvtData->selectedClockCadenceValid) {
+							reanchorAfterWarmup = TRUE;
+							if (pPvtData->selectedClockMuteUsec > 0) {
+								pPvtData->selectedClockMuteActive = TRUE;
+								pPvtData->selectedClockMuteLogged = FALSE;
+								pPvtData->selectedClockMuteUntilNs =
+									nowNs + ((U64)pPvtData->selectedClockMuteUsec * NANOSECONDS_PER_USEC);
+								pPvtData->selectedClockMutePacketCount = 0;
+							}
+						}
+					}
+				}
+				if (reanchorAfterWarmup) {
+					/*
+					 * Warm-up intentionally drops the initial packet window while the
+					 * selected local CRF/media clock settles. Re-anchor the first
+					 * transmitted packet to the current shared phase instead of the
+					 * synthesized cadence base accumulated during the dropped period.
+					 * Without this, the whole bus32split group can inherit an
+					 * arbitrary run-to-run offset that then stays stable for the
+					 * duration of the run.
+					 */
+					U64 sharedAnchorNs = sourceBaseNs;
+					if (intervalNs > 0 && packetIndex > 0) {
+						/*
+						 * If warm-up ends mid-item, re-anchor to the start of the item
+						 * rather than the current packet within that item. Otherwise the
+						 * stream that happens to leave warm-up on packet N can inherit a
+						 * stable N * txInterval offset for the whole run.
+						 */
+						sharedAnchorNs -= (intervalNs * packetIndex);
+					}
+					bool createdSharedAnchor = FALSE;
+					openavbClockSourceRuntimeAcquireWarmupAnchorForLocation(
+						clockSelection.clock_source_location_type,
+						clockSelection.clock_source_location_index,
+						clockSelection.generation,
+						recoveryGeneration,
+						0,
+						sharedAnchorNs,
+						&sharedAnchorNs,
+						&createdSharedAnchor);
+					pPvtData->selectedClockCadenceBaseNs = sharedAnchorNs;
+					pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
+					baseNs = sharedAnchorNs;
+					launchTimeNs = baseNs + (intervalNs * packetIndex);
+					if (pPvtData->txMinLeadUsec > 0) {
+						launchTimeNs += ((U64)pPvtData->txMinLeadUsec * NANOSECONDS_PER_USEC);
+					}
+					if (pPvtData->selectedClockTrimUsec != 0) {
+						S64 trimNs = (S64)pPvtData->selectedClockTrimUsec * (S64)NANOSECONDS_PER_USEC;
+						if (trimNs >= 0) {
+							launchTimeNs += (U64)trimNs;
+						}
+						else {
+							U64 absTrimNs = (U64)(-trimNs);
+							if (launchTimeNs > absTrimNs) {
+								launchTimeNs -= absTrimNs;
+							}
+							else {
+								launchTimeNs = 0;
+							}
+						}
+					}
+					packetTsNs = launchTimeNs +
+						((U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC);
+					unclampedPacketTsNs = packetTsNs;
+					pPvtData->txDiagPrevPacketTsValid = FALSE;
+					mapAafResetTxPhaseDiag(pPvtData);
+					AVB_LOGF_INFO(
+						"AAF TX warm-up re-anchor: stream=%u name=%s base=%lluns packet=%u transit=%uus launch_lead=%uus shared=%u",
+						pMediaQ->debug_stream_uid,
+						pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
+						(unsigned long long)baseNs,
+						packetIndex,
+						pPvtData->maxTransitUsec,
+						pPvtData->txMinLeadUsec,
+						createdSharedAnchor ? 1U : 0U);
+				}
+				if (!dropThisPacketForWarmup && usingSelectedInputClock &&
+						usingLocalMediaClock && pPvtData->selectedClockMuteActive) {
+					if (nowNs == 0) {
+						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+					}
+					if (nowNs < pPvtData->selectedClockMuteUntilNs) {
+						muteThisPacketForSettle = TRUE;
+						if (!pPvtData->selectedClockMuteLogged) {
+							U64 remainingUsec =
+								(pPvtData->selectedClockMuteUntilNs - nowNs) / NANOSECONDS_PER_USEC;
+							AVB_LOGF_INFO(
+								"AAF TX muted settle window active: stream=%u name=%s remaining=%lluus",
+								pMediaQ->debug_stream_uid,
+								pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
+								(unsigned long long)remainingUsec);
+							pPvtData->selectedClockMuteLogged = TRUE;
+						}
+					}
+					else {
+						pPvtData->selectedClockMuteActive = FALSE;
+						if (pPvtData->selectedClockMuteLogged ||
+								pPvtData->selectedClockMutePacketCount > 0) {
+							AVB_LOGF_INFO(
+								"AAF TX muted settle window complete: stream=%u name=%s muted_packets=%llu duration=%uus",
+								pMediaQ->debug_stream_uid,
+								pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
+								(unsigned long long)pPvtData->selectedClockMutePacketCount,
+								pPvtData->selectedClockMuteUsec);
+						}
+						pPvtData->selectedClockMuteLogged = FALSE;
+						pPvtData->selectedClockMuteUntilNs = 0;
 					}
 				}
 				if (usingSelectedInputClock) {
-					U64 sourcePacketTsNs = sourceBaseNs +
+					/*
+					 * For packed items, `sourceBaseNs` is a fresh projection of the
+					 * selected clock at the current callback time, while `baseNs` is
+					 * the cadence anchor for the media-queue item being packetized.
+					 * Comparing packet timestamps against the fresh projection makes a
+					 * healthy packed item appear roughly half an item early.
+					 *
+					 * Use the item cadence anchor here so the phase diagnostic tracks
+					 * the actual selected-clock semantics for the item being sent.
+					 * This intentionally keeps trim visible in the diagnostic, since
+					 * trim is a real offset applied to the transmitted timestamps.
+					 */
+					U64 sourcePacketTsNs = baseNs +
 						((U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC) +
 						(intervalNs * packetIndex);
 					if (!dropThisPacketForWarmup) {
@@ -1227,7 +1435,15 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 						if ((pPvtData->txLeadLogCounter % pPvtData->txLeadLogEveryPackets) == 0) {
 							S32 baseLeadUsec = openavbAvtpTimeUsecDelta(pMediaQItem->pAvtpTime);
 							S64 packetOffsetUsec = (S64)((intervalNs * (U64)packetIndex) / NANOSECONDS_PER_USEC);
+							S64 captureToSelectedUsec = 0;
+							S64 captureToCadenceUsec = 0;
 							S64 finalLeadUsec;
+							captureToSelectedUsec = (sourceBaseNs >= itemBaseNs)
+								? (S64)((sourceBaseNs - itemBaseNs) / NANOSECONDS_PER_USEC)
+								: -((S64)((itemBaseNs - sourceBaseNs) / NANOSECONDS_PER_USEC));
+							captureToCadenceUsec = (baseNs >= itemBaseNs)
+								? (S64)((baseNs - itemBaseNs) / NANOSECONDS_PER_USEC)
+								: -((S64)((itemBaseNs - baseNs) / NANOSECONDS_PER_USEC));
 							if (pPvtData->txMinLeadUsec > 0) {
 								if (nowNs == 0) {
 									CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
@@ -1239,17 +1455,19 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 							else {
 								finalLeadUsec = (S64)baseLeadUsec + (S64)pPvtData->maxTransitUsec + packetOffsetUsec;
 							}
-							AVB_LOGF_INFO("AAF TX lead: stream=%u name=%s final=%lldus base=%dus transit=%uus packet=%u offset=%lldus tx_interval=%u launch_lead=%u clamp=%u",
+							AVB_LOGF_INFO("AAF TX lead: stream=%u name=%s final=%lldus base=%dus transit=%uus packet=%u offset=%lldus tx_interval=%u launch_lead=%u clamp=%u capture_to_selected=%lldus capture_to_cadence=%lldus",
 									pMediaQ->debug_stream_uid,
 									pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
-									(long long)finalLeadUsec,
-									baseLeadUsec,
-									pPvtData->maxTransitUsec,
-									packetIndex,
-									(long long)packetOffsetUsec,
-									pPvtData->txInterval,
-									pPvtData->txMinLeadUsec,
-									clamped ? 1U : 0U);
+							(long long)finalLeadUsec,
+							baseLeadUsec,
+							pPvtData->maxTransitUsec,
+							packetIndex,
+							(long long)packetOffsetUsec,
+							pPvtData->txInterval,
+							pPvtData->txMinLeadUsec,
+							clamped ? 1U : 0U,
+							(long long)captureToSelectedUsec,
+							(long long)captureToCadenceUsec);
 						}
 					}
 				}
@@ -1300,7 +1518,12 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 			}
 
 			if (!dropThisPacketForWarmup) {
-				memcpy(pPayload, (uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx, pPvtData->payloadSize);
+				if (muteThisPacketForSettle) {
+					memset(pPayload, 0, pPvtData->payloadSize);
+				}
+				else {
+					memcpy(pPayload, (uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx, pPvtData->payloadSize);
+				}
 				pPayload += pPvtData->payloadSize;
 			}
 			bytesProcessed += pPvtData->payloadSize;
@@ -1316,6 +1539,9 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 			}
 			if (dropThisPacketForWarmup) {
 				pPvtData->selectedClockWarmupDropCount++;
+			}
+			if (muteThisPacketForSettle) {
+				pPvtData->selectedClockMutePacketCount++;
 			}
 		}
 		else {
@@ -1356,6 +1582,16 @@ bool openavbMapAVTPAudioLTCalcCB(media_q_t *pMediaQ, U64 *lt)
 	}
 
 	*lt = pPvtData->lastLaunchTimeNs;
+	if (pPvtData->txLaunchSkewUsec != 0) {
+		S64 skewNs = (S64)pPvtData->txLaunchSkewUsec * (S64)NANOSECONDS_PER_USEC;
+		if (skewNs >= 0) {
+			*lt += (U64)skewNs;
+		}
+		else {
+			U64 absSkewNs = (U64)(-skewNs);
+			*lt = (*lt > absSkewNs) ? (*lt - absSkewNs) : 0;
+		}
+	}
 	AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
 	return TRUE;
 }
@@ -1695,6 +1931,7 @@ extern DLL_EXPORT bool openavbMapAVTPAudioInitialize(media_q_t *pMediaQ, openavb
 		pPvtData->txPhaseDiagEveryPackets = 0;
 		pPvtData->txMinLeadUsec = 1000;
 		pPvtData->selectedClockWarmupUsec = 0;
+		pPvtData->selectedClockMuteUsec = 0;
 		pPvtData->selectedClockFollowUpdates = TRUE;
 		pPvtData->mediaQItemSyncTS = FALSE;
 		mapAafResetTxPhaseDiag(pPvtData);

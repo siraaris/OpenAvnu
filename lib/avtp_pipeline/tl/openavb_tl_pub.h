@@ -97,6 +97,10 @@ typedef struct {
 	avb_role_t role;
 	/// Initial Talker/Listener state
 	tl_init_state_t initial_state;
+	/// Defer automatic start until the selected stream clock is stable
+	bool defer_start_until_selected_clock;
+	/// Required selected-clock stable window before deferred start
+	U32 defer_start_stable_usec;
 	/// Structure with callbacks to mapping
 	openavb_map_cb_t map_cb;
 	/// Structure with callbacks to interface

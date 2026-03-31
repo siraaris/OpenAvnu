@@ -70,6 +70,20 @@ openavb_list_t strElemList;
 #define SID_FORMAT "%02x:%02x:%02x:%02x:%02x:%02x/%u"
 #define SID_OCTETS(a) (a)[0],(a)[1],(a)[2],(a)[3],(a)[4],(a)[5],(a)[6]<<8|(a)[7]
 
+static bool shouldSuppressTalkerAskFailed(const strElem_t *elem, int subtype)
+{
+	if (!elem || !elem->talker) {
+		return FALSE;
+	}
+
+	// MSRP leaveAll/rejoin churn can briefly downgrade an otherwise-active
+	// listener declaration to Asking_Failed before it returns to Ready/Ready_Failed.
+	// Treat that as a transient control-plane wobble and keep the current talker-side
+	// state until a stronger downgrade (None/Ignore) or a stable recovery arrives.
+	return (subtype == openavbSrp_LDSt_Asking_Failed &&
+		elem->subtype > openavbSrp_LDSt_Asking_Failed);
+}
+
 // Callback for SRP to notify AVTP Talker that a Listener Declaration has been
 // registered (or de-registered)
 void mrp_attach_cb(unsigned char streamid[8], int subtype)
@@ -83,6 +97,11 @@ void mrp_attach_cb(unsigned char streamid[8], int subtype)
 		while (node) {
 			strElem_t *elem = openavbListData(node);
 			if (elem && elem->talker && memcmp(streamid, elem->streamId, sizeof(elem->streamId)) == 0) {
+				if (shouldSuppressTalkerAskFailed(elem, subtype)) {
+					AVB_LOGF_INFO("Suppress transient talker askfailed for stream " SID_FORMAT " prior_subtype=%d",
+						SID_OCTETS(elem->streamId), elem->subtype);
+					break;
+				}
 				_attachCb(elem->avtpHandle, subtype);
 				elem->subtype = subtype;
 				AVB_LOGF_DEBUG("mrp_attach_cb subtype changed to %d", elem->subtype);

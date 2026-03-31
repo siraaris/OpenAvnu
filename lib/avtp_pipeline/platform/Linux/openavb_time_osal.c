@@ -64,11 +64,17 @@ typedef struct {
 	U64 lastReturnedNs;
 	U64 lastMonotonicNs;
 	U64 holdoverCount;
+	U64 holdoverStartMonoNs;
 } openavb_walltime_holdover_t;
 
 static __thread openavb_walltime_holdover_t gWalltimeHoldover = {0};
 static U32 gWalltimeRecoveryGeneration = 0;
 static U64 gWalltimeRecoveryLastMonoNs = 0;
+
+// Brief BMCA / GM disturbances should ride through holdover without forcing a
+// media-clock recovery epoch reset. Only longer outages escalate to a
+// generation bump that downstream CRF/AAF logic treats as a hard recovery.
+#define GPTP_WALLTIME_RECOVERY_RESET_THRESHOLD_NS (2000000000ULL)
 
 static U32 x_noteWalltimeRecoveryEvent(U64 monoNow)
 {
@@ -175,31 +181,43 @@ static bool x_getPTPTime(U64 *timeNsec) {
 
 				if (gWalltimeHoldover.holdoverActive) {
 					if (absWallErrNs <= GPTP_WALLTIME_HOLDOVER_EXIT_NS) {
+						U64 holdoverDurationNs = 0;
+						U32 recoveryGeneration = gWalltimeRecoveryGeneration;
+						if (gWalltimeHoldover.holdoverStartMonoNs != 0 &&
+								monoNow >= gWalltimeHoldover.holdoverStartMonoNs) {
+							holdoverDurationNs = monoNow - gWalltimeHoldover.holdoverStartMonoNs;
+						}
+						if (holdoverDurationNs >= GPTP_WALLTIME_RECOVERY_RESET_THRESHOLD_NS) {
+							recoveryGeneration = x_noteWalltimeRecoveryEvent(monoNow);
+						}
 						gWalltimeHoldover.holdoverActive = FALSE;
 						AVB_LOGF_WARNING(
-							"GPTP walltime holdover recovered: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " holds=%" PRIu64,
+							"GPTP walltime holdover recovered: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " holds=%" PRIu64 " duration=%" PRIu64 "ns generation=%u",
 							rawTimeNs,
 							projectedNs,
 							wallErrNs,
-							gWalltimeHoldover.holdoverCount);
+							gWalltimeHoldover.holdoverCount,
+							holdoverDurationNs,
+							recoveryGeneration);
 						filteredTimeNs = rawTimeNs;
+						gWalltimeHoldover.holdoverStartMonoNs = 0;
 					}
 					else {
 						filteredTimeNs = projectedNs;
 					}
 				}
 				else if (absWallErrNs > GPTP_WALLTIME_HOLDOVER_ENTER_NS) {
-					U32 recoveryGeneration = x_noteWalltimeRecoveryEvent(monoNow);
 					gWalltimeHoldover.holdoverActive = TRUE;
 					gWalltimeHoldover.holdoverCount++;
+					gWalltimeHoldover.holdoverStartMonoNs = monoNow;
 					filteredTimeNs = projectedNs;
 					AVB_LOGF_WARNING(
-						"GPTP walltime discontinuity detected: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " hold=%" PRIu64 " generation=%u",
+						"GPTP walltime discontinuity detected: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " hold=%" PRIu64 " reset_threshold=%" PRIu64 "ns",
 						rawTimeNs,
 						projectedNs,
 						wallErrNs,
 						gWalltimeHoldover.holdoverCount,
-						recoveryGeneration);
+						(U64)GPTP_WALLTIME_RECOVERY_RESET_THRESHOLD_NS);
 				}
 			}
 

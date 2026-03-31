@@ -28,10 +28,24 @@ TONEGEN_TX_MIN_LEAD_USEC="${TONEGEN_TX_MIN_LEAD_USEC:-250}"
 TONEGEN_FIXED_TS_RUNTIME_LEAD_USEC="${TONEGEN_FIXED_TS_RUNTIME_LEAD_USEC:-0}"
 TONEGEN_SELECTED_CLOCK_FOLLOW_UPDATES="${TONEGEN_SELECTED_CLOCK_FOLLOW_UPDATES:-0}"
 TONEGEN_SELECTED_CLOCK_WARMUP_USEC="${TONEGEN_SELECTED_CLOCK_WARMUP_USEC:-500000}"
+TONEGEN_SELECTED_CLOCK_MUTE_USEC="${TONEGEN_SELECTED_CLOCK_MUTE_USEC:-500000}"
+BUS32_AAF_SELECTED_CLOCK_TRIM_USEC="${BUS32_AAF_SELECTED_CLOCK_TRIM_USEC:-0}"
 CRF_TONEGEN_MAX_TRANSIT_USEC="${CRF_TONEGEN_MAX_TRANSIT_USEC:-2500}"
 CRF_TONEGEN_MAX_TRANSMIT_DEFICIT_USEC="${CRF_TONEGEN_MAX_TRANSMIT_DEFICIT_USEC:-2500}"
 CRF_TONEGEN_TX_RATE="${CRF_TONEGEN_TX_RATE:-500}"
 CRF_TONEGEN_LAUNCH_LEAD_USEC="${CRF_TONEGEN_LAUNCH_LEAD_USEC:-1200}"
+STOCK_IGB_AAF_TX_MIN_LEAD_USEC="${STOCK_IGB_AAF_TX_MIN_LEAD_USEC:-2000}"
+STOCK_IGB_AAF_MAX_TRANSIT_USEC="${STOCK_IGB_AAF_MAX_TRANSIT_USEC:-500}"
+STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC="${STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC:-$STOCK_IGB_AAF_MAX_TRANSIT_USEC}"
+STOCK_IGB_CRF_LAUNCH_LEAD_USEC="${STOCK_IGB_CRF_LAUNCH_LEAD_USEC:-2000}"
+STOCK_IGB_CLASSA_ETF_DELTA_NS="${STOCK_IGB_CLASSA_ETF_DELTA_NS:-1500000}"
+STOCK_IGB_CLASSB_ETF_DELTA_NS="${STOCK_IGB_CLASSB_ETF_DELTA_NS:-1500000}"
+STOCK_IGB_MQPRIO_HW="${STOCK_IGB_MQPRIO_HW:-0}"
+STOCK_IGB_CLASSA_CBS_OFFLOAD="${STOCK_IGB_CLASSA_CBS_OFFLOAD:-1}"
+STOCK_IGB_CLASSA_ETF_OFFLOAD="${STOCK_IGB_CLASSA_ETF_OFFLOAD:-0}"
+STOCK_IGB_CLASSB_CBS_OFFLOAD="${STOCK_IGB_CLASSB_CBS_OFFLOAD:-0}"
+STOCK_IGB_CLASSB_ETF_OFFLOAD="${STOCK_IGB_CLASSB_ETF_OFFLOAD:-0}"
+STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC="${STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC:-12}"
 BUS32_CRF_DIAG_ENABLE="${BUS32_CRF_DIAG_ENABLE:-1}"
 BUS32_CRF_DIAG_LOG_EVERY_PACKETS="${BUS32_CRF_DIAG_LOG_EVERY_PACKETS:-500}"
 BUS32_CRF_DIAG_JITTER_THRESH_NS="${BUS32_CRF_DIAG_JITTER_THRESH_NS:-250000}"
@@ -50,24 +64,28 @@ STOCK_IGB_IFACE_HOST="${STOCK_IGB_IFACE_HOST:-sendmmsg:enp2s0}"
 STOCK_IGB_IFACE_AVDECC="${STOCK_IGB_IFACE_AVDECC:-enp2s0}"
 STOCK_IGB_IFACE_DAEMONS="${STOCK_IGB_IFACE_DAEMONS:-enp2s0}"
 GENERIC_TSN_SHAPER_LINK_SPEED_MBPS="${GENERIC_TSN_SHAPER_LINK_SPEED_MBPS:-1000}"
-GENERIC_TSN_SHAPER_CLASSA_PARENT="${GENERIC_TSN_SHAPER_CLASSA_PARENT:-100:3}"
-GENERIC_TSN_SHAPER_CLASSB_PARENT="${GENERIC_TSN_SHAPER_CLASSB_PARENT:-100:2}"
+GENERIC_TSN_SHAPER_CLASSA_PARENT="${GENERIC_TSN_SHAPER_CLASSA_PARENT:-1:2}"
+GENERIC_TSN_SHAPER_CLASSB_PARENT="${GENERIC_TSN_SHAPER_CLASSB_PARENT:-1:3}"
 GENERIC_TSN_SHAPER_CLASSA_HANDLE="${GENERIC_TSN_SHAPER_CLASSA_HANDLE:-2}"
 GENERIC_TSN_SHAPER_CLASSB_HANDLE="${GENERIC_TSN_SHAPER_CLASSB_HANDLE:-3}"
 GENERIC_TSN_SHAPER_EGRESS_QMAP="${GENERIC_TSN_SHAPER_EGRESS_QMAP:-1}"
-GENERIC_TSN_SHAPER_CLASSA_QMAP="${GENERIC_TSN_SHAPER_CLASSA_QMAP:-2}"
-GENERIC_TSN_SHAPER_CLASSB_QMAP="${GENERIC_TSN_SHAPER_CLASSB_QMAP:-1}"
+GENERIC_TSN_SHAPER_CLASSA_QMAP="${GENERIC_TSN_SHAPER_CLASSA_QMAP:-1}"
+GENERIC_TSN_SHAPER_CLASSB_QMAP="${GENERIC_TSN_SHAPER_CLASSB_QMAP:-2}"
 GENERIC_TSN_SHAPER_DEFAULT_QMAP="${GENERIC_TSN_SHAPER_DEFAULT_QMAP:-3}"
 GENERIC_TSN_SHAPER_GPTP_QMAP="${GENERIC_TSN_SHAPER_GPTP_QMAP:-0}"
 # Default generic-tsn queue split:
-# - prio 7/6 (gPTP/network-control) -> tc0 -> classid 100:1 (queue 0, highest)
-# - prio 3 (Class A) -> tc2 -> classid 100:3 (queue 2)
-# - prio 2 (Class B) -> tc1 -> classid 100:2 (queue 1)
-# - prio 0/1 and remaining priorities -> tc3 -> classid 100:4 (queue 3, default)
+# - prio 7/6 (gPTP/network-control) -> tc0 -> classid 1:1 (queue 0, highest)
+# - prio 3 (Class A) -> tc1 -> classid 1:2 (queue 1)
+# - prio 2 (Class B) -> tc2 -> classid 1:3 (queue 2)
+# - prio 0/1 and remaining priorities -> tc3 -> classid 1:4 (queue 3, default)
 # gPTP is additionally steered by shaper egress filters (ethertype 0x88f7).
-GENERIC_TSN_SHAPER_TAPRIO_CMD="${GENERIC_TSN_SHAPER_TAPRIO_CMD:-handle 100: taprio num_tc 4 map 3 3 1 2 3 3 0 0 3 3 3 3 3 3 3 3 queues 1@0 1@1 1@2 1@3 base-time 0 sched-entry S 0xF 1000000 clockid CLOCK_TAI}"
+STOCK_IGB_SHAPER_TC_MAP="${STOCK_IGB_SHAPER_TC_MAP:-3 3 2 1 3 3 0 0 3 3 3 3 3 3 3 3}"
+STOCK_IGB_MQPRIO_CLASSA_PARENT="${STOCK_IGB_MQPRIO_CLASSA_PARENT:-1:2}"
+STOCK_IGB_MQPRIO_CLASSB_PARENT="${STOCK_IGB_MQPRIO_CLASSB_PARENT:-1:3}"
+STOCK_IGB_MQPRIO_CLASSA_HANDLE="${STOCK_IGB_MQPRIO_CLASSA_HANDLE:-2}"
+STOCK_IGB_MQPRIO_CLASSB_HANDLE="${STOCK_IGB_MQPRIO_CLASSB_HANDLE:-3}"
 INI_FILES="${INI_FILES:-$DEFAULT_INI_FILES}"
-STACK_PROFILE="${STACK_PROFILE:-full}"
+STACK_PROFILE="${STACK_PROFILE:-bus32split-sendmmsg-stockigb}"
 
 AVDECC_BIN="${AVDECC_BIN:-/root/src/OpenAvnu/lib/avtp_pipeline/build_avdecc/platform/Linux/avb_avdecc/openavb_avdecc}"
 HOST_BIN="${HOST_BIN:-/root/src/OpenAvnu/lib/avtp_pipeline/build/bin/openavb_host}"
@@ -112,12 +130,24 @@ SHAPER_CLASSA_PARENT="${SHAPER_CLASSA_PARENT:-}"
 SHAPER_CLASSB_PARENT="${SHAPER_CLASSB_PARENT:-}"
 SHAPER_CLASSA_HANDLE="${SHAPER_CLASSA_HANDLE:-}"
 SHAPER_CLASSB_HANDLE="${SHAPER_CLASSB_HANDLE:-}"
-SHAPER_TAPRIO_CMD="${SHAPER_TAPRIO_CMD:-}"
 SHAPER_EGRESS_QMAP="${SHAPER_EGRESS_QMAP:-}"
 SHAPER_CLASSA_QMAP="${SHAPER_CLASSA_QMAP:-}"
 SHAPER_CLASSB_QMAP="${SHAPER_CLASSB_QMAP:-}"
 SHAPER_DEFAULT_QMAP="${SHAPER_DEFAULT_QMAP:-}"
 SHAPER_GPTP_QMAP="${SHAPER_GPTP_QMAP:-}"
+SHAPER_CLASSA_QDISC="${SHAPER_CLASSA_QDISC:-}"
+SHAPER_CLASSA_CBS_OFFLOAD="${SHAPER_CLASSA_CBS_OFFLOAD:-}"
+SHAPER_CLASSA_ETF_DELTA_NS="${SHAPER_CLASSA_ETF_DELTA_NS:-}"
+SHAPER_CLASSA_ETF_OFFLOAD="${SHAPER_CLASSA_ETF_OFFLOAD:-}"
+SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK="${SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK:-}"
+SHAPER_CLASSB_QDISC="${SHAPER_CLASSB_QDISC:-}"
+SHAPER_CLASSB_CBS_OFFLOAD="${SHAPER_CLASSB_CBS_OFFLOAD:-}"
+SHAPER_CLASSB_ETF_DELTA_NS="${SHAPER_CLASSB_ETF_DELTA_NS:-}"
+SHAPER_CLASSB_ETF_OFFLOAD="${SHAPER_CLASSB_ETF_OFFLOAD:-}"
+SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK="${SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK:-}"
+SHAPER_MQPRIO_HW="${SHAPER_MQPRIO_HW:-}"
+SHAPER_TC_MAP="${SHAPER_TC_MAP:-}"
+OPENAVB_DISABLE_SO_TXTIME="${OPENAVB_DISABLE_SO_TXTIME:-}"
 MRPD_LOG_FLAGS="${MRPD_LOG_FLAGS:-lmvs}"
 MRPD_PROFILE="${MRPD_PROFILE:-keep}"
 MRPD_DEFAULT_CFLAGS="${MRPD_DEFAULT_CFLAGS:--O2 -Wall -Wextra -Wno-parentheses -ggdb -D_GNU_SOURCE}"
@@ -215,10 +245,10 @@ Defaults (override via env vars):
     tonegen4 -> uses TONEGEN_DEFAULT_INI_FILES (4x tonegen + CRF talker + CRF listener)
     toneaudio -> alias for tonegen4
     toneaudio-sendmmsg -> tonegen4/toneaudio streams on sendmmsg rawsock with generic-tsn shaper defaults
-    toneaudio-sendmmsg-stockigb -> tonegen4/toneaudio streams on sendmmsg rawsock with explicit stock-igb host/AVDECC/daemon interfaces and generic-tsn shaper defaults
-    full-sendmmsg-stockigb|bus32split-sendmmsg-stockigb -> bus32split streams on sendmmsg rawsock with explicit stock-igb host/AVDECC/daemon interfaces and generic-tsn shaper defaults
+    toneaudio-sendmmsg-stockigb -> tonegen4/toneaudio streams on sendmmsg rawsock with explicit stock-igb host/AVDECC/daemon interfaces and stock-igb shaper defaults
+    full-sendmmsg-stockigb|bus32split-sendmmsg-stockigb -> bus32split streams on sendmmsg rawsock with explicit stock-igb host/AVDECC/daemon interfaces and stock-igb shaper defaults
     wav     -> uses WAV_TONEGEN_DEFAULT_INI_FILES (4x tonegen + CRF talker/listener + AAF WAV listener)
-    generic-tsn -> tonegen + CRF talker using sendmmsg rawsock and shaper-managed TAPRIO/CBS defaults
+    generic-tsn -> tonegen + CRF talker using sendmmsg rawsock and shaper-managed MQPRIO/CBS/ETF defaults
     nullcrf -> uses NULL_CRF_DEFAULT_INI_FILES (null talker + CRF talker)
     crf    -> uses only CRF_INI
     crfmodel -> uses CRF_MODEL_INI and switches to CRF-only endpoint/AVDECC config
@@ -246,9 +276,6 @@ EOF
 }
 
 apply_generic_tsn_shaper_defaults() {
-    if [[ -z "$SHAPER_TAPRIO_CMD" ]]; then
-        SHAPER_TAPRIO_CMD="$GENERIC_TSN_SHAPER_TAPRIO_CMD"
-    fi
     if [[ -z "$SHAPER_LINK_SPEED_MBPS" ]]; then
         SHAPER_LINK_SPEED_MBPS="$GENERIC_TSN_SHAPER_LINK_SPEED_MBPS"
     fi
@@ -281,6 +308,29 @@ apply_generic_tsn_shaper_defaults() {
     fi
 }
 
+apply_stock_igb_shaper_defaults() {
+    apply_generic_tsn_shaper_defaults
+
+    SHAPER_MQPRIO_HW="$STOCK_IGB_MQPRIO_HW"
+    SHAPER_TC_MAP="$STOCK_IGB_SHAPER_TC_MAP"
+    SHAPER_CLASSA_PARENT="$STOCK_IGB_MQPRIO_CLASSA_PARENT"
+    SHAPER_CLASSB_PARENT="$STOCK_IGB_MQPRIO_CLASSB_PARENT"
+    SHAPER_CLASSA_HANDLE="$STOCK_IGB_MQPRIO_CLASSA_HANDLE"
+    SHAPER_CLASSB_HANDLE="$STOCK_IGB_MQPRIO_CLASSB_HANDLE"
+
+    SHAPER_CLASSA_QMAP="-1"
+    SHAPER_CLASSB_QMAP="-1"
+    SHAPER_DEFAULT_QMAP="-1"
+    [[ -z "$SHAPER_CLASSA_QDISC" ]] && SHAPER_CLASSA_QDISC="cbs_etf"
+    [[ -z "$SHAPER_CLASSA_CBS_OFFLOAD" ]] && SHAPER_CLASSA_CBS_OFFLOAD="$STOCK_IGB_CLASSA_CBS_OFFLOAD"
+    [[ -z "$SHAPER_CLASSA_ETF_DELTA_NS" ]] && SHAPER_CLASSA_ETF_DELTA_NS="$STOCK_IGB_CLASSA_ETF_DELTA_NS"
+    [[ -z "$SHAPER_CLASSA_ETF_OFFLOAD" ]] && SHAPER_CLASSA_ETF_OFFLOAD="$STOCK_IGB_CLASSA_ETF_OFFLOAD"
+    [[ -z "$SHAPER_CLASSB_QDISC" ]] && SHAPER_CLASSB_QDISC="cbs_etf"
+    [[ -z "$SHAPER_CLASSB_CBS_OFFLOAD" ]] && SHAPER_CLASSB_CBS_OFFLOAD="$STOCK_IGB_CLASSB_CBS_OFFLOAD"
+    [[ -z "$SHAPER_CLASSB_ETF_DELTA_NS" ]] && SHAPER_CLASSB_ETF_DELTA_NS="$STOCK_IGB_CLASSB_ETF_DELTA_NS"
+    [[ -z "$SHAPER_CLASSB_ETF_OFFLOAD" ]] && SHAPER_CLASSB_ETF_OFFLOAD="$STOCK_IGB_CLASSB_ETF_OFFLOAD"
+}
+
 apply_stack_profile() {
     local profile="${STACK_PROFILE,,}"
     ACTIVE_ENDPOINT_INI="$ENDPOINT_INI"
@@ -306,26 +356,23 @@ apply_stack_profile() {
             ;;
         toneaudio-sendmmsg-stockigb|toneaudio_sendmmsg_stockigb|tonegen4-sendmmsg-stockigb|tonegen4_sendmmsg_stockigb|tone-sendmmsg-stockigb|tone_sendmmsg_stockigb)
             INI_FILES="$TONEGEN_DEFAULT_INI_FILES"
+            [[ "$TONEGEN_TX_MIN_LEAD_USEC" == "250" ]] && TONEGEN_TX_MIN_LEAD_USEC="$STOCK_IGB_AAF_TX_MIN_LEAD_USEC"
+            [[ "$CRF_TONEGEN_LAUNCH_LEAD_USEC" == "1200" ]] && CRF_TONEGEN_LAUNCH_LEAD_USEC="$STOCK_IGB_CRF_LAUNCH_LEAD_USEC"
+            INI_FILES="$TONEGEN_DEFAULT_INI_FILES"
             IFACE_HOST="$STOCK_IGB_IFACE_HOST"
             IFACE_AVDECC="$STOCK_IGB_IFACE_AVDECC"
             IFACE_DAEMONS="$STOCK_IGB_IFACE_DAEMONS"
             if [[ "$GPTP_ARGS" == "-F gptp_cfg.ini" ]]; then
                 GPTP_ARGS="-F /root/src/gptp/gptp_cfg.ini"
             fi
-            apply_generic_tsn_shaper_defaults
-            # On the stock igb + sendmmsg path, AVTP stream sockets already set SO_PRIORITY
-            # from SR class / VLAN PCP. Keep the explicit gPTP queue rule, but let taprio
-            # classify stream traffic by socket priority instead of relying on SO_MARK-based
-            # clsact queue overrides, which do not match reliably for PF_PACKET traffic here.
-            SHAPER_CLASSA_QMAP="-1"
-            SHAPER_CLASSB_QMAP="-1"
-            SHAPER_DEFAULT_QMAP="-1"
+            apply_stock_igb_shaper_defaults
             ;;
         full-sendmmsg-stockigb|full_sendmmsg_stockigb|bus32split-sendmmsg-stockigb|bus32split_sendmmsg_stockigb|bus32-sendmmsg-stockigb|bus32_sendmmsg_stockigb)
-            INI_FILES="$AUDIO_INI_0,ifname=$STOCK_IGB_IFACE_HOST,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0 \
-$AUDIO_INI_1,ifname=$STOCK_IGB_IFACE_HOST,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0 \
-$AUDIO_INI_2,ifname=$STOCK_IGB_IFACE_HOST,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0 \
-$AUDIO_INI_3,ifname=$STOCK_IGB_IFACE_HOST,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0 \
+            [[ "$CRF_TONEGEN_LAUNCH_LEAD_USEC" == "1200" ]] && CRF_TONEGEN_LAUNCH_LEAD_USEC="$STOCK_IGB_CRF_LAUNCH_LEAD_USEC"
+            INI_FILES="$AUDIO_INI_0,ifname=$STOCK_IGB_IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=0,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_1,ifname=$STOCK_IGB_IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_2,ifname=$STOCK_IGB_IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 2)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_3,ifname=$STOCK_IGB_IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 3)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
 $CRF_INI,ifname=$STOCK_IGB_IFACE_HOST,max_transit_usec=$CRF_TONEGEN_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$CRF_TONEGEN_MAX_TRANSMIT_DEFICIT_USEC,map_nv_tx_rate=$CRF_TONEGEN_TX_RATE,map_nv_crf_launch_lead_usec=$CRF_TONEGEN_LAUNCH_LEAD_USEC,map_nv_crf_diag_enable=$BUS32_CRF_DIAG_ENABLE,map_nv_crf_diag_log_every_packets=$BUS32_CRF_DIAG_LOG_EVERY_PACKETS,map_nv_crf_diag_jitter_thresh_ns=$BUS32_CRF_DIAG_JITTER_THRESH_NS \
 $CRF_LISTENER_INI,ifname=$STOCK_IGB_IFACE_HOST"
             IFACE_HOST="$STOCK_IGB_IFACE_HOST"
@@ -334,10 +381,7 @@ $CRF_LISTENER_INI,ifname=$STOCK_IGB_IFACE_HOST"
             if [[ "$GPTP_ARGS" == "-F gptp_cfg.ini" ]]; then
                 GPTP_ARGS="-F /root/src/gptp/gptp_cfg.ini"
             fi
-            apply_generic_tsn_shaper_defaults
-            SHAPER_CLASSA_QMAP="-1"
-            SHAPER_CLASSB_QMAP="-1"
-            SHAPER_DEFAULT_QMAP="-1"
+            apply_stock_igb_shaper_defaults
             ;;
         wav|tonegen4wav|tonegen-wav|tonegen_wav|wav-listener|wav_listener)
             INI_FILES="$WAV_TONEGEN_DEFAULT_INI_FILES"
@@ -876,19 +920,33 @@ start_stack() {
         [[ -n "$SHAPER_CLASSB_PARENT" ]] && shaper_env+=" SHAPER_CLASSB_PARENT=$(printf '%q' "$SHAPER_CLASSB_PARENT")"
         [[ -n "$SHAPER_CLASSA_HANDLE" ]] && shaper_env+=" SHAPER_CLASSA_HANDLE=$(printf '%q' "$SHAPER_CLASSA_HANDLE")"
         [[ -n "$SHAPER_CLASSB_HANDLE" ]] && shaper_env+=" SHAPER_CLASSB_HANDLE=$(printf '%q' "$SHAPER_CLASSB_HANDLE")"
-        [[ -n "$SHAPER_TAPRIO_CMD" ]] && shaper_env+=" SHAPER_TAPRIO_CMD=$(printf '%q' "$SHAPER_TAPRIO_CMD")"
         [[ -n "$SHAPER_EGRESS_QMAP" ]] && shaper_env+=" SHAPER_EGRESS_QMAP=$(printf '%q' "$SHAPER_EGRESS_QMAP")"
         [[ -n "$SHAPER_CLASSA_QMAP" ]] && shaper_env+=" SHAPER_CLASSA_QMAP=$(printf '%q' "$SHAPER_CLASSA_QMAP")"
         [[ -n "$SHAPER_CLASSB_QMAP" ]] && shaper_env+=" SHAPER_CLASSB_QMAP=$(printf '%q' "$SHAPER_CLASSB_QMAP")"
         [[ -n "$SHAPER_DEFAULT_QMAP" ]] && shaper_env+=" SHAPER_DEFAULT_QMAP=$(printf '%q' "$SHAPER_DEFAULT_QMAP")"
         [[ -n "$SHAPER_GPTP_QMAP" ]] && shaper_env+=" SHAPER_GPTP_QMAP=$(printf '%q' "$SHAPER_GPTP_QMAP")"
+        [[ -n "$SHAPER_CLASSA_QDISC" ]] && shaper_env+=" SHAPER_CLASSA_QDISC=$(printf '%q' "$SHAPER_CLASSA_QDISC")"
+        [[ -n "$SHAPER_CLASSA_CBS_OFFLOAD" ]] && shaper_env+=" SHAPER_CLASSA_CBS_OFFLOAD=$(printf '%q' "$SHAPER_CLASSA_CBS_OFFLOAD")"
+        [[ -n "$SHAPER_CLASSA_ETF_DELTA_NS" ]] && shaper_env+=" SHAPER_CLASSA_ETF_DELTA_NS=$(printf '%q' "$SHAPER_CLASSA_ETF_DELTA_NS")"
+        [[ -n "$SHAPER_CLASSA_ETF_OFFLOAD" ]] && shaper_env+=" SHAPER_CLASSA_ETF_OFFLOAD=$(printf '%q' "$SHAPER_CLASSA_ETF_OFFLOAD")"
+        [[ -n "$SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK" ]] && shaper_env+=" SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK=$(printf '%q' "$SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK")"
+        [[ -n "$SHAPER_CLASSB_QDISC" ]] && shaper_env+=" SHAPER_CLASSB_QDISC=$(printf '%q' "$SHAPER_CLASSB_QDISC")"
+        [[ -n "$SHAPER_CLASSB_CBS_OFFLOAD" ]] && shaper_env+=" SHAPER_CLASSB_CBS_OFFLOAD=$(printf '%q' "$SHAPER_CLASSB_CBS_OFFLOAD")"
+        [[ -n "$SHAPER_CLASSB_ETF_DELTA_NS" ]] && shaper_env+=" SHAPER_CLASSB_ETF_DELTA_NS=$(printf '%q' "$SHAPER_CLASSB_ETF_DELTA_NS")"
+        [[ -n "$SHAPER_CLASSB_ETF_OFFLOAD" ]] && shaper_env+=" SHAPER_CLASSB_ETF_OFFLOAD=$(printf '%q' "$SHAPER_CLASSB_ETF_OFFLOAD")"
+        [[ -n "$SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK" ]] && shaper_env+=" SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK=$(printf '%q' "$SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK")"
+        [[ -n "$SHAPER_MQPRIO_HW" ]] && shaper_env+=" SHAPER_MQPRIO_HW=$(printf '%q' "$SHAPER_MQPRIO_HW")"
+        [[ -n "$SHAPER_TC_MAP" ]] && shaper_env+=" SHAPER_TC_MAP=$(printf '%q' "$SHAPER_TC_MAP")"
         start_session "$SESS_SHAPER" \
             "exec env $shaper_env $SHAPER_BIN $SHAPER_ARGS >>$SHAPER_LOG 2>&1"
         sleep 1
     fi
 
     local host_cmd
-    host_cmd="cd $CFG_DIR && OPENAVB_ENDPOINT_INI=$ACTIVE_ENDPOINT_INI OPENAVB_ENDPOINT_SAVE_INI=$ACTIVE_ENDPOINT_SAVE_INI exec $HOST_BIN -I $IFACE_HOST $INI_ARGS >>$HOST_LOG 2>&1"
+    local host_env
+    host_env="OPENAVB_ENDPOINT_INI=$ACTIVE_ENDPOINT_INI OPENAVB_ENDPOINT_SAVE_INI=$ACTIVE_ENDPOINT_SAVE_INI"
+    [[ -n "$OPENAVB_DISABLE_SO_TXTIME" ]] && host_env+=" OPENAVB_DISABLE_SO_TXTIME=$(printf '%q' "$OPENAVB_DISABLE_SO_TXTIME")"
+    host_cmd="cd $CFG_DIR && env $host_env $HOST_BIN -I $IFACE_HOST $INI_ARGS >>$HOST_LOG 2>&1"
     local host_attempt=0
     local host_max_attempts=1
     local host_ready_rc=1

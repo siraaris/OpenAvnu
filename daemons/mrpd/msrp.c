@@ -2284,12 +2284,16 @@ msrp_emit_talkervectors(unsigned char *msgbuf, unsigned char *msgbuf_eof,
 			attrib = attrib->next;
 			continue;
 		}
-#ifdef CHECK
-		if (MSRP_OPERATION_REGISTER == attrib->direction) {
+		/*
+		 * An endpoint should only emit talker vectors for locally declared
+		 * streams. Bridge- or listener-learned TalkerAdvertise/TalkerFailed
+		 * state belongs to the receive path and must not be re-advertised
+		 * back onto the wire.
+		 */
+		if (MSRP_OPERATION_REGISTER == attrib->operation) {
 			attrib = attrib->next;
 			continue;
 		}
-#endif
 		if (0 == attrib->applicant.tx) {
 			attrib = attrib->next;
 			continue;

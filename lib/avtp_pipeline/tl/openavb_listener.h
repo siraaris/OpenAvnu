@@ -69,6 +69,9 @@ typedef struct {
 	U8				srpTalkerDecl;
 	U8				srpFailureCode;
 	U8				srpFailureBridgeId[8];
+	U64				lastTalkerAdvertiseNS;
+	bool			srpStopPending;
+	U64				srpStopDeadlineNS;
 
 	// Cumulative Milan / AECP counters for this listener across AVTP restarts.
 	openavb_avtp_diag_counters_t aecpCounters;

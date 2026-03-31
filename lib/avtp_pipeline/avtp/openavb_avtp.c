@@ -497,6 +497,8 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 					{
 						U64 nowNs = 0;
 						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+						U64 tsLeadNs = (tsTimeNs > 0 && tsTimeNs >= nowNs) ? (tsTimeNs - nowNs) :
+							(tsTimeNs > 0 ? 0ULL : 0ULL);
 
 						// Guard against pathological launch targets (seconds behind/ahead of wall clock)
 						// after scheduling stalls. Rebase to a bounded lead to avoid bursts of early/late packets.
@@ -512,6 +514,26 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 						if (deltaLaunchNs < -5000000LL || deltaLaunchNs > ((int64_t)safeLeadNs + 50000000LL)) {
 							launchTimeNs = nowNs + safeLeadNs;
 							deltaLaunchNs = (int64_t)(launchTimeNs - nowNs);
+						}
+
+						if (pStream->tx_launch_log_count < 16 ||
+								deltaLaunchNs < 500000LL ||
+								deltaLaunchNs > (int64_t)(safeLeadNs + 5000000ULL)) {
+							U16 streamUid = 0;
+							memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+							streamUid = ntohs(streamUid);
+							AVB_LOGF_INFO(
+								"AVTP TX launch window: uid=%u subtype=0x%02x launch=%" PRIu64 " now=%" PRIu64 " delta=%" PRId64 "ns ts=%" PRIu64 " ts_lead=%" PRIu64 "ns safe_lead=%" PRIu64 "ns map_lt=%d",
+								streamUid,
+								pStream->subtype,
+								launchTimeNs,
+								nowNs,
+								deltaLaunchNs,
+								tsTimeNs,
+								tsLeadNs,
+								safeLeadNs,
+								haveMapLaunchTime ? 1 : 0);
+							pStream->tx_launch_log_count++;
 						}
 					}
 					openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, launchTimeNs);

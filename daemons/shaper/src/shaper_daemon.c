@@ -27,6 +27,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <ctype.h>
 #include <net/if.h>
@@ -68,6 +69,12 @@ typedef enum {
 	SHAPER_CLASS_B = 2,
 } shaper_class_t;
 
+typedef enum {
+	SHAPER_QDISC_CBS = 0,
+	SHAPER_QDISC_ETF = 1,
+	SHAPER_QDISC_CBS_ETF = 2,
+} shaper_qdisc_mode_t;
+
 typedef struct stream_da
 {
 	char dest_addr[STREAMDA_LENGTH];
@@ -85,17 +92,17 @@ char interface[IFNAMSIZ] = {0};
 int bandwidth_bps = 0;
 int classa_parent = 2, classb_parent=3;
 // mqprio creates classids 1:1..1:4 for num_tc=4.
-// Keep queue 0 for gPTP/control; steer Class B to queue 1 and Class A to queue 2.
-char classa_parent_str[8] = "1:3";
-char classb_parent_str[8] = "1:2";
+// Keep queue 0 for gPTP/control; steer Class A to queue 1 and Class B to queue 2.
+char classa_parent_str[8] = "1:2";
+char classb_parent_str[8] = "1:3";
 int classa_bw = 0, classb_bw = 0;
 int classa_max_frame_size = 0, classb_max_frame_size = 0;
 int link_speed_mbps = 0;
 int skip_root_qdisc = 0;
-char taprio_cmd[512] = {0};
 int interface_cleaned = 0;
 char tc_path[128] = "tc";
 int tc_cbs_checked = 0;
+int tc_etf_checked = 0;
 int log_tc_commands = 0;
 char modprobe_path[128] = "modprobe";
 int root_qdisc_installed = 0;
@@ -105,13 +112,24 @@ int qmap_classa = -1;
 int qmap_classb = -1;
 int qmap_default = 3;
 int qmap_gptp = 0;
-// Priority map for mqprio/taprio:
+shaper_qdisc_mode_t classa_qdisc_mode = SHAPER_QDISC_CBS;
+shaper_qdisc_mode_t classb_qdisc_mode = SHAPER_QDISC_CBS;
+int classa_cbs_offload = 0;
+long long classa_etf_delta_ns = 300000;
+int classa_etf_offload = 1;
+int classa_etf_skip_sock_check = 0;
+int classb_cbs_offload = 0;
+long long classb_etf_delta_ns = 300000;
+int classb_etf_offload = 0;
+int classb_etf_skip_sock_check = 0;
+// Default mqprio traffic-class map:
 //   prio 7/6 -> tc0 (gPTP/control, highest)
-//   prio 3   -> tc2 (Class A)
-//   prio 2   -> tc1 (Class B)
+//   prio 3   -> tc1 (Class A)
+//   prio 2   -> tc2 (Class B)
 //   all others -> tc3 (default/best effort)
 // gPTP ethertype is also pinned by flower filter when egress qmap is enabled.
-#define SHAPER_TC_MAP "3 3 1 2 3 3 0 0 3 3 3 3 3 3 3 3"
+#define SHAPER_TC_MAP_DEFAULT "3 3 2 1 3 3 0 0 3 3 3 3 3 3 3 3"
+char shaper_tc_map[64] = SHAPER_TC_MAP_DEFAULT;
 
 static int process_command(int sockfd, char command[]);
 static int process_commands_from_stream(int sockfd, char *accum, int *accum_len, const char *chunk, int chunk_len);
@@ -119,8 +137,14 @@ static void cleanup_client_streams(int sockfd);
 static int compute_cbs_params(int port_rate_bps, int idleslope_bps, int max_frame_size,
 	int *sendslope_bps, int *hicredit, int *locredit);
 static int run_cmd(const char *cmd, int log_failure);
+static const char *qdisc_mode_name(shaper_qdisc_mode_t mode);
 static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
-	int idleslope_bps, int sendslope_bps, int hicredit, int locredit);
+	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int offload);
+static void tc_etf_command(int sockfd, char interface[], const char *parent, int handle,
+	long long delta_ns, int offload, int skip_sock_check);
+static void tc_cbs_etf_command(int sockfd, char interface[], const char *parent, int handle,
+	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int cbs_offload,
+	long long delta_ns, int etf_offload, int etf_skip_sock_check);
 static int parse_parent_queue_index(const char *parent);
 static void apply_egress_qmap_filters(const char *ifname);
 
@@ -459,11 +483,28 @@ static void cleanup_client_streams(int sockfd)
 		run_cmd(tc_command, 1);
 		sr_classa = 0;
 	}
+	else if (classa_qdisc_mode == SHAPER_QDISC_ETF)
+	{
+		tc_etf_command(-1, interface, classa_parent_str, classa_parent,
+			classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
+		sr_classa = 1;
+	}
+	else if (classa_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+	{
+		if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+			&sendslope_bps, &hicredit, &locredit) == 0)
+		{
+			tc_cbs_etf_command(-1, interface, classa_parent_str, classa_parent,
+				classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload,
+				classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
+			sr_classa = 1;
+		}
+	}
 	else if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
 		&sendslope_bps, &hicredit, &locredit) == 0)
 	{
 		tc_cbs_command(-1, interface, classa_parent_str, classa_parent,
-			classa_bw, sendslope_bps, hicredit, locredit);
+			classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload);
 		sr_classa = 1;
 	}
 
@@ -478,9 +519,25 @@ static void cleanup_client_streams(int sockfd)
 	else if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
 		&sendslope_bps, &hicredit, &locredit) == 0)
 	{
-		tc_cbs_command(-1, interface, classb_parent_str, classb_parent,
-			classb_bw, sendslope_bps, hicredit, locredit);
-		sr_classb = 1;
+		if (classb_qdisc_mode == SHAPER_QDISC_ETF)
+		{
+			tc_etf_command(-1, interface, classb_parent_str, classb_parent,
+				classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
+			sr_classb = 1;
+		}
+		else if (classb_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+		{
+			tc_cbs_etf_command(-1, interface, classb_parent_str, classb_parent,
+				classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload,
+				classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
+			sr_classb = 1;
+		}
+		else
+		{
+			tc_cbs_command(-1, interface, classb_parent_str, classb_parent,
+				classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload);
+			sr_classb = 1;
+		}
 	}
 }
 
@@ -657,7 +714,7 @@ static void cleanup_qdisc(const char *ifname)
 	system(tc_command);
 
 	// Delete root qdisc if we manage it
-	if (!skip_root_qdisc || taprio_cmd[0] != '\0')
+	if (!skip_root_qdisc)
 	{
 		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root >/dev/null 2>&1", tc_path, ifname);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
@@ -805,8 +862,22 @@ static void apply_egress_qmap_filters(const char *ifname)
 	}
 }
 
+static const char *qdisc_mode_name(shaper_qdisc_mode_t mode)
+{
+	switch (mode)
+	{
+		case SHAPER_QDISC_ETF:
+			return "etf";
+		case SHAPER_QDISC_CBS_ETF:
+			return "cbs_etf";
+		case SHAPER_QDISC_CBS:
+		default:
+			return "cbs";
+	}
+}
+
 static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
-	int idleslope_bps, int sendslope_bps, int hicredit, int locredit)
+	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int offload)
 {
 	char tc_command[1000]={0};
 	const char *verbs_replace_first[] = { "replace", "change", "add" };
@@ -820,8 +891,8 @@ static void tc_cbs_command(int sockfd, char interface[], const char *parent, int
 	for (i = 0; i < 3; ++i)
 	{
 		snprintf(tc_command, sizeof(tc_command),
-			"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d >/dev/null 2>&1",
-			tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
+			"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d offload %d >/dev/null 2>&1",
+			tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit, offload);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 		if (run_cmd(tc_command, 1) == 0)
@@ -847,11 +918,98 @@ static void tc_cbs_command(int sockfd, char interface[], const char *parent, int
 			for (i = 0; i < 3; ++i)
 			{
 				snprintf(tc_command, sizeof(tc_command),
-					"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d >/dev/null 2>&1",
-					tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
+					"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d offload %d >/dev/null 2>&1",
+					tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit, offload);
 				if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 				log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 				if (run_cmd(tc_command, 1) == 0)
+				{
+					return;
+				}
+			}
+		}
+	}
+}
+
+static void tc_cbs_etf_command(int sockfd, char interface[], const char *parent, int handle,
+	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int cbs_offload,
+	long long delta_ns, int etf_offload, int etf_skip_sock_check)
+{
+	char child_parent[16];
+	int etf_handle = handle * 10;
+
+	tc_cbs_command(sockfd, interface, parent, handle,
+		idleslope_bps, sendslope_bps, hicredit, locredit, cbs_offload);
+	snprintf(child_parent, sizeof(child_parent), "%d:1", handle);
+	tc_etf_command(sockfd, interface, child_parent, etf_handle,
+		delta_ns, etf_offload, etf_skip_sock_check);
+}
+
+static void tc_etf_command(int sockfd, char interface[], const char *parent, int handle,
+	long long delta_ns, int offload, int skip_sock_check)
+{
+	char tc_command[1000] = {0};
+	const char *verbs[] = {"add", "replace", "change"};
+	int i;
+	int appended;
+
+	for (i = 0; i < 3; ++i)
+	{
+		appended = snprintf(tc_command, sizeof(tc_command),
+			"%s qdisc %s dev %s parent %s handle %d: etf delta %lld clockid CLOCK_TAI",
+			tc_path, verbs[i], interface, parent, handle, delta_ns);
+		if (offload && appended > 0 && appended < (int)sizeof(tc_command))
+		{
+			appended += snprintf(tc_command + appended, sizeof(tc_command) - appended, " offload");
+		}
+		if (skip_sock_check && appended > 0 && appended < (int)sizeof(tc_command))
+		{
+			appended += snprintf(tc_command + appended, sizeof(tc_command) - appended, " skip_sock_check");
+		}
+		if (appended > 0 && appended < (int)sizeof(tc_command))
+		{
+			snprintf(tc_command + appended, sizeof(tc_command) - appended, " >/dev/null 2>&1");
+		}
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+		if (run_cmd(tc_command, i == 2) == 0)
+		{
+			return;
+		}
+	}
+
+	if (!tc_etf_checked)
+	{
+		tc_etf_checked = 1;
+		const char *auto_modprobe = getenv("SHAPER_AUTO_MODPROBE");
+		if (auto_modprobe && atoi(auto_modprobe) > 0)
+		{
+			char modprobe_cmd[256];
+			snprintf(modprobe_cmd, sizeof(modprobe_cmd), "%s sch_etf", modprobe_path);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", modprobe_cmd); }
+			log_client_debug_message(sockfd, "tc command:  \"%s\"", modprobe_cmd);
+			run_cmd(modprobe_cmd, 0);
+
+			for (i = 0; i < 3; ++i)
+			{
+				appended = snprintf(tc_command, sizeof(tc_command),
+					"%s qdisc %s dev %s parent %s handle %d: etf delta %lld clockid CLOCK_TAI",
+					tc_path, verbs[i], interface, parent, handle, delta_ns);
+				if (offload && appended > 0 && appended < (int)sizeof(tc_command))
+				{
+					appended += snprintf(tc_command + appended, sizeof(tc_command) - appended, " offload");
+				}
+				if (skip_sock_check && appended > 0 && appended < (int)sizeof(tc_command))
+				{
+					appended += snprintf(tc_command + appended, sizeof(tc_command) - appended, " skip_sock_check");
+				}
+				if (appended > 0 && appended < (int)sizeof(tc_command))
+				{
+					snprintf(tc_command + appended, sizeof(tc_command) - appended, " >/dev/null 2>&1");
+				}
+				if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+				log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+				if (run_cmd(tc_command, i == 2) == 0)
 				{
 					return;
 				}
@@ -964,25 +1122,6 @@ int process_command(int sockfd, char command[])
 			cleanup_qdisc(input.interface);
 			interface_cleaned = 1;
 		}
-		if (taprio_cmd[0] != '\0')
-		{
-			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root %s >/dev/null 2>&1", tc_path, input.interface, taprio_cmd);
-			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
-			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-			if (run_cmd(tc_command, 0) != 0)
-			{
-				snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root %s >/dev/null 2>&1", tc_path, input.interface, taprio_cmd);
-				if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
-				log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-				if (run_cmd(tc_command, 1) != 0)
-				{
-					log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
-					return -1;
-				}
-			}
-			skip_root_qdisc = 1;
-		}
-
 		if (!skip_root_qdisc)
 		{
 			if (root_qdisc_installed || has_mqprio_root(input.interface))
@@ -997,7 +1136,7 @@ int process_command(int sockfd, char command[])
 			{
 				hw = 1;
 			}
-			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, SHAPER_TC_MAP, hw);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, shaper_tc_map, hw);
 			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 			if (run_cmd(tc_command, 0) != 0)
@@ -1009,7 +1148,7 @@ int process_command(int sockfd, char command[])
 				}
 				else
 				{
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, SHAPER_TC_MAP, hw);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, shaper_tc_map, hw);
 					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					if (run_cmd(tc_command, 1) != 0)
@@ -1085,16 +1224,38 @@ int process_command(int sockfd, char command[])
 				return -1;
 			}
 
-			if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
-				&sendslope_bps, &hicredit, &locredit) < 0)
+			if (classa_qdisc_mode == SHAPER_QDISC_ETF)
 			{
-				SHAPER_LOGF_ERROR("CBS compute failed A: port_rate=%d idleslope=%d max_frame=%d",
-					link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
-				log_client_error_message(sockfd, "Invalid CBS parameters for Class A. Check link speed and bandwidth");
-				return -1;
+				tc_etf_command(sockfd, interface, classa_parent_str, classa_parent,
+					classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
 			}
-			tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
-				classa_bw, sendslope_bps, hicredit, locredit);
+			else if (classa_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+			{
+				if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+					&sendslope_bps, &hicredit, &locredit) < 0)
+				{
+					SHAPER_LOGF_ERROR("CBS compute failed A: port_rate=%d idleslope=%d max_frame=%d",
+						link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
+					log_client_error_message(sockfd, "Invalid CBS parameters for Class A. Check link speed and bandwidth");
+					return -1;
+				}
+				tc_cbs_etf_command(sockfd, interface, classa_parent_str, classa_parent,
+					classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload,
+					classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
+			}
+			else
+			{
+				if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+					&sendslope_bps, &hicredit, &locredit) < 0)
+				{
+					SHAPER_LOGF_ERROR("CBS compute failed A: port_rate=%d idleslope=%d max_frame=%d",
+						link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
+					log_client_error_message(sockfd, "Invalid CBS parameters for Class A. Check link speed and bandwidth");
+					return -1;
+				}
+				tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
+					classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload);
+			}
 			sr_classa = 1;
 		}
 		else
@@ -1123,16 +1284,33 @@ int process_command(int sockfd, char command[])
 				return -1;
 			}
 
-			if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
-				&sendslope_bps, &hicredit, &locredit) < 0)
+			if (classb_qdisc_mode == SHAPER_QDISC_ETF)
 			{
-				SHAPER_LOGF_ERROR("CBS compute failed B: port_rate=%d idleslope=%d max_frame=%d",
-					link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
-				log_client_error_message(sockfd, "Invalid CBS parameters for Class B. Check link speed and bandwidth");
-				return -1;
+				tc_etf_command(sockfd, interface, classb_parent_str, classb_parent,
+					classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
 			}
-			tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
-				classb_bw, sendslope_bps, hicredit, locredit);
+			else
+			{
+				if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
+					&sendslope_bps, &hicredit, &locredit) < 0)
+				{
+					SHAPER_LOGF_ERROR("CBS compute failed B: port_rate=%d idleslope=%d max_frame=%d",
+						link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
+					log_client_error_message(sockfd, "Invalid CBS parameters for Class B. Check link speed and bandwidth");
+					return -1;
+				}
+				if (classb_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+				{
+					tc_cbs_etf_command(sockfd, interface, classb_parent_str, classb_parent,
+						classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload,
+						classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
+				}
+				else
+				{
+					tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
+						classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload);
+				}
+			}
 			sr_classb = 1;
 		}
 	}
@@ -1161,16 +1339,38 @@ int process_command(int sockfd, char command[])
 				}
 				else
 				{
-					if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
-						&sendslope_bps, &hicredit, &locredit) < 0)
+					if (classa_qdisc_mode == SHAPER_QDISC_ETF)
 					{
-						SHAPER_LOGF_ERROR("CBS recompute failed A: port_rate=%d idleslope=%d max_frame=%d",
-							link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
-						log_client_error_message(sockfd, "Invalid CBS parameters for Class A after unreserve");
-						return -1;
+						tc_etf_command(sockfd, interface, classa_parent_str, classa_parent,
+							classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
 					}
-					tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
-						classa_bw, sendslope_bps, hicredit, locredit);
+					else if (classa_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+					{
+						if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+							&sendslope_bps, &hicredit, &locredit) < 0)
+						{
+							SHAPER_LOGF_ERROR("CBS recompute failed A: port_rate=%d idleslope=%d max_frame=%d",
+								link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
+							log_client_error_message(sockfd, "Invalid CBS parameters for Class A after unreserve");
+							return -1;
+						}
+						tc_cbs_etf_command(sockfd, interface, classa_parent_str, classa_parent,
+							classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload,
+							classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
+					}
+					else
+					{
+						if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+							&sendslope_bps, &hicredit, &locredit) < 0)
+						{
+							SHAPER_LOGF_ERROR("CBS recompute failed A: port_rate=%d idleslope=%d max_frame=%d",
+								link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
+							log_client_error_message(sockfd, "Invalid CBS parameters for Class A after unreserve");
+							return -1;
+						}
+						tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
+							classa_bw, sendslope_bps, hicredit, locredit, classa_cbs_offload);
+					}
 				}
 			}
 			else if (class_type == SHAPER_CLASS_B)
@@ -1190,16 +1390,33 @@ int process_command(int sockfd, char command[])
 				}
 				else
 				{
-					if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
-						&sendslope_bps, &hicredit, &locredit) < 0)
+					if (classb_qdisc_mode == SHAPER_QDISC_ETF)
 					{
-						SHAPER_LOGF_ERROR("CBS recompute failed B: port_rate=%d idleslope=%d max_frame=%d",
-							link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
-						log_client_error_message(sockfd, "Invalid CBS parameters for Class B after unreserve");
-						return -1;
+						tc_etf_command(sockfd, interface, classb_parent_str, classb_parent,
+							classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
 					}
-					tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
-						classb_bw, sendslope_bps, hicredit, locredit);
+					else
+					{
+						if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
+							&sendslope_bps, &hicredit, &locredit) < 0)
+						{
+							SHAPER_LOGF_ERROR("CBS recompute failed B: port_rate=%d idleslope=%d max_frame=%d",
+								link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
+							log_client_error_message(sockfd, "Invalid CBS parameters for Class B after unreserve");
+							return -1;
+						}
+						if (classb_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+						{
+							tc_cbs_etf_command(sockfd, interface, classb_parent_str, classb_parent,
+								classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload,
+								classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
+						}
+						else
+						{
+							tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
+								classb_bw, sendslope_bps, hicredit, locredit, classb_cbs_offload);
+						}
+					}
 				}
 			}
 		}
@@ -1325,12 +1542,22 @@ int main (int argc, char *argv[])
 		const char *env_classb_parent = getenv("SHAPER_CLASSB_PARENT");
 		const char *env_classa_handle = getenv("SHAPER_CLASSA_HANDLE");
 		const char *env_classb_handle = getenv("SHAPER_CLASSB_HANDLE");
-		const char *env_taprio_cmd = getenv("SHAPER_TAPRIO_CMD");
 		const char *env_egress_qmap = getenv("SHAPER_EGRESS_QMAP");
 		const char *env_classa_qmap = getenv("SHAPER_CLASSA_QMAP");
 		const char *env_classb_qmap = getenv("SHAPER_CLASSB_QMAP");
 		const char *env_default_qmap = getenv("SHAPER_DEFAULT_QMAP");
 		const char *env_gptp_qmap = getenv("SHAPER_GPTP_QMAP");
+		const char *env_classa_qdisc = getenv("SHAPER_CLASSA_QDISC");
+		const char *env_classb_qdisc = getenv("SHAPER_CLASSB_QDISC");
+		const char *env_classa_cbs_offload = getenv("SHAPER_CLASSA_CBS_OFFLOAD");
+		const char *env_classa_etf_delta = getenv("SHAPER_CLASSA_ETF_DELTA_NS");
+		const char *env_classa_etf_offload = getenv("SHAPER_CLASSA_ETF_OFFLOAD");
+		const char *env_classa_etf_skip_sock_check = getenv("SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK");
+		const char *env_classb_cbs_offload = getenv("SHAPER_CLASSB_CBS_OFFLOAD");
+		const char *env_classb_etf_delta = getenv("SHAPER_CLASSB_ETF_DELTA_NS");
+		const char *env_classb_etf_offload = getenv("SHAPER_CLASSB_ETF_OFFLOAD");
+		const char *env_classb_etf_skip_sock_check = getenv("SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK");
+		const char *env_tc_map = getenv("SHAPER_TC_MAP");
 		if (env_classa_parent)
 		{
 			strncpy(classa_parent_str, env_classa_parent, sizeof(classa_parent_str) - 1);
@@ -1348,19 +1575,6 @@ int main (int argc, char *argv[])
 		if (env_classb_handle)
 		{
 			classb_parent = atoi(env_classb_handle);
-		}
-		if (env_taprio_cmd)
-		{
-			// Only accept a full taprio argument string (must include "taprio")
-			if (strstr(env_taprio_cmd, "taprio") != NULL)
-			{
-				strncpy(taprio_cmd, env_taprio_cmd, sizeof(taprio_cmd) - 1);
-				taprio_cmd[sizeof(taprio_cmd) - 1] = '\0';
-			}
-			else
-			{
-				SHAPER_LOGF_WARNING("Ignoring SHAPER_TAPRIO_CMD without taprio: \"%s\"", env_taprio_cmd);
-			}
 		}
 		if (env_egress_qmap && atoi(env_egress_qmap) > 0)
 		{
@@ -1381,6 +1595,102 @@ int main (int argc, char *argv[])
 		if (env_gptp_qmap)
 		{
 			qmap_gptp = atoi(env_gptp_qmap);
+		}
+		if (env_classa_qdisc)
+		{
+			if (!strcasecmp(env_classa_qdisc, "etf"))
+			{
+				classa_qdisc_mode = SHAPER_QDISC_ETF;
+			}
+			else if (!strcasecmp(env_classa_qdisc, "cbs_etf") || !strcasecmp(env_classa_qdisc, "cbs+etf"))
+			{
+				classa_qdisc_mode = SHAPER_QDISC_CBS_ETF;
+			}
+			else if (!strcasecmp(env_classa_qdisc, "cbs"))
+			{
+				classa_qdisc_mode = SHAPER_QDISC_CBS;
+			}
+			else
+			{
+				SHAPER_LOGF_WARNING("Ignoring unsupported SHAPER_CLASSA_QDISC=%s", env_classa_qdisc);
+			}
+		}
+		if (env_classb_qdisc)
+		{
+			if (!strcasecmp(env_classb_qdisc, "etf"))
+			{
+				classb_qdisc_mode = SHAPER_QDISC_ETF;
+			}
+			else if (!strcasecmp(env_classb_qdisc, "cbs_etf") || !strcasecmp(env_classb_qdisc, "cbs+etf"))
+			{
+				classb_qdisc_mode = SHAPER_QDISC_CBS_ETF;
+			}
+			else if (!strcasecmp(env_classb_qdisc, "cbs"))
+			{
+				classb_qdisc_mode = SHAPER_QDISC_CBS;
+			}
+			else
+			{
+				SHAPER_LOGF_WARNING("Ignoring unsupported SHAPER_CLASSB_QDISC=%s", env_classb_qdisc);
+			}
+		}
+		if (env_classa_cbs_offload)
+		{
+			classa_cbs_offload = atoi(env_classa_cbs_offload) > 0 ? 1 : 0;
+		}
+		if (env_classa_etf_delta)
+		{
+			classa_etf_delta_ns = atoll(env_classa_etf_delta);
+		}
+		if (env_classa_etf_offload)
+		{
+			classa_etf_offload = atoi(env_classa_etf_offload) > 0 ? 1 : 0;
+		}
+		if (env_classa_etf_skip_sock_check)
+		{
+			classa_etf_skip_sock_check = atoi(env_classa_etf_skip_sock_check) > 0 ? 1 : 0;
+		}
+		if (env_classb_cbs_offload)
+		{
+			classb_cbs_offload = atoi(env_classb_cbs_offload) > 0 ? 1 : 0;
+		}
+		if (env_classb_etf_delta)
+		{
+			classb_etf_delta_ns = atoll(env_classb_etf_delta);
+		}
+		if (env_classb_etf_offload)
+		{
+			classb_etf_offload = atoi(env_classb_etf_offload) > 0 ? 1 : 0;
+		}
+		if (env_classb_etf_skip_sock_check)
+		{
+			classb_etf_skip_sock_check = atoi(env_classb_etf_skip_sock_check) > 0 ? 1 : 0;
+		}
+		if (env_tc_map && *env_tc_map)
+		{
+			strncpy(shaper_tc_map, env_tc_map, sizeof(shaper_tc_map) - 1);
+			shaper_tc_map[sizeof(shaper_tc_map) - 1] = '\0';
+		}
+		SHAPER_LOGF_INFO("Class A qdisc mode: %s", qdisc_mode_name(classa_qdisc_mode));
+		SHAPER_LOGF_INFO("Class B qdisc mode: %s", qdisc_mode_name(classb_qdisc_mode));
+		SHAPER_LOGF_INFO("mqprio traffic-class map: %s", shaper_tc_map);
+		if (classa_qdisc_mode == SHAPER_QDISC_CBS || classa_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+		{
+			SHAPER_LOGF_INFO("Class A CBS settings: offload=%d", classa_cbs_offload);
+		}
+		if (classa_qdisc_mode == SHAPER_QDISC_ETF || classa_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+		{
+			SHAPER_LOGF_INFO("Class A ETF settings: delta=%lld offload=%d skip_sock_check=%d",
+				classa_etf_delta_ns, classa_etf_offload, classa_etf_skip_sock_check);
+		}
+		if (classb_qdisc_mode == SHAPER_QDISC_CBS || classb_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+		{
+			SHAPER_LOGF_INFO("Class B CBS settings: offload=%d", classb_cbs_offload);
+		}
+		if (classb_qdisc_mode == SHAPER_QDISC_ETF || classb_qdisc_mode == SHAPER_QDISC_CBS_ETF)
+		{
+			SHAPER_LOGF_INFO("Class B ETF settings: delta=%lld offload=%d skip_sock_check=%d",
+				classb_etf_delta_ns, classb_etf_offload, classb_etf_skip_sock_check);
 		}
 		if (egress_qmap_enable)
 		{
