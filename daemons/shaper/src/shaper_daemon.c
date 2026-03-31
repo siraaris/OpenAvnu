@@ -36,6 +36,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <limits.h>
 
 #define SHAPER_LOG_COMPONENT "Main"
 #include "shaper_log.h"
@@ -88,6 +89,7 @@ int link_speed_mbps = 0;
 int skip_root_qdisc = 0;
 char taprio_cmd[512] = {0};
 int interface_cleaned = 0;
+char tc_path[128] = "tc";
 int exit_received = 0;
 
 static int process_command(int sockfd, char command[]);
@@ -531,17 +533,17 @@ static void cleanup_qdisc(const char *ifname)
 	}
 
 	// Delete CBS qdiscs if present (ignore failures)
-	sprintf(tc_command, "tc qdisc del dev %s parent %s handle %d: 2>/dev/null", ifname, classa_parent_str, classa_parent);
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: 2>/dev/null", tc_path, ifname, classa_parent_str, classa_parent);
 	log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 	system(tc_command);
-	sprintf(tc_command, "tc qdisc del dev %s parent %s handle %d: 2>/dev/null", ifname, classb_parent_str, classb_parent);
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: 2>/dev/null", tc_path, ifname, classb_parent_str, classb_parent);
 	log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 	system(tc_command);
 
 	// Delete root qdisc if we manage it
 	if (!skip_root_qdisc || taprio_cmd[0] != '\0')
 	{
-		sprintf(tc_command, "tc qdisc del dev %s root 2>/dev/null", ifname);
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root 2>/dev/null", tc_path, ifname);
 		log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 		system(tc_command);
 	}
@@ -556,8 +558,8 @@ void tc_cbs_command(int sockfd, const char *command, char interface[], const cha
 	{
 		cmd = "replace";
 	}
-	sprintf(tc_command, "tc qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d",
-		cmd, interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d",
+		tc_path, cmd, interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
 	log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 	if (system(tc_command) < 0)
 	{
@@ -625,7 +627,7 @@ int process_command(int sockfd, char command[])
 				if (!skip_root_qdisc)
 				{
 					//delete qdisc
-					sprintf(tc_command, "tc qdisc del dev %s root handle 1:", interface);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1:", tc_path, interface);
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					if (system(tc_command) < 0)
 					{
@@ -664,7 +666,7 @@ int process_command(int sockfd, char command[])
 		}
 		if (taprio_cmd[0] != '\0')
 		{
-			sprintf(tc_command, "tc qdisc replace dev %s root %s", input.interface, taprio_cmd);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root %s", tc_path, input.interface, taprio_cmd);
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 			if (system(tc_command) < 0)
 			{
@@ -682,7 +684,7 @@ int process_command(int sockfd, char command[])
 			{
 				hw = 1;
 			}
-			sprintf(tc_command, "tc qdisc replace dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d", input.interface, hw);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d", tc_path, input.interface, hw);
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 			if (system(tc_command) < 0)
 			{
@@ -799,7 +801,7 @@ int process_command(int sockfd, char command[])
 
 				if (classa_bw == 0)
 				{
-					sprintf(tc_command, "tc qdisc del dev %s parent %s handle %d:", interface, classa_parent_str, classa_parent);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d:", tc_path, interface, classa_parent_str, classa_parent);
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					system(tc_command);
 					sr_classa = 0;
@@ -824,7 +826,7 @@ int process_command(int sockfd, char command[])
 
 				if (classb_bw == 0)
 				{
-					sprintf(tc_command, "tc qdisc del dev %s parent %s handle %d:", interface, classb_parent_str, classb_parent);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d:", tc_path, interface, classb_parent_str, classb_parent);
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					system(tc_command);
 					sr_classb = 0;
@@ -900,6 +902,26 @@ int main (int argc, char *argv[])
 	shaperLogInit();
 
 	{
+		const char *env_tc_path = getenv("SHAPER_TC_PATH");
+		if (env_tc_path && env_tc_path[0] != '\0')
+		{
+			strncpy(tc_path, env_tc_path, sizeof(tc_path) - 1);
+			tc_path[sizeof(tc_path) - 1] = '\0';
+		}
+		else if (access("/sbin/tc", X_OK) == 0)
+		{
+			strncpy(tc_path, "/sbin/tc", sizeof(tc_path) - 1);
+			tc_path[sizeof(tc_path) - 1] = '\0';
+		}
+		else if (access("/usr/sbin/tc", X_OK) == 0)
+		{
+			strncpy(tc_path, "/usr/sbin/tc", sizeof(tc_path) - 1);
+			tc_path[sizeof(tc_path) - 1] = '\0';
+		}
+
+		// Ensure PATH contains sbin for system() commands.
+		setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin", 1);
+
 		const char *skip_root = getenv("SHAPER_SKIP_ROOT_QDISC");
 		if (skip_root && atoi(skip_root) > 0)
 		{
