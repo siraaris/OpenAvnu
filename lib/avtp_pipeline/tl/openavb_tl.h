@@ -101,6 +101,15 @@ typedef struct {
 	// Handle to the AVDECC Msg support.  (Value set by avdeccMsgThread)
 	int avdeccMsgHandle;
 
+	// Last clock source selection received via AVDECC.
+	U16 clock_domain_index;
+	U16 clock_source_index;
+	U16 clock_source_flags;
+	U16 clock_source_type;
+	U16 clock_source_location_type;
+	U16 clock_source_location_index;
+	U32 clock_source_generation;
+
 	// Per stream Stats Mutex
 	MUTEX_HANDLE(statsMutex);
 

@@ -92,6 +92,7 @@ if (DEFINED AVB_FEATURE_AVDECC)
 		set ( AVB_FEATURE_IGB 0 )
 		set ( AVB_FEATURE_ATL 0 )
 		set ( IGB_LAUNCHTIME_ENABLED 0 )
+		set ( SOCKET_LAUNCHTIME_ENABLED 0 )
 	endif ()
 endif ()
 
@@ -119,7 +120,7 @@ endif ()
 # Default launchtime feature
 if (NOT DEFINED IGB_LAUNCHTIME_ENABLED)
   set ( IGB_LAUNCHTIME_ENABLED 0 )
-else ()
+elseif (IGB_LAUNCHTIME_ENABLED)
   MESSAGE ( "-- IGB launch time enabled" )
 endif ()
 set ( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DIGB_LAUNCHTIME_ENABLED=${IGB_LAUNCHTIME_ENABLED}" )
@@ -129,6 +130,15 @@ if (NOT DEFINED ATL_LAUNCHTIME_ENABLED)
   set ( ATL_LAUNCHTIME_ENABLED 1 )
 endif ()
 set ( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DATL_LAUNCHTIME_ENABLED=${ATL_LAUNCHTIME_ENABLED}" )
+
+# Default launch-time feature for socket-based TX paths (e.g. sendmmsg + SO_TXTIME)
+if (NOT DEFINED SOCKET_LAUNCHTIME_ENABLED)
+  set ( SOCKET_LAUNCHTIME_ENABLED 0 )
+endif ()
+if (SOCKET_LAUNCHTIME_ENABLED)
+  MESSAGE ( "-- Socket launch time enabled" )
+endif ()
+set ( CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DSOCKET_LAUNCHTIME_ENABLED=${SOCKET_LAUNCHTIME_ENABLED}" )
 
 
 # Export feature flags for sub-builds
@@ -251,6 +261,7 @@ include_directories(
 		${AVB_SRC_DIR}/map_aaf_audio
 		${AVB_SRC_DIR}/map_uncmp_audio
 		${AVB_SRC_DIR}/map_ctrl
+		${AVB_SRC_DIR}/map_crf
 		${AVB_SRC_DIR}/map_h264
 		${AVB_SRC_DIR}/intf_ctrl
 		${AVB_SRC_DIR}/mcr
@@ -336,6 +347,7 @@ if (NOT AVB_FEATURE_AVDECC)
 		install ( TARGETS ${MAP_NAME} ARCHIVE DESTINATION ${AVB_INSTALL_LIB_DIR} )
 	endmacro()
 	add_map_mod ( "map_ctrl" )
+	add_map_mod ( "map_crf" )
 	add_map_mod ( "map_mjpeg" )
 	add_map_mod ( "map_mpeg2ts" )
 	add_map_mod ( "map_null" )
@@ -373,6 +385,7 @@ if (NOT AVB_FEATURE_AVDECC)
 	endmacro()
 
 	add_intf_mod_platform ( "intf_alsa" )
+	add_intf_mod_platform ( "intf_bus32split" )
 	if (AVB_FEATURE_GSTREAMER)
 		add_intf_mod_platform ( "intf_mpeg2ts_gst" )
 		add_intf_mod_platform ( "intf_mjpeg_gst" )

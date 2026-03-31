@@ -49,6 +49,10 @@ openavb_list_t openavbListNewList(void);
 // Delete a link list.
 void openavbListDeleteList(openavb_list_t list);
 
+// Delete list container only. Leaves any nodes/data allocated.
+// Useful for defensive shutdown paths where list integrity is uncertain.
+void openavbListDeleteListShallow(openavb_list_t list);
+
 // Add a data element as a node to the end (tail) of a link list. Returns NULL on failure.
 openavb_list_node_t openavbListAdd(openavb_list_t list, void *data);
 

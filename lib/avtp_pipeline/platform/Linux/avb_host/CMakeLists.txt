@@ -15,6 +15,7 @@ target_link_libraries( openavb_host
 	map_null
 	map_pipe
 	map_aaf_audio 
+	map_crf
 	map_uncmp_audio 
 	map_h264 
 	intf_ctrl
@@ -24,6 +25,7 @@ target_link_libraries( openavb_host
 	intf_tonegen
 	intf_viewer
 	intf_alsa
+	intf_bus32split
 	intf_mpeg2ts_file
 	intf_wav_file
 	avbTl
@@ -44,6 +46,7 @@ target_link_libraries( openavb_harness
 	map_null
 	map_pipe
 	map_aaf_audio 
+	map_crf
 	map_uncmp_audio 
 	map_h264 
 	intf_ctrl
@@ -53,6 +56,7 @@ target_link_libraries( openavb_harness
 	intf_tonegen
 	intf_viewer
 	intf_alsa
+	intf_bus32split
 	intf_mpeg2ts_file
 	intf_wav_file
 	avbTl

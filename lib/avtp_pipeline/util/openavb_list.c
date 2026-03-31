@@ -71,10 +71,25 @@ void openavbListDeleteList(openavb_list_t list)
     }
 }
 
+void openavbListDeleteListShallow(openavb_list_t list)
+{
+	if (list) {
+		free(list);
+	}
+}
+
 openavb_list_node_t openavbListAdd(openavb_list_t list, void *data)
 {
     openavb_list_node_t retNode = NULL;
     if (list) {
+		// Defensive invariant repair: if one end pointer is missing,
+		// reset the list to empty rather than chasing potentially invalid links.
+		if ((list->head && !list->tail) || (!list->head && list->tail)) {
+			list->head = NULL;
+			list->tail = NULL;
+			list->iter = NULL;
+		}
+
         retNode = calloc(1, sizeof(struct openavb_list_node));
         if (retNode) {
             retNode->data = data;
@@ -285,7 +300,4 @@ void openavbListDump(openavb_list_t list, U32 dataSize)
 	}
 	printf("Invalid list pointer\n");
 }
-
-
-
 

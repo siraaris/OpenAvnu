@@ -42,7 +42,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #define MSG_COUNT 8
 #define MAX_FRAME_SIZE 1024
-#define USE_LAUNCHTIME 0
+#define USE_LAUNCHTIME 1
 
 
 // State information for raw socket
@@ -70,8 +70,13 @@ typedef struct {
 	struct iovec miov[MSG_COUNT];
 
 	unsigned char pktbuf[MSG_COUNT][MAX_FRAME_SIZE];
+	unsigned long txOutOfBuffers;
+	unsigned long txOutOfBuffersCyclic;
 #if USE_LAUNCHTIME
 	unsigned char cmsgbuf[MSG_COUNT][CMSG_SPACE(sizeof(uint64_t))];
+	bool launchTimeEnabled;
+	bool launchTimeSockConfigured;
+	bool launchTimeFallbackLogged;
 #endif
 } sendmmsg_rawsock_t;
 
@@ -89,6 +94,9 @@ U8* sendmmsgRawsockGetTxFrame(void *pvRawsock, bool blocking, unsigned int *len)
 // FQTSS creates a mark that includes the AVB class and stream index.
 bool sendmmsgRawsockTxSetMark(void *pvRawsock, int mark);
 
+// Release a TX frame without sending it
+bool sendmmsgRawsockRelTxFrame(void *pvRawsock, U8 *pBuffer);
+
 // Pre-set the ethernet header information that will be used on TX frames
 bool sendmmsgRawsockTxSetHdr(void *pvRawsock, hdr_info_t *pHdr);
 
@@ -98,11 +106,18 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 // Send all packets that are ready (i.e. tell kernel to send them)
 int sendmmsgRawsockSend(void *pvRawsock);
 
+// Check Tx buffer level in sockets
+int sendmmsgRawsockTxBufLevel(void *pvRawsock);
+
 // Get a RX frame
 U8* sendmmsgRawsockGetRxFrame(void *pvRawsock, U32 timeout, unsigned int *offset, unsigned int *len);
 
 // Setup the rawsock to receive multicast packets
 bool sendmmsgRawsockRxMulticast(void *pvRawsock, bool add_membership, const U8 addr[ETH_ALEN]);
+
+// Get TX out-of-buffer event counters
+unsigned long sendmmsgRawsockGetTXOutOfBuffers(void *pvRawsock);
+unsigned long sendmmsgRawsockGetTXOutOfBuffersCyclic(void *pvRawsock);
 
 // Get the socket used for this rawsock; can be used for poll/select
 int  sendmmsgRawsockGetSocket(void *pvRawsock);

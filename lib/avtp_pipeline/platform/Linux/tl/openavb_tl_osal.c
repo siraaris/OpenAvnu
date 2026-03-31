@@ -483,14 +483,16 @@ EXTERN_DLL_EXPORT bool openavbTLReadIniFileOsal(tl_handle_t TLhandle, const char
 		*pszExtension = '\0';
 	}
 
+	if_info_t ifinfo;
+	bool ifinfoValid = FALSE;
 	int result = ini_parse(fileName, openavbTLCfgCallback, &parseIniData);
 	if (result == 0) {
-		if_info_t ifinfo;
 		if (pCfg->ifname[0] && !openavbCheckInterface(parseIniData.pCfg->ifname, &ifinfo)) {
 			AVB_LOGF_ERROR("Invalid value: name=%s, value=%s", "ifname", parseIniData.pCfg->ifname);
 			AVB_TRACE_EXIT(AVB_TRACE_TL);
 			return FALSE;
 		}
+		ifinfoValid = (pCfg->ifname[0] != '\0');
 	}
 	if (result < 0) {
 		AVB_LOGF_ERROR("Couldn't parse INI file: %s", fileName);
@@ -507,14 +509,21 @@ EXTERN_DLL_EXPORT bool openavbTLReadIniFileOsal(tl_handle_t TLhandle, const char
 	if (parseIniData.pCfg->role == AVB_ROLE_TALKER &&
 	    (!parseIniData.pCfg->stream_addr.mac || memcmp(parseIniData.pCfg->stream_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
 	{
-		// Open a rawsock may be the easiest cross platform way to get the MAC address.
-		void *txSock = openavbRawsockOpen(parseIniData.pCfg->ifname, FALSE, TRUE, ETHERTYPE_AVTP, 100, 1);
-		if (txSock) {
-			if (openavbRawsockGetAddr(txSock, parseIniData.pCfg->stream_addr.buffer.ether_addr_octet)) {
-				parseIniData.pCfg->stream_addr.mac = &(parseIniData.pCfg->stream_addr.buffer); // Indicate that the MAC Address is valid.
+		// Prefer the interface query result to avoid taking the rawsock/igb path during INI parsing.
+		if (ifinfoValid) {
+			memcpy(parseIniData.pCfg->stream_addr.buffer.ether_addr_octet, ifinfo.mac.ether_addr_octet, ETH_ALEN);
+			parseIniData.pCfg->stream_addr.mac = &(parseIniData.pCfg->stream_addr.buffer);
+		}
+		else {
+			// Fallback for cases where ifname was not provided.
+			void *txSock = openavbRawsockOpen(parseIniData.pCfg->ifname, FALSE, TRUE, ETHERTYPE_AVTP, 100, 1);
+			if (txSock) {
+				if (openavbRawsockGetAddr(txSock, parseIniData.pCfg->stream_addr.buffer.ether_addr_octet)) {
+					parseIniData.pCfg->stream_addr.mac = &(parseIniData.pCfg->stream_addr.buffer); // Indicate that the MAC Address is valid.
+				}
+				openavbRawsockClose(txSock);
+				txSock = NULL;
 			}
-			openavbRawsockClose(txSock);
-			txSock = NULL;
 		}
 
 		if (!parseIniData.pCfg->stream_addr.mac || memcmp(parseIniData.pCfg->stream_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
@@ -524,6 +533,22 @@ EXTERN_DLL_EXPORT bool openavbTLReadIniFileOsal(tl_handle_t TLhandle, const char
 		}
 		AVB_LOGF_DEBUG("Detected stream_addr:  " ETH_FORMAT,
 			ETH_OCTETS(parseIniData.pCfg->stream_addr.buffer.ether_addr_octet));
+	}
+
+	// For a Talker, ensure a non-zero default destination multicast address is
+	// always present so controller-facing stream metadata is never all-zero.
+	if (parseIniData.pCfg->role == AVB_ROLE_TALKER &&
+		(!parseIniData.pCfg->dest_addr.mac ||
+		 memcmp(parseIniData.pCfg->dest_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
+	{
+		U8 defaultDest[ETH_ALEN] = {0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x80};
+		if (parseIniData.pCfg->stream_uid != 0xFFFF) {
+			defaultDest[5] = (U8)(0x80 + (parseIniData.pCfg->stream_uid & 0x7f));
+		}
+		memcpy(parseIniData.pCfg->dest_addr.buffer.ether_addr_octet, defaultDest, ETH_ALEN);
+		parseIniData.pCfg->dest_addr.mac = &(parseIniData.pCfg->dest_addr.buffer);
+		AVB_LOGF_INFO("No dest_addr specified; defaulting to " ETH_FORMAT,
+			ETH_OCTETS(parseIniData.pCfg->dest_addr.buffer.ether_addr_octet));
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
@@ -565,5 +590,3 @@ bool openavbTLCloseLinkLibsOsal(tl_state_t *pTLState)
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 	return TRUE;
 }
-
-

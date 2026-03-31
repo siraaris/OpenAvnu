@@ -34,12 +34,12 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "ring_rawsock.h"
 #if AVB_FEATURE_PCAP
 #include "pcap_rawsock.h"
+#endif
 #if AVB_FEATURE_IGB
 #include "igb_rawsock.h"
 #endif
 #if AVB_FEATURE_ATL
 #include "atl_rawsock.h"
-#endif
 #endif
 
 #include "openavb_rawsock.h"
@@ -88,7 +88,13 @@ void *openavbRawsockOpen(const char *ifname_uri, bool rx_mode, bool tx_mode, U16
 	char proto[IF_NAMESIZE] = "pcap";
 #endif
 #else
+#if AVB_FEATURE_IGB
+	char proto[IF_NAMESIZE] = "igb";
+#elif AVB_FEATURE_ATL
+	char proto[IF_NAMESIZE] = "atl";
+#else
 	char proto[IF_NAMESIZE] = "simple";
+#endif
 #endif
 
 	char *colon = strchr(ifname_uri, ':');
@@ -156,6 +162,7 @@ void *openavbRawsockOpen(const char *ifname_uri, bool rx_mode, bool tx_mode, U16
 
 		// call constructor
 		pvRawsock = pcapRawsockOpen(rawsock, ifname, rx_mode, tx_mode, ethertype, frame_size, num_frames);
+#endif
 #if AVB_FEATURE_IGB
 	} else if (strcmp(proto, "igb") == 0) {
 
@@ -185,7 +192,6 @@ void *openavbRawsockOpen(const char *ifname_uri, bool rx_mode, bool tx_mode, U16
 
 		// call constructor
 		pvRawsock = atlRawsockOpen((atl_rawsock_t*)rawsock, ifname, rx_mode, tx_mode, ethertype, frame_size, num_frames);
-#endif
 #endif
 	} else {
 		AVB_LOGF_ERROR("Unknown proto %s specified.", proto);

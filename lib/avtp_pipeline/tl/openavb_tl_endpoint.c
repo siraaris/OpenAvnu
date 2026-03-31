@@ -55,6 +55,11 @@ void openavbEptClntCheckVerMatchesSrvr(int endpointHandle, U32 AVBVersion)
 	AVB_TRACE_ENTRY(AVB_TRACE_TL);
 
 	tl_state_t *pTLState = TLHandleListGet(endpointHandle);
+	if (!pTLState) {
+		AVB_LOGF_WARNING("Unable to get TL state from endpoint handle %d for version callback.", endpointHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
+		return;
+	}
 
 	if (AVBVersion == AVB_CORE_VER_FULL) {
 		pTLState->AVBVerState = OPENAVB_TL_AVB_VER_VALID;

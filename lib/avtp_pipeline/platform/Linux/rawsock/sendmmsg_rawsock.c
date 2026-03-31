@@ -36,27 +36,123 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <sys/ioctl.h>
 #include <linux/if_packet.h>
 #include <linux/filter.h>
+#include <linux/net_tstamp.h>
+#include <errno.h>
 
 #define AVB_LOG_LEVEL AVB_LOG_LEVEL_INFO
 
 #include "openavb_trace.h"
+#include "avb_sched.h"
 
 #define	AVB_LOG_COMPONENT	"Raw Socket"
 #include "openavb_log.h"
 
+#define SR_CLASS_A_DEFAULT_PRIORITY 3
+#define SR_CLASS_B_DEFAULT_PRIORITY 2
+
+static bool sendmmsgRawsockSetPriority(sendmmsg_rawsock_t *rawsock, U32 priority, const char *source)
+{
+	if (priority > 7) {
+		AVB_LOGF_WARNING("SO_PRIORITY source=%s requested out-of-range value=%u, clamping to 7",
+			source ? source : "unknown", priority);
+		priority = 7;
+	}
+
+	int sockPriority = (int)priority;
+	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_PRIORITY, &sockPriority, sizeof(sockPriority)) < 0) {
+		AVB_LOGF_ERROR("Setting TX priority from %s failed (%d: %s)",
+			source ? source : "unknown", errno, strerror(errno));
+		return FALSE;
+	}
+
+	AVB_LOGF_DEBUG("SO_PRIORITY=%d set from %s", sockPriority, source ? source : "unknown");
+	return TRUE;
+}
+
+static bool sendmmsgRawsockClassMarkToPriority(int mark, U32 *pPriority)
+{
+	int fwmarkClass = TC_AVB_MARK_CLASS(mark);
+	if (fwmarkClass == SR_CLASS_A) {
+		*pPriority = SR_CLASS_A_DEFAULT_PRIORITY;
+		return TRUE;
+	}
+	if (fwmarkClass == SR_CLASS_B) {
+		*pPriority = SR_CLASS_B_DEFAULT_PRIORITY;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void sendmmsgRawsockForceQdiscPath(sendmmsg_rawsock_t *rawsock)
+{
+#ifdef PACKET_QDISC_BYPASS
+	int bypass = 0;
+	if (setsockopt(rawsock->sock, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass)) < 0) {
+		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass taprio/CBS",
+			errno, strerror(errno));
+	}
+	else {
+		AVB_LOG_DEBUG("PACKET_QDISC_BYPASS=0 (qdisc path enabled)");
+	}
+#endif
+}
+
 
 #if USE_LAUNCHTIME
 
-#ifndef SCM_TIMEDLAUNCH
-#define SCM_TIMEDLAUNCH 0x04
+#ifndef SO_TXTIME
+#define SO_TXTIME 61
 #endif
+
+#ifndef SCM_TXTIME
+#define SCM_TXTIME SO_TXTIME
+#endif
+
+#ifndef SOF_TXTIME_REPORT_ERRORS
+#define SOF_TXTIME_REPORT_ERRORS (1U << 1)
+#endif
+
+static bool launchTimeErrnoIsUnsupported(int err)
+{
+	switch (err) {
+		case EINVAL:
+		case EOPNOTSUPP:
+#if ENOTSUP != EOPNOTSUPP
+		case ENOTSUP:
+#endif
+		case EPERM:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool sendmmsgRawsockEnableLaunchTime(sendmmsg_rawsock_t *rawsock)
+{
+	struct sock_txtime txtimeCfg;
+	memset(&txtimeCfg, 0, sizeof(txtimeCfg));
+
+	// AVTP launch timestamps are in wall-time domain; CLOCK_TAI is the Linux wall clock
+	// that tracks gPTP/802.1AS with leap-second-free semantics.
+	txtimeCfg.clockid = CLOCK_TAI;
+	txtimeCfg.flags = SOF_TXTIME_REPORT_ERRORS;
+
+	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_TXTIME, &txtimeCfg, sizeof(txtimeCfg)) < 0) {
+		AVB_LOGF_WARNING("SO_TXTIME unsupported (errno=%d: %s); disabling launch-time on %s",
+			errno, strerror(errno), rawsock->base.ifInfo.name);
+		rawsock->launchTimeEnabled = false;
+		return false;
+	}
+
+	return true;
+}
 
 #endif /* if USE_LAUNCHTIME */
 
 
 static void fillmsghdr(struct msghdr *msg, struct iovec *iov,
 #if USE_LAUNCHTIME
-					   unsigned char *cmsgbuf, uint64_t time,
+					   bool useLaunchTime, unsigned char *cmsgbuf, uint64_t time,
 #endif
 					   void *pktdata, size_t pktlen)
 {
@@ -69,7 +165,7 @@ static void fillmsghdr(struct msghdr *msg, struct iovec *iov,
 	msg->msg_iovlen = 1;
 
 #if USE_LAUNCHTIME
-	{
+	if (useLaunchTime) {
 		struct cmsghdr *cmsg;
 		uint64_t *tsptr;
 
@@ -78,11 +174,15 @@ static void fillmsghdr(struct msghdr *msg, struct iovec *iov,
 
 		cmsg = CMSG_FIRSTHDR(msg);
 		cmsg->cmsg_level = SOL_SOCKET;
-		cmsg->cmsg_type = SCM_TIMEDLAUNCH;
+		cmsg->cmsg_type = SCM_TXTIME;
 		cmsg->cmsg_len = CMSG_LEN(sizeof time);
 
 		tsptr = (uint64_t *)CMSG_DATA(cmsg);
 		*tsptr = time;
+	}
+	else {
+		msg->msg_control = NULL;
+		msg->msg_controllen = 0;
 	}
 #else
 	msg->msg_control = NULL;
@@ -90,6 +190,14 @@ static void fillmsghdr(struct msghdr *msg, struct iovec *iov,
 #endif
 
 	msg->msg_flags = 0;
+}
+
+static void sendmmsgRawsockResetTxState(sendmmsg_rawsock_t *rawsock, const char *reason)
+{
+	AVB_LOGF_WARNING("Resetting sendmmsg TX state (%s): out=%d ready=%d",
+		reason ? reason : "unknown", rawsock->buffersOut, rawsock->buffersReady);
+	rawsock->buffersOut = 0;
+	rawsock->buffersReady = 0;
 }
 
 // Open a rawsock for TX or RX
@@ -149,6 +257,7 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK);
 		return NULL;
 	}
+	sendmmsgRawsockForceQdiscPath(rawsock);
 
 	// Bind to interface
 	struct sockaddr_ll my_addr;
@@ -170,6 +279,9 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 	memset(rawsock->pktbuf, 0, sizeof(rawsock->pktbuf));
 #if USE_LAUNCHTIME
 	memset(rawsock->cmsgbuf, 0, sizeof(rawsock->cmsgbuf));
+	rawsock->launchTimeEnabled = true;
+	rawsock->launchTimeSockConfigured = false;
+	rawsock->launchTimeFallbackLogged = false;
 #endif
 
 	rawsock->buffersOut = 0;
@@ -181,9 +293,13 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 	cb->close = sendmmsgRawsockClose;
 	cb->getTxFrame = sendmmsgRawsockGetTxFrame;
 	cb->txSetMark = sendmmsgRawsockTxSetMark;
+	cb->relTxFrame = sendmmsgRawsockRelTxFrame;
 	cb->txSetHdr = sendmmsgRawsockTxSetHdr;
 	cb->txFrameReady = sendmmsgRawsockTxFrameReady;
 	cb->send = sendmmsgRawsockSend;
+	cb->txBufLevel = sendmmsgRawsockTxBufLevel;
+	cb->getTXOutOfBuffers = sendmmsgRawsockGetTXOutOfBuffers;
+	cb->getTXOutOfBuffersCyclic = sendmmsgRawsockGetTXOutOfBuffersCyclic;
 	cb->getRxFrame = sendmmsgRawsockGetRxFrame;
 	cb->rxMulticast = sendmmsgRawsockRxMulticast;
 	cb->getSocket = sendmmsgRawsockGetSocket;
@@ -222,9 +338,24 @@ U8* sendmmsgRawsockGetTxFrame(void *pvRawsock, bool blocking, unsigned int *len)
 		return NULL;
 	}
 	if (rawsock->buffersOut >= rawsock->frameCount) {
-		AVB_LOG_ERROR("Getting TX frame; too many TX buffers in use");
-		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
-		return NULL;
+		rawsock->txOutOfBuffers++;
+		rawsock->txOutOfBuffersCyclic++;
+		AVB_LOGF_WARNING("Getting TX frame; too many TX buffers in use (out=%d ready=%d count=%d), attempting recovery",
+			rawsock->buffersOut, rawsock->buffersReady, rawsock->frameCount);
+
+		if (rawsock->buffersOut == rawsock->buffersReady && rawsock->buffersReady > 0) {
+			(void)sendmmsgRawsockSend(rawsock);
+		}
+		else {
+			// Mixed in-flight state should not persist; drop queued state to recover.
+			sendmmsgRawsockResetTxState(rawsock, "buffer saturation with inconsistent in-flight state");
+		}
+
+		if (rawsock->buffersOut >= rawsock->frameCount) {
+			AVB_LOG_ERROR("Getting TX frame; recovery failed, dropping this packet");
+			AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+			return NULL;
+		}
 	}
 
 	U8 *pBuffer = rawsock->pktbuf[rawsock->buffersOut];
@@ -245,7 +376,7 @@ bool sendmmsgRawsockTxSetMark(void *pvRawsock, int mark)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
 	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
-	bool retval = FALSE;
+	bool retval = TRUE;
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
 		AVB_LOG_ERROR("Setting TX mark; invalid argument passed");
@@ -255,14 +386,53 @@ bool sendmmsgRawsockTxSetMark(void *pvRawsock, int mark)
 
 	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
 		AVB_LOGF_ERROR("Setting TX mark; setsockopt failed: %s", strerror(errno));
+		retval = FALSE;
 	}
 	else {
 		AVB_LOGF_DEBUG("SO_MARK=%d OK", mark);
-		retval = TRUE;
+		U32 classPriority = 0;
+		if (sendmmsgRawsockClassMarkToPriority(mark, &classPriority)) {
+			if (!sendmmsgRawsockSetPriority(rawsock, classPriority, "fwmark class")) {
+				retval = FALSE;
+			}
+		}
+		else {
+			AVB_LOGF_DEBUG("SO_PRIORITY unchanged for non-SR mark=%d", mark);
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 	return retval;
+}
+
+// Release a TX frame without sending it
+bool sendmmsgRawsockRelTxFrame(void *pvRawsock, U8 *pBuffer)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
+	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
+
+	if (!VALID_TX_RAWSOCK(rawsock) || !pBuffer) {
+		AVB_LOG_ERROR("Releasing TX frame; invalid argument");
+		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+		return FALSE;
+	}
+
+	if (rawsock->buffersOut <= rawsock->buffersReady) {
+		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+		return FALSE;
+	}
+
+	if (pBuffer != rawsock->pktbuf[rawsock->buffersOut - 1]) {
+		AVB_LOGF_WARNING("Releasing TX frame out-of-order ignored (out=%d ready=%d)",
+			rawsock->buffersOut, rawsock->buffersReady);
+		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+		return FALSE;
+	}
+
+	rawsock->buffersOut--;
+
+	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+	return TRUE;
 }
 
 // Pre-set the ethernet header information that will be used on TX frames
@@ -273,11 +443,7 @@ bool sendmmsgRawsockTxSetHdr(void *pvRawsock, hdr_info_t *pHdr)
 
 	bool ret = baseRawsockTxSetHdr(pvRawsock, pHdr);
 	if (ret && pHdr->vlan) {
-		// set the class'es priority on the TX socket
-		// (required by Telechips platform for FQTSS Credit Based Shaper to work)
-		U32 pcp = pHdr->vlan_pcp;
-		if (setsockopt(rawsock->sock, SOL_SOCKET, SO_PRIORITY, (char *)&pcp, sizeof(pcp)) < 0) {
-			AVB_LOGF_ERROR("openavbRawsockTxSetHdr; SO_PRIORITY setsockopt failed (%d: %s)\n", errno, strerror(errno));
+		if (!sendmmsgRawsockSetPriority(rawsock, pHdr->vlan_pcp, "vlan PCP")) {
 			AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 			return FALSE;
 		}
@@ -293,6 +459,9 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
 	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
 	int bufidx;
+#if USE_LAUNCHTIME
+	bool useLaunchTime = false;
+#endif
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
 		AVB_LOG_ERROR("Marking TX frame ready; invalid argument");
@@ -304,10 +473,19 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 	assert(pBuffer == rawsock->pktbuf[bufidx]);
 
 #if USE_LAUNCHTIME
-	if (!timeNsec) {
-		IF_LOG_INTERVAL(1000) AVB_LOG_WARNING("launch time is enabled but not passed to TxFrameReady");
+	if (rawsock->launchTimeEnabled && rawsock->launchTimeSockConfigured && !timeNsec) {
+		IF_LOG_INTERVAL(1000) AVB_LOG_WARNING("launch time is configured but not passed to TxFrameReady");
 	}
-	fillmsghdr(&(rawsock->mmsg[bufidx].msg_hdr), &(rawsock->miov[bufidx]), rawsock->cmsgbuf[bufidx],
+	if (rawsock->launchTimeEnabled && timeNsec) {
+		if (!rawsock->launchTimeSockConfigured) {
+			if (sendmmsgRawsockEnableLaunchTime(rawsock)) {
+				rawsock->launchTimeSockConfigured = true;
+			}
+		}
+		useLaunchTime = (rawsock->launchTimeEnabled && rawsock->launchTimeSockConfigured);
+	}
+	fillmsghdr(&(rawsock->mmsg[bufidx].msg_hdr), &(rawsock->miov[bufidx]), useLaunchTime,
+			   rawsock->cmsgbuf[bufidx],
 			   timeNsec, rawsock->pktbuf[bufidx], len);
 #else
 	if (timeNsec) {
@@ -334,6 +512,9 @@ int sendmmsgRawsockSend(void *pvRawsock)
 	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
 	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
 	int sz, bytes;
+#if USE_LAUNCHTIME
+	bool hadLaunchTimeCmsg = false;
+#endif
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
 			AVB_LOG_ERROR("Marking TX frame ready; invalid argument");
@@ -348,10 +529,65 @@ int sendmmsgRawsockSend(void *pvRawsock)
 	}
 
 	IF_LOG_INTERVAL(1000) AVB_LOGF_DEBUG("Send with %d of %d buffers ready", rawsock->buffersReady, rawsock->frameCount);
+#if USE_LAUNCHTIME
+	{
+		int i;
+		for (i = 0; i < rawsock->buffersReady; i++) {
+			if (rawsock->mmsg[i].msg_hdr.msg_controllen > 0) {
+				hadLaunchTimeCmsg = true;
+				break;
+			}
+		}
+	}
+#endif
 	sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
 	if (sz < 0) {
-		AVB_LOGF_ERROR("Call to sendmmsg failed! Error code was %d", sz);
-		bytes = sz;
+		int savedErrno = errno;
+#if USE_LAUNCHTIME
+		AVB_LOGF_WARNING("sendmmsg errno=%d (%s) launchEnabled=%d sockConfigured=%d hadLaunchCmsg=%d first_controllen=%zu first_control=%p",
+			savedErrno, strerror(savedErrno),
+			rawsock->launchTimeEnabled ? 1 : 0,
+			rawsock->launchTimeSockConfigured ? 1 : 0,
+			hadLaunchTimeCmsg ? 1 : 0,
+			rawsock->buffersReady > 0 ? (size_t)rawsock->mmsg[0].msg_hdr.msg_controllen : 0U,
+			rawsock->buffersReady > 0 ? rawsock->mmsg[0].msg_hdr.msg_control : NULL);
+		if (rawsock->launchTimeEnabled && rawsock->launchTimeSockConfigured &&
+				hadLaunchTimeCmsg && launchTimeErrnoIsUnsupported(savedErrno)) {
+			int i;
+			if (!rawsock->launchTimeFallbackLogged) {
+				AVB_LOGF_WARNING("sendmmsg launch-time unsupported (errno=%d: %s); disabling launch-time on %s and retrying",
+					savedErrno, strerror(savedErrno), rawsock->base.ifInfo.name);
+				rawsock->launchTimeFallbackLogged = true;
+			}
+			rawsock->launchTimeEnabled = false;
+			rawsock->launchTimeSockConfigured = false;
+			for (i = 0; i < rawsock->buffersReady; i++) {
+				fillmsghdr(&(rawsock->mmsg[i].msg_hdr), &(rawsock->miov[i]), false,
+					rawsock->cmsgbuf[i], 0, rawsock->pktbuf[i], rawsock->miov[i].iov_len);
+			}
+			sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
+			if (sz < 0) {
+				savedErrno = errno;
+				AVB_LOGF_ERROR("Call to sendmmsg failed after launch-time fallback! rc=%d errno=%d (%s)",
+					sz, savedErrno, strerror(savedErrno));
+				bytes = sz;
+			}
+			else {
+				int i;
+				for (i = 0, bytes = 0; i < sz; i++) {
+					bytes += rawsock->mmsg[i].msg_len;
+				}
+				if (sz < rawsock->buffersReady) {
+					AVB_LOGF_WARNING("Only sent %d of %d messages after fallback; dropping others", sz, rawsock->buffersReady);
+				}
+			}
+		}
+		else
+#endif
+		{
+			AVB_LOGF_ERROR("Call to sendmmsg failed! rc=%d errno=%d (%s)", sz, savedErrno, strerror(savedErrno));
+			bytes = sz;
+		}
 	} else {
 		int i;
 		for (i = 0, bytes = 0; i < sz; i++) {
@@ -366,6 +602,15 @@ int sendmmsgRawsockSend(void *pvRawsock)
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 	return bytes;
+}
+
+int sendmmsgRawsockTxBufLevel(void *pvRawsock)
+{
+	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
+	if (!rawsock) {
+		return -1;
+	}
+	return rawsock->frameCount - rawsock->buffersOut;
 }
 
 // Get a RX frame
@@ -485,6 +730,27 @@ bool sendmmsgRawsockRxMulticast(void *pvRawsock, bool add_membership, const U8 a
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 	return TRUE;
+}
+
+unsigned long sendmmsgRawsockGetTXOutOfBuffers(void *pvRawsock)
+{
+	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
+	if (!rawsock) {
+		return 0;
+	}
+	return rawsock->txOutOfBuffers;
+}
+
+unsigned long sendmmsgRawsockGetTXOutOfBuffersCyclic(void *pvRawsock)
+{
+	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
+	unsigned long ret;
+	if (!rawsock) {
+		return 0;
+	}
+	ret = rawsock->txOutOfBuffersCyclic;
+	rawsock->txOutOfBuffersCyclic = 0;
+	return ret;
 }
 
 // Get the socket used for this rawsock; can be used for poll/select

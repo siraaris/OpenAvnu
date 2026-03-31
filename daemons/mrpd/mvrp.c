@@ -58,7 +58,7 @@ SOCKET mvrp_socket;
 struct mvrp_database *MVRP_db;
 
 /* MVRP */
-#if LOG_MVRP && LOG_MRP
+#if LOG_MVRP
 void mvrp_print_debug_info(int evt, const struct mvrp_attribute *attrib)
 {
 	char * state_mc_states = NULL;

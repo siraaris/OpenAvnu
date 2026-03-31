@@ -1,0 +1,372 @@
+/*************************************************************************************************************
+Copyright (c) 2026
+All rights reserved.
+*************************************************************************************************************/
+
+/*
+ * MODULE SUMMARY : Runtime cache for selected AVDECC clock source, latest CRF
+ * timestamp, and shared media-clock phase.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+#include "openavb_clock_source_runtime_pub.h"
+#include "openavb_aem_types_pub.h"
+#include "openavb_time_osal_pub.h"
+
+typedef struct {
+	bool valid;
+	U64 timeNs;
+	U64 wallCaptureNs;
+	bool wallCaptureValid;
+	bool uncertain;
+	U32 generation;
+} openavb_clock_source_runtime_time_t;
+
+typedef struct {
+	openavb_clock_source_runtime_time_t *pEntries;
+	U16 entryCount;
+	openavb_clock_source_runtime_time_t fallback;
+} openavb_clock_source_runtime_time_bank_t;
+
+typedef struct {
+	openavb_clock_source_runtime_t selection;
+	openavb_clock_source_runtime_time_bank_t crfInput;
+	openavb_clock_source_runtime_time_bank_t crfOutput;
+	openavb_clock_source_runtime_time_bank_t mediaInput;
+	openavb_clock_source_runtime_time_bank_t mediaOutput;
+} openavb_clock_source_runtime_state_t;
+
+static pthread_mutex_t gClockSourceRuntimeMutex = PTHREAD_MUTEX_INITIALIZER;
+static openavb_clock_source_runtime_state_t gClockSourceRuntime = {0};
+
+static openavb_clock_source_runtime_time_bank_t *clockSourceRuntimeTimeBankForLocation(
+	openavb_clock_source_runtime_state_t *pState,
+	U16 clock_source_location_type,
+	bool mediaClock)
+{
+	if (!pState) {
+		return NULL;
+	}
+	if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		return mediaClock ? &pState->mediaOutput : &pState->crfOutput;
+	}
+	return mediaClock ? &pState->mediaInput : &pState->crfInput;
+}
+
+static void clockSourceRuntimeClearTimeValue(openavb_clock_source_runtime_time_t *pTime)
+{
+	if (!pTime) {
+		return;
+	}
+	pTime->valid = FALSE;
+	pTime->timeNs = 0;
+	pTime->wallCaptureNs = 0;
+	pTime->wallCaptureValid = FALSE;
+	pTime->uncertain = FALSE;
+}
+
+static openavb_clock_source_runtime_time_t *clockSourceRuntimeTimeGetSlot(
+	openavb_clock_source_runtime_time_bank_t *pBank,
+	U16 clock_source_location_index,
+	bool create)
+{
+	if (!pBank) {
+		return NULL;
+	}
+
+	if (clock_source_location_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return &pBank->fallback;
+	}
+
+	if (clock_source_location_index >= pBank->entryCount) {
+		if (!create) {
+			return NULL;
+		}
+
+		U16 oldCount = pBank->entryCount;
+		U32 newCount = (U32)clock_source_location_index + 1U;
+		openavb_clock_source_runtime_time_t *pNewEntries = (openavb_clock_source_runtime_time_t *)realloc(
+			pBank->pEntries,
+			newCount * sizeof(*pBank->pEntries));
+		if (!pNewEntries) {
+			return NULL;
+		}
+		pBank->pEntries = pNewEntries;
+		pBank->entryCount = (U16)newCount;
+		memset(&pBank->pEntries[oldCount], 0, (newCount - oldCount) * sizeof(*pBank->pEntries));
+	}
+
+	return &pBank->pEntries[clock_source_location_index];
+}
+
+static void clockSourceRuntimeTimeBankClearAll(openavb_clock_source_runtime_time_bank_t *pBank)
+{
+	if (!pBank) {
+		return;
+	}
+
+	clockSourceRuntimeClearTimeValue(&pBank->fallback);
+	for (U16 idx = 0; idx < pBank->entryCount; idx++) {
+		clockSourceRuntimeClearTimeValue(&pBank->pEntries[idx]);
+	}
+}
+
+void openavbClockSourceRuntimeSetSelection(
+	U16 clock_domain_index,
+	U16 clock_source_index,
+	U16 clock_source_flags,
+	U16 clock_source_type,
+	U16 clock_source_location_type,
+	U16 clock_source_location_index)
+{
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	bool changed = !gClockSourceRuntime.selection.valid ||
+		(gClockSourceRuntime.selection.clock_domain_index != clock_domain_index) ||
+		(gClockSourceRuntime.selection.clock_source_index != clock_source_index) ||
+		(gClockSourceRuntime.selection.clock_source_flags != clock_source_flags) ||
+		(gClockSourceRuntime.selection.clock_source_type != clock_source_type) ||
+		(gClockSourceRuntime.selection.clock_source_location_type != clock_source_location_type) ||
+		(gClockSourceRuntime.selection.clock_source_location_index != clock_source_location_index);
+
+	if (changed) {
+		gClockSourceRuntime.selection.valid = TRUE;
+		gClockSourceRuntime.selection.clock_domain_index = clock_domain_index;
+		gClockSourceRuntime.selection.clock_source_index = clock_source_index;
+		gClockSourceRuntime.selection.clock_source_flags = clock_source_flags;
+		gClockSourceRuntime.selection.clock_source_type = clock_source_type;
+		gClockSourceRuntime.selection.clock_source_location_type = clock_source_location_type;
+		gClockSourceRuntime.selection.clock_source_location_index = clock_source_location_index;
+		gClockSourceRuntime.selection.generation++;
+	}
+
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}
+
+bool openavbClockSourceRuntimeGetSelection(openavb_clock_source_runtime_t *pSelection)
+{
+	bool ret = FALSE;
+
+	if (!pSelection) {
+		return FALSE;
+	}
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	if (gClockSourceRuntime.selection.valid) {
+		*pSelection = gClockSourceRuntime.selection;
+		ret = TRUE;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+
+	return ret;
+}
+
+void openavbClockSourceRuntimeSetCrfTimeForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U64 crfTimeNs,
+	bool uncertain)
+{
+	U64 nowNs = 0;
+	bool haveNow = CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNs);
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, FALSE);
+	openavb_clock_source_runtime_time_t *pCrf =
+		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, TRUE);
+	if (pCrf) {
+		pCrf->timeNs = crfTimeNs;
+		pCrf->wallCaptureNs = nowNs;
+		pCrf->wallCaptureValid = haveNow;
+		pCrf->uncertain = uncertain;
+		pCrf->valid = TRUE;
+		pCrf->generation++;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}
+
+void openavbClockSourceRuntimeSetCrfTime(U64 crfTimeNs, bool uncertain)
+{
+	openavbClockSourceRuntimeSetCrfTimeForLocation(
+		OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+		OPENAVB_AEM_DESCRIPTOR_INVALID,
+		crfTimeNs,
+		uncertain);
+}
+
+bool openavbClockSourceRuntimeGetCrfTimeForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U64 *pCrfTimeNs,
+	bool *pUncertain,
+	U32 *pGeneration)
+{
+	bool ret = FALSE;
+	U64 nowNs = 0;
+	bool haveNow = CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNs);
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, FALSE);
+	openavb_clock_source_runtime_time_t *pCrf =
+		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, FALSE);
+	if (pCrf && pCrf->valid) {
+		U64 projectedCrfNs = pCrf->timeNs;
+		if (haveNow && pCrf->wallCaptureValid && nowNs >= pCrf->wallCaptureNs) {
+			projectedCrfNs += (nowNs - pCrf->wallCaptureNs);
+		}
+		if (pCrfTimeNs) {
+			*pCrfTimeNs = projectedCrfNs;
+		}
+		if (pUncertain) {
+			*pUncertain = pCrf->uncertain;
+		}
+		if (pGeneration) {
+			*pGeneration = pCrf->generation;
+		}
+		ret = TRUE;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+
+	return ret;
+}
+
+bool openavbClockSourceRuntimeGetCrfTime(U64 *pCrfTimeNs, bool *pUncertain, U32 *pGeneration)
+{
+	return openavbClockSourceRuntimeGetCrfTimeForLocation(
+		OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+		OPENAVB_AEM_DESCRIPTOR_INVALID,
+		pCrfTimeNs,
+		pUncertain,
+		pGeneration);
+}
+
+void openavbClockSourceRuntimeClearCrfTimeForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index)
+{
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, FALSE);
+	if (pBank) {
+		if (clock_source_location_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+			clockSourceRuntimeTimeBankClearAll(pBank);
+		}
+		else {
+			openavb_clock_source_runtime_time_t *pCrf =
+				clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, FALSE);
+			if (pCrf) {
+				clockSourceRuntimeClearTimeValue(pCrf);
+			}
+		}
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}
+
+void openavbClockSourceRuntimeClearCrfTime(void)
+{
+	openavbClockSourceRuntimeClearCrfTimeForLocation(
+		OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT,
+		OPENAVB_AEM_DESCRIPTOR_INVALID);
+	openavbClockSourceRuntimeClearCrfTimeForLocation(
+		OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT,
+		OPENAVB_AEM_DESCRIPTOR_INVALID);
+}
+
+void openavbClockSourceRuntimeSetMediaClockForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U64 mediaClockNs,
+	bool uncertain)
+{
+	U64 nowNs = 0;
+	bool haveNow = CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNs);
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, TRUE);
+	openavb_clock_source_runtime_time_t *pClock =
+		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, TRUE);
+	if (pClock) {
+		pClock->timeNs = mediaClockNs;
+		pClock->wallCaptureNs = nowNs;
+		pClock->wallCaptureValid = haveNow;
+		pClock->uncertain = uncertain;
+		pClock->valid = TRUE;
+		pClock->generation++;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}
+
+bool openavbClockSourceRuntimeGetMediaClockForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index,
+	U64 *pMediaClockNs,
+	bool *pUncertain,
+	U32 *pGeneration)
+{
+	bool ret = FALSE;
+	U64 nowNs = 0;
+	bool haveNow = CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNs);
+
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, TRUE);
+	openavb_clock_source_runtime_time_t *pClock =
+		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, FALSE);
+	if (pClock && pClock->valid) {
+		U64 projectedClockNs = pClock->timeNs;
+		if (haveNow && pClock->wallCaptureValid && nowNs >= pClock->wallCaptureNs) {
+			projectedClockNs += (nowNs - pClock->wallCaptureNs);
+		}
+		if (pMediaClockNs) {
+			*pMediaClockNs = projectedClockNs;
+		}
+		if (pUncertain) {
+			*pUncertain = pClock->uncertain;
+		}
+		if (pGeneration) {
+			*pGeneration = pClock->generation;
+		}
+		ret = TRUE;
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+
+	return ret;
+}
+
+void openavbClockSourceRuntimeClearMediaClockForLocation(
+	U16 clock_source_location_type,
+	U16 clock_source_location_index)
+{
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	openavb_clock_source_runtime_time_bank_t *pBank =
+		clockSourceRuntimeTimeBankForLocation(&gClockSourceRuntime, clock_source_location_type, TRUE);
+	if (pBank) {
+		if (clock_source_location_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+			clockSourceRuntimeTimeBankClearAll(pBank);
+		}
+		else {
+			openavb_clock_source_runtime_time_t *pClock =
+				clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, FALSE);
+			if (pClock) {
+				clockSourceRuntimeClearTimeValue(pClock);
+			}
+		}
+	}
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}
+
+void openavbClockSourceRuntimeReset(void)
+{
+	pthread_mutex_lock(&gClockSourceRuntimeMutex);
+	free(gClockSourceRuntime.crfInput.pEntries);
+	free(gClockSourceRuntime.crfOutput.pEntries);
+	free(gClockSourceRuntime.mediaInput.pEntries);
+	free(gClockSourceRuntime.mediaOutput.pEntries);
+	memset(&gClockSourceRuntime, 0, sizeof(gClockSourceRuntime));
+	pthread_mutex_unlock(&gClockSourceRuntimeMutex);
+}

@@ -305,11 +305,39 @@ openavbRC strmAttachCb(void* pv,
 
 	openavbRC rc = OPENAVB_FAILURE;
 	clientStream_t *ps = (clientStream_t*)pv;
+	U64 nowNs = 0;
+	U64 deltaNs = 0;
+	double deltaMs = 0.0;
+	bool haveNow = CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &nowNs);
 
-	AVB_LOGF_INFO("SRP talker callback uid=%d: lsnrDecl=%x", ps->streamID.uniqueID, lsnrDecl);
+	if (!ps->lsnrDeclSeen) {
+		AVB_LOGF_INFO("SRP talker callback uid=%d: lsnrDecl init=%x fwmark=%d",
+			ps->streamID.uniqueID, lsnrDecl, ps->fwmark);
+	}
+	else if (ps->lastLsnrDecl != lsnrDecl) {
+		if (haveNow && nowNs >= ps->lastLsnrDeclTsNs) {
+			deltaNs = nowNs - ps->lastLsnrDeclTsNs;
+			deltaMs = (double)deltaNs / 1000000.0;
+		}
+		AVB_LOGF_INFO("SRP talker callback uid=%d: lsnrDecl %x->%x dt=%.3fms fwmark=%d",
+			ps->streamID.uniqueID, ps->lastLsnrDecl, lsnrDecl, deltaMs, ps->fwmark);
+	}
+	else {
+		AVB_LOGF_DEBUG("SRP talker callback uid=%d: lsnrDecl unchanged=%x fwmark=%d",
+			ps->streamID.uniqueID, lsnrDecl, ps->fwmark);
+	}
 
+	ps->lsnrDeclSeen = TRUE;
+	ps->lastLsnrDecl = lsnrDecl;
+	if (haveNow) {
+		ps->lastLsnrDeclTsNs = nowNs;
+	}
+
+	// Treat Asking_Failed as transient listener presence to avoid tearing down
+	// active talker queues during short SRP churn windows.
 	if (lsnrDecl == openavbSrp_LDSt_Ready
-		|| lsnrDecl == openavbSrp_LDSt_Ready_Failed)
+		|| lsnrDecl == openavbSrp_LDSt_Ready_Failed
+		|| lsnrDecl == openavbSrp_LDSt_Asking_Failed)
 	{
 		// Somebody is listening - get ready to stream
 

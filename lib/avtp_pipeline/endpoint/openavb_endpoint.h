@@ -153,6 +153,11 @@ typedef struct clientStream_t {
 
 	// Information provided by QMgr
 	int				fwmark;				// mark to identify packets of this stream
+
+	// Diagnostic tracking for SRP listener declaration callbacks
+	bool			lsnrDeclSeen;
+	openavbSrpLsnrDeclSubtype_t lastLsnrDecl;
+	U64				lastLsnrDeclTsNs;
 } clientStream_t;
 
 int startPTP(void);

@@ -45,6 +45,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define STREAMDA_LENGTH 18
 #define SHAPER_PORT 15365 /* Unassigned at https://www.iana.org/assignments/port-numbers */
 #define MAX_CLIENT_CONNECTIONS 10
+#define COMMAND_BUFFER_SIZE 2048
 #define USER_COMMAND_PROMPT "\nEnter the command:  "
 
 typedef struct cmd_ip
@@ -73,6 +74,7 @@ typedef struct stream_da
 	int bandwidth_bps;
 	int max_frame_size;
 	shaper_class_t class_type;
+	int owner_sockfd;
 	struct stream_da *next;
 } stream_da;
 
@@ -82,9 +84,9 @@ int daemonize=0,c=0;
 char interface[IFNAMSIZ] = {0};
 int bandwidth_bps = 0;
 int classa_parent = 2, classb_parent=3;
-// mqprio creates classids 1:1..1:4 for num_tc=4. Default Class A/B parents
-// map to traffic classes 0 and 1 (priorities 3 and 2 in the default map).
-char classa_parent_str[8] = "1:1";
+// mqprio creates classids 1:1..1:4 for num_tc=4.
+// Keep queue 0 for gPTP/control; steer Class B to queue 1 and Class A to queue 2.
+char classa_parent_str[8] = "1:3";
 char classb_parent_str[8] = "1:2";
 int classa_bw = 0, classb_bw = 0;
 int classa_max_frame_size = 0, classb_max_frame_size = 0;
@@ -98,9 +100,29 @@ int log_tc_commands = 0;
 char modprobe_path[128] = "modprobe";
 int root_qdisc_installed = 0;
 int exit_received = 0;
+int egress_qmap_enable = 0;
+int qmap_classa = -1;
+int qmap_classb = -1;
+int qmap_default = 3;
+int qmap_gptp = 0;
+// Priority map for mqprio/taprio:
+//   prio 7/6 -> tc0 (gPTP/control, highest)
+//   prio 3   -> tc2 (Class A)
+//   prio 2   -> tc1 (Class B)
+//   all others -> tc3 (default/best effort)
+// gPTP ethertype is also pinned by flower filter when egress qmap is enabled.
+#define SHAPER_TC_MAP "3 3 1 2 3 3 0 0 3 3 3 3 3 3 3 3"
 
 static int process_command(int sockfd, char command[]);
-static int process_commands_from_buffer(int sockfd, char *buffer, int len);
+static int process_commands_from_stream(int sockfd, char *accum, int *accum_len, const char *chunk, int chunk_len);
+static void cleanup_client_streams(int sockfd);
+static int compute_cbs_params(int port_rate_bps, int idleslope_bps, int max_frame_size,
+	int *sendslope_bps, int *hicredit, int *locredit);
+static int run_cmd(const char *cmd, int log_failure);
+static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
+	int idleslope_bps, int sendslope_bps, int hicredit, int locredit);
+static int parse_parent_queue_index(const char *parent);
+static void apply_egress_qmap_filters(const char *ifname);
 
 static void signal_handler(int signal)
 {
@@ -191,19 +213,39 @@ int is_empty()
 	return head == NULL;
 }
 
-static int process_commands_from_buffer(int sockfd, char *buffer, int len)
+static int process_commands_from_stream(int sockfd, char *accum, int *accum_len, const char *chunk, int chunk_len)
 {
-	int i = 0;
+	int i;
 	int start = 0;
 	int ret = 1;
 
-	buffer[len] = '\0';
-	while (i <= len)
+	if (!accum || !accum_len || !chunk || chunk_len <= 0)
 	{
-		if (buffer[i] == '\n' || buffer[i] == '\r' || buffer[i] == '\0')
+		return ret;
+	}
+
+	// Append new data to the per-source accumulation buffer.
+	if (*accum_len + chunk_len >= COMMAND_BUFFER_SIZE)
+	{
+		SHAPER_LOG_WARNING("Incoming command data exceeded buffer; dropping partial command");
+		*accum_len = 0;
+	}
+	if (chunk_len >= COMMAND_BUFFER_SIZE)
+	{
+		chunk += (chunk_len - (COMMAND_BUFFER_SIZE - 1));
+		chunk_len = COMMAND_BUFFER_SIZE - 1;
+	}
+	memcpy(accum + *accum_len, chunk, chunk_len);
+	*accum_len += chunk_len;
+	accum[*accum_len] = '\0';
+
+	// Process complete newline-delimited commands only.
+	for (i = 0; i < *accum_len; ++i)
+	{
+		if (accum[i] == '\n' || accum[i] == '\r')
 		{
-			buffer[i] = '\0';
-			char *cmd = &buffer[start];
+			accum[i] = '\0';
+			char *cmd = &accum[start];
 
 			while (*cmd && isspace(*cmd))
 			{
@@ -221,13 +263,27 @@ static int process_commands_from_buffer(int sockfd, char *buffer, int len)
 				ret = process_command(sockfd, cmd);
 				if (!ret)
 				{
+					*accum_len = 0;
+					accum[0] = '\0';
 					return 0;
 				}
 			}
 			start = i + 1;
 		}
-		i++;
 	}
+
+	// Keep any trailing partial line for the next recv() call.
+	if (start > 0)
+	{
+		int remaining = *accum_len - start;
+		if (remaining > 0)
+		{
+			memmove(accum, accum + start, remaining);
+		}
+		*accum_len = remaining;
+		accum[*accum_len] = '\0';
+	}
+
 	return ret;
 }
 
@@ -244,6 +300,7 @@ void insert_stream_da(int sockfd, char dest_addr[], int bandwidth_bps, int max_f
 	node->bandwidth_bps = bandwidth_bps;
 	node->max_frame_size = max_frame_size;
 	node->class_type = class_type;
+	node->owner_sockfd = sockfd;
 	node->next = NULL;
 	if (is_empty())
 	{
@@ -350,6 +407,83 @@ void delete_streamda_list()
 	head = NULL;
 }
 
+static void cleanup_client_streams(int sockfd)
+{
+	stream_da *current = head;
+	stream_da *prev = NULL;
+	int removed = 0;
+	int sendslope_bps = 0, hicredit = 0, locredit = 0;
+	char tc_command[1000] = {0};
+
+	if (sockfd < 0) {
+		return;
+	}
+
+	while (current != NULL)
+	{
+		if (current->owner_sockfd == sockfd)
+		{
+			stream_da *to_free = current;
+			if (prev == NULL) {
+				head = current->next;
+			}
+			else {
+				prev->next = current->next;
+			}
+			current = current->next;
+			free(to_free);
+			removed++;
+			continue;
+		}
+		prev = current;
+		current = current->next;
+	}
+
+	if (removed == 0) {
+		return;
+	}
+
+	SHAPER_LOGF_INFO("Removed %d stale reservation(s) for closed socket %d", removed, sockfd);
+	recompute_class_totals(SHAPER_CLASS_A, &classa_bw, &classa_max_frame_size);
+	recompute_class_totals(SHAPER_CLASS_B, &classb_bw, &classb_max_frame_size);
+
+	if (interface[0] == '\0') {
+		return;
+	}
+
+	if (classa_bw == 0)
+	{
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s parent %s handle %d: pfifo >/dev/null 2>&1",
+			tc_path, interface, classa_parent_str, classa_parent);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 1);
+		sr_classa = 0;
+	}
+	else if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
+		&sendslope_bps, &hicredit, &locredit) == 0)
+	{
+		tc_cbs_command(-1, interface, classa_parent_str, classa_parent,
+			classa_bw, sendslope_bps, hicredit, locredit);
+		sr_classa = 1;
+	}
+
+	if (classb_bw == 0)
+	{
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s parent %s handle %d: pfifo >/dev/null 2>&1",
+			tc_path, interface, classb_parent_str, classb_parent);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 1);
+		sr_classb = 0;
+	}
+	else if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
+		&sendslope_bps, &hicredit, &locredit) == 0)
+	{
+		tc_cbs_command(-1, interface, classb_parent_str, classb_parent,
+			classb_bw, sendslope_bps, hicredit, locredit);
+		sr_classb = 1;
+	}
+}
+
 void usage (int sockfd)
 {
 	const char *usage = "Usage:\n"
@@ -385,126 +519,99 @@ void usage (int sockfd)
 
 cmd_ip parse_cmd(char command[])
 {
-	cmd_ip inputs={0};
-	int i=0;
-	char temp[100];
-	while(command[i++] != '\0')
+	cmd_ip inputs = {0};
+	char *saveptr = NULL;
+	char *token = strtok_r(command, " \t", &saveptr);
+
+	while (token != NULL)
 	{
-
-		if (command[i] == 'r')
+		if (token[0] == '-')
 		{
-			inputs.reserve_bw=1;
-			i++;
-		}
-
-		if (command[i] == 'u')
-		{
-			inputs.unreserve_bw=1;
-			i++;
-		}
-
-		if (command[i] == 'i')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i] != ' ' && k < IFNAMSIZ-1)
+			char *opt = token + 1;
+			while (*opt != '\0')
 			{
-				inputs.interface[k] = command[i];
-				k++;i++;
-			}
-			inputs.interface[k] = '\0';
-		}
+				char flag = *opt++;
+				char *value = NULL;
 
-		if (command[i] == 'c')
-		{
-			i = i+2;
-			if (command[i] == 'A' || command[i] == 'a')
-			{
-				inputs.class_a = 1;
-			}
-			else if (command[i] == 'B' || command[i] == 'b')
-			{
-				inputs.class_b = 1;
-			}
-			i++;
-		}
+				switch (flag)
+				{
+					case 'r':
+						inputs.reserve_bw = 1;
+						continue;
+					case 'u':
+						inputs.unreserve_bw = 1;
+						continue;
+					case 'd':
+						inputs.delete_qdisc = 1;
+						continue;
+					case 'q':
+						inputs.quit = 1;
+						continue;
+					case 'i':
+					case 'c':
+					case 's':
+					case 'b':
+					case 'f':
+					case 'l':
+					case 'a':
+						break;
+					default:
+						// Unknown option character, ignore to preserve compatibility.
+						continue;
+				}
 
-		if (command[i] == 's')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i] != ' ' && k < (int) sizeof(temp)-1)
-			{
-				temp[k] = command[i];
-				k++;i++;
+				// Options with values accept either "-x value" or "-xvalue".
+				if (*opt != '\0') {
+					value = opt;
+					opt += strlen(opt);
+				}
+				else {
+					value = strtok_r(NULL, " \t", &saveptr);
+				}
+
+				if (value == NULL) {
+					break;
+				}
+
+				switch (flag)
+				{
+					case 'i':
+						strncpy(inputs.interface, value, IFNAMSIZ - 1);
+						inputs.interface[IFNAMSIZ - 1] = '\0';
+						break;
+					case 'c':
+						if (value[0] == 'A' || value[0] == 'a') {
+							inputs.class_a = 1;
+						}
+						else if (value[0] == 'B' || value[0] == 'b') {
+							inputs.class_b = 1;
+						}
+						break;
+					case 's':
+						inputs.measurement_interval = atoi(value);
+						break;
+					case 'b':
+						inputs.max_frame_size = atoi(value);
+						break;
+					case 'f':
+						inputs.max_frame_interval = atoi(value);
+						break;
+					case 'l':
+						inputs.link_speed_mbps = atoi(value);
+						break;
+					case 'a':
+						strncpy(inputs.stream_da, value, STREAMDA_LENGTH - 1);
+						inputs.stream_da[STREAMDA_LENGTH - 1] = '\0';
+						break;
+				}
+
+				// Value consumed; no more flags can be parsed from this token.
+				break;
 			}
-			temp[k] = '\0';
-			inputs.measurement_interval = atoi(temp);
 		}
-
-		if (command[i] == 'b')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i]  != ' ' && k < (int) sizeof(temp)-1)
-			{
-				temp[k] = command[i];
-				k++;i++;
-			}
-			temp[k] = '\0';
-			inputs.max_frame_size = atoi(temp);
-		}
-
-		if (command[i] == 'f')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i]  != ' ' && k < (int) sizeof(temp)-1)
-			{
-				temp[k] = command[i];
-				k++;i++;
-			}
-			temp[k] = '\0';
-			inputs.max_frame_interval = atoi(temp);
-		}
-
-		if (command[i] == 'l')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i]  != ' ' && k < (int) sizeof(temp)-1)
-			{
-				temp[k] = command[i];
-				k++;i++;
-			}
-			temp[k] = '\0';
-			inputs.link_speed_mbps = atoi(temp);
-		}
-
-		if (command[i] == 'a')
-		{
-			int k=0;
-			i = i+2;
-			while (command[i]  != ' ' && k < STREAMDA_LENGTH-1)
-			{
-				inputs.stream_da[k] = command[i];
-				k++;i++;
-			}
-			inputs.stream_da[k] = '\0';
-		}
-
-		if (command[i] == 'd')
-		{
-			inputs.delete_qdisc=1;
-			i++;
-		}
-
-		if (command[i] == 'q')
-		{
-			inputs.quit = 1;
-			i++;
-		}
+		token = strtok_r(NULL, " \t", &saveptr);
 	}
+
 	return inputs;
 }
 
@@ -552,7 +659,7 @@ static void cleanup_qdisc(const char *ifname)
 	// Delete root qdisc if we manage it
 	if (!skip_root_qdisc || taprio_cmd[0] != '\0')
 	{
-		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1: >/dev/null 2>&1", tc_path, ifname);
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root >/dev/null 2>&1", tc_path, ifname);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 		system(tc_command);
@@ -604,6 +711,98 @@ static int has_parent_qdisc(const char *ifname, const char *parent)
 	snprintf(cmd, sizeof(cmd), "%s qdisc show dev %s | grep -q \"parent %s\"",
 		tc_path, ifname, parent);
 	return run_cmd(cmd, 0) == 0;
+}
+
+static int parse_parent_queue_index(const char *parent)
+{
+	const char *colon = NULL;
+	unsigned int class_hex = 0;
+
+	if (!parent || parent[0] == '\0')
+	{
+		return -1;
+	}
+
+	colon = strchr(parent, ':');
+	if (!colon || *(colon + 1) == '\0')
+	{
+		return -1;
+	}
+
+	// tc classids are rendered in hex (e.g., 100:a), so parse as hex.
+	if (sscanf(colon + 1, "%x", &class_hex) != 1 || class_hex == 0 || class_hex > 16)
+	{
+		return -1;
+	}
+
+	return (int)class_hex - 1;
+}
+
+static void apply_egress_qmap_filters(const char *ifname)
+{
+	char tc_command[1000] = {0};
+
+	if (!ifname || ifname[0] == '\0')
+	{
+		return;
+	}
+
+	// Ensure clsact exists; ignore failure on add because it may already exist.
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s clsact >/dev/null 2>&1", tc_path, ifname);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+	run_cmd(tc_command, 0);
+
+	// Always clear prior egress filters so stale queue mapping does not persist across runs.
+	snprintf(tc_command, sizeof(tc_command), "%s filter del dev %s egress >/dev/null 2>&1", tc_path, ifname);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+	run_cmd(tc_command, 0);
+
+	if (!egress_qmap_enable)
+	{
+		// No explicit queue mapping requested: remove clsact to avoid lingering filter behavior.
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s clsact >/dev/null 2>&1", tc_path, ifname);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+		return;
+	}
+
+	// Keep gPTP (ethertype 0x88f7) on a dedicated queue when configured.
+	if (qmap_gptp >= 0)
+	{
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x88f7 prio 5 flower action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_gptp);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+	}
+
+	// OpenAvnu Qmgr encodes SR class in fwmark upper byte:
+	// Class A => 0x0100, Class B => 0x0200 (mask 0xff00).
+	if (qmap_classa >= 0)
+	{
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol all prio 10 u32 match mark 0x00000100 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_classa);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+	}
+	if (qmap_classb >= 0)
+	{
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol all prio 20 u32 match mark 0x00000200 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_classb);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+	}
+
+	if (qmap_default >= 0)
+	{
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress prio 100 matchall action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_default);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+	}
 }
 
 static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
@@ -669,6 +868,12 @@ int process_command(int sockfd, char command[])
 	int sendslope_bps = 0, hicredit = 0, locredit = 0;
 	int class_bw = 0, class_max_frame = 0;
 
+	SHAPER_LOGF_INFO("Parsed cmd: reserve=%d unreserve=%d if=%s classA=%d classB=%d s=%d b=%d f=%d l=%d a=%s",
+		input.reserve_bw, input.unreserve_bw, input.interface,
+		input.class_a, input.class_b, input.measurement_interval,
+		input.max_frame_size, input.max_frame_interval,
+		input.link_speed_mbps, input.stream_da);
+
 	if (input.reserve_bw && input.unreserve_bw)
 	{
 		log_client_error_message(sockfd, "Cannot reserve and unreserve bandwidth at the same time");
@@ -721,7 +926,7 @@ int process_command(int sockfd, char command[])
 				if (!skip_root_qdisc)
 				{
 					//delete qdisc
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1: >/dev/null 2>&1", tc_path, interface);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root >/dev/null 2>&1", tc_path, interface);
 					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					if (run_cmd(tc_command, 1) != 0)
@@ -792,7 +997,7 @@ int process_command(int sockfd, char command[])
 			{
 				hw = 1;
 			}
-			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, hw);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, SHAPER_TC_MAP, hw);
 			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 			if (run_cmd(tc_command, 0) != 0)
@@ -804,7 +1009,7 @@ int process_command(int sockfd, char command[])
 				}
 				else
 				{
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, hw);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, SHAPER_TC_MAP, hw);
 					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					if (run_cmd(tc_command, 1) != 0)
@@ -822,11 +1027,24 @@ int process_command(int sockfd, char command[])
 			}
 		}
 		strcpy(interface,input.interface);
+		apply_egress_qmap_filters(input.interface);
 	}
 
-	if (input.unreserve_bw || input.reserve_bw)
+	if (input.reserve_bw)
 	{
 		bandwidth_bps = (int)ceil((1/(input.measurement_interval*pow(10,-6))) * (input.max_frame_size*8) * input.max_frame_interval);
+		SHAPER_LOGF_INFO("Computed stream bandwidth=%d bps (interval=%dus frame_size=%d frame_interval=%d)",
+			bandwidth_bps, input.measurement_interval, input.max_frame_size, input.max_frame_interval);
+	}
+
+	// Per-command link speed (if provided) must override any startup/default value.
+	if (input.reserve_bw && input.link_speed_mbps > 0)
+	{
+		if (link_speed_mbps != input.link_speed_mbps) {
+			SHAPER_LOGF_INFO("Using command link speed: %d Mbps (previous %d Mbps)",
+				input.link_speed_mbps, link_speed_mbps);
+		}
+		link_speed_mbps = input.link_speed_mbps;
 	}
 
 	if (input.reserve_bw == 1)
@@ -870,6 +1088,8 @@ int process_command(int sockfd, char command[])
 			if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
 				&sendslope_bps, &hicredit, &locredit) < 0)
 			{
+				SHAPER_LOGF_ERROR("CBS compute failed A: port_rate=%d idleslope=%d max_frame=%d",
+					link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
 				log_client_error_message(sockfd, "Invalid CBS parameters for Class A. Check link speed and bandwidth");
 				return -1;
 			}
@@ -906,6 +1126,8 @@ int process_command(int sockfd, char command[])
 			if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
 				&sendslope_bps, &hicredit, &locredit) < 0)
 			{
+				SHAPER_LOGF_ERROR("CBS compute failed B: port_rate=%d idleslope=%d max_frame=%d",
+					link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
 				log_client_error_message(sockfd, "Invalid CBS parameters for Class B. Check link speed and bandwidth");
 				return -1;
 			}
@@ -942,6 +1164,8 @@ int process_command(int sockfd, char command[])
 					if (compute_cbs_params(link_speed_mbps * 1000000, classa_bw, classa_max_frame_size,
 						&sendslope_bps, &hicredit, &locredit) < 0)
 					{
+						SHAPER_LOGF_ERROR("CBS recompute failed A: port_rate=%d idleslope=%d max_frame=%d",
+							link_speed_mbps * 1000000, classa_bw, classa_max_frame_size);
 						log_client_error_message(sockfd, "Invalid CBS parameters for Class A after unreserve");
 						return -1;
 					}
@@ -969,6 +1193,8 @@ int process_command(int sockfd, char command[])
 					if (compute_cbs_params(link_speed_mbps * 1000000, classb_bw, classb_max_frame_size,
 						&sendslope_bps, &hicredit, &locredit) < 0)
 					{
+						SHAPER_LOGF_ERROR("CBS recompute failed B: port_rate=%d idleslope=%d max_frame=%d",
+							link_speed_mbps * 1000000, classb_bw, classb_max_frame_size);
 						log_client_error_message(sockfd, "Invalid CBS parameters for Class B after unreserve");
 						return -1;
 					}
@@ -1024,7 +1250,11 @@ int init_socket()
 
 int main (int argc, char *argv[])
 {
-	char command[100];
+	char command[256];
+	char stdinCommandBuf[COMMAND_BUFFER_SIZE] = {0};
+	int stdinCommandLen = 0;
+	char clientCommandBuf[MAX_CLIENT_CONNECTIONS][COMMAND_BUFFER_SIZE];
+	int clientCommandLen[MAX_CLIENT_CONNECTIONS];
 	int socketfd = 0,newfd = 0;
 	int clientfd[MAX_CLIENT_CONNECTIONS];
 	int i, nextclientindex;
@@ -1083,16 +1313,24 @@ int main (int argc, char *argv[])
 		{
 			skip_root_qdisc = 1;
 		}
-		const char *env_link_speed = getenv("SHAPER_LINK_SPEED_MBPS");
-		if (env_link_speed)
-		{
-			link_speed_mbps = atoi(env_link_speed);
-		}
+			const char *env_link_speed = getenv("SHAPER_LINK_SPEED_MBPS");
+			if (env_link_speed)
+			{
+				link_speed_mbps = atoi(env_link_speed);
+				if (link_speed_mbps > 0) {
+					SHAPER_LOGF_INFO("Initial link speed from SHAPER_LINK_SPEED_MBPS: %d Mbps", link_speed_mbps);
+				}
+			}
 		const char *env_classa_parent = getenv("SHAPER_CLASSA_PARENT");
 		const char *env_classb_parent = getenv("SHAPER_CLASSB_PARENT");
 		const char *env_classa_handle = getenv("SHAPER_CLASSA_HANDLE");
 		const char *env_classb_handle = getenv("SHAPER_CLASSB_HANDLE");
 		const char *env_taprio_cmd = getenv("SHAPER_TAPRIO_CMD");
+		const char *env_egress_qmap = getenv("SHAPER_EGRESS_QMAP");
+		const char *env_classa_qmap = getenv("SHAPER_CLASSA_QMAP");
+		const char *env_classb_qmap = getenv("SHAPER_CLASSB_QMAP");
+		const char *env_default_qmap = getenv("SHAPER_DEFAULT_QMAP");
+		const char *env_gptp_qmap = getenv("SHAPER_GPTP_QMAP");
 		if (env_classa_parent)
 		{
 			strncpy(classa_parent_str, env_classa_parent, sizeof(classa_parent_str) - 1);
@@ -1123,6 +1361,39 @@ int main (int argc, char *argv[])
 			{
 				SHAPER_LOGF_WARNING("Ignoring SHAPER_TAPRIO_CMD without taprio: \"%s\"", env_taprio_cmd);
 			}
+		}
+		if (env_egress_qmap && atoi(env_egress_qmap) > 0)
+		{
+			egress_qmap_enable = 1;
+		}
+		if (env_classa_qmap)
+		{
+			qmap_classa = atoi(env_classa_qmap);
+		}
+		if (env_classb_qmap)
+		{
+			qmap_classb = atoi(env_classb_qmap);
+		}
+		if (env_default_qmap)
+		{
+			qmap_default = atoi(env_default_qmap);
+		}
+		if (env_gptp_qmap)
+		{
+			qmap_gptp = atoi(env_gptp_qmap);
+		}
+		if (egress_qmap_enable)
+		{
+			if (qmap_classa < 0)
+			{
+				qmap_classa = parse_parent_queue_index(classa_parent_str);
+			}
+			if (qmap_classb < 0)
+			{
+				qmap_classb = parse_parent_queue_index(classb_parent_str);
+			}
+			SHAPER_LOGF_INFO("Egress qmap enabled: classA=%d classB=%d default=%d gPTP=%d",
+				qmap_classa, qmap_classb, qmap_default, qmap_gptp);
 		}
 	}
 
@@ -1184,6 +1455,8 @@ int main (int argc, char *argv[])
 	for (i = 0; i < MAX_CLIENT_CONNECTIONS; ++i)
 	{
 		clientfd[i] = -1;
+		clientCommandLen[i] = 0;
+		clientCommandBuf[i][0] = '\0';
 	}
 	nextclientindex = 0;
 
@@ -1244,7 +1517,7 @@ int main (int argc, char *argv[])
 			else
 			{
 				/* Process the command data (may include multiple lines). */
-				int ret = process_commands_from_buffer(-1, command, recvbytes);
+					int ret = process_commands_from_stream(-1, stdinCommandBuf, &stdinCommandLen, command, recvbytes);
 				if (!ret)
 				{
 					/* Received a command to exit. */
@@ -1284,10 +1557,12 @@ int main (int argc, char *argv[])
 				}
 
 
-				if (newfd != -1)
-				{
-					clientfd[nextclientindex] = newfd;
-					nextclientindex = (nextclientindex + 1) % MAX_CLIENT_CONNECTIONS; /* Next slot used for the next try. */
+					if (newfd != -1)
+					{
+						clientfd[nextclientindex] = newfd;
+						clientCommandLen[nextclientindex] = 0;
+						clientCommandBuf[nextclientindex][0] = '\0';
+						nextclientindex = (nextclientindex + 1) % MAX_CLIENT_CONNECTIONS; /* Next slot used for the next try. */
 
 					/* Send a prompt to the user. */
 					send(newfd, USER_COMMAND_PROMPT, strlen(USER_COMMAND_PROMPT), 0);
@@ -1299,25 +1574,32 @@ int main (int argc, char *argv[])
 				if (clientfd[i] != -1 && FD_ISSET(clientfd[i], &read_fds))
 				{
 					recvbytes = recv(clientfd[i], command, sizeof(command) - 1, 0);
-					if (recvbytes < 0)
-					{
-						SHAPER_LOGF_ERROR("Error %d reading from socket %d (%s).  Connection closed.", errno, clientfd[i], strerror(errno));
-						close(clientfd[i]);
-						clientfd[i] = -1;
-						nextclientindex = i; /* We know this slot will be empty. */
-						continue;
-					}
-					if (recvbytes == 0)
-					{
-						SHAPER_LOGF_INFO("Socket %d closed", clientfd[i]);
-						close(clientfd[i]);
-						clientfd[i] = -1;
-						nextclientindex = i; /* We know this slot will be empty. */
-						continue;
-					}
+						if (recvbytes < 0)
+						{
+							SHAPER_LOGF_ERROR("Error %d reading from socket %d (%s).  Connection closed.", errno, clientfd[i], strerror(errno));
+								cleanup_client_streams(clientfd[i]);
+								close(clientfd[i]);
+								clientfd[i] = -1;
+								clientCommandLen[i] = 0;
+							clientCommandBuf[i][0] = '\0';
+							nextclientindex = i; /* We know this slot will be empty. */
+							continue;
+						}
+						if (recvbytes == 0)
+						{
+							SHAPER_LOGF_INFO("Socket %d closed", clientfd[i]);
+							cleanup_client_streams(clientfd[i]);
+							close(clientfd[i]);
+							clientfd[i] = -1;
+							clientCommandLen[i] = 0;
+							clientCommandBuf[i][0] = '\0';
+							nextclientindex = i; /* We know this slot will be empty. */
+							continue;
+						}
 
-					/* Process the command data (may include multiple lines). */
-					int ret = process_commands_from_buffer(clientfd[i], command, recvbytes);
+						/* Process the command data (may include multiple lines). */
+						int ret = process_commands_from_stream(
+							clientfd[i], clientCommandBuf[i], &clientCommandLen[i], command, recvbytes);
 					if (!ret)
 					{
 						/* Received a command to exit. */
@@ -1339,6 +1621,7 @@ int main (int argc, char *argv[])
 	for (i = 0; i < MAX_CLIENT_CONNECTIONS; ++i) {
 		if (clientfd[i] != -1) {
 			SHAPER_LOGF_INFO("Socket %d closed", clientfd[i]);
+			cleanup_client_streams(clientfd[i]);
 			close(clientfd[i]);
 			clientfd[i] = -1;
 		}

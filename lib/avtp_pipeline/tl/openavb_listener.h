@@ -37,6 +37,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define OPENAVB_TL_LISTENER_H 1
 
 #include "openavb_tl.h"
+#include "openavb_avtp.h"
 
 typedef struct {
 	U64 totalCalls;
@@ -60,7 +61,20 @@ typedef struct {
 	U64 			nextReportNS;
 	U64				nextSecondNS;
 	unsigned long	lastReportFrames;
+	U32				emptyRxStreak;
 	listener_stats_t stats;
+
+	// Last SRP status published to AVDECC (edge-triggered publish guard).
+	bool			srpInfoPublished;
+	U8				srpTalkerDecl;
+	U8				srpFailureCode;
+	U8				srpFailureBridgeId[8];
+
+	// Cumulative Milan / AECP counters for this listener across AVTP restarts.
+	openavb_avtp_diag_counters_t aecpCounters;
+
+	// Serializes AVTP handle access between the listener thread and endpoint/AVDECC control paths.
+	MUTEX_HANDLE(streamMutex);
 } listener_data_t;
 
 void openavbTLRunListener(tl_state_t *pTLState);
