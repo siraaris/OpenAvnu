@@ -33,7 +33,9 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_platform_pub.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "openavb_queue.h"
 #include "openavb_tcal_pub.h"
 
@@ -63,6 +65,7 @@ typedef struct {
 static openavb_queue_t logQueue;
 static openavb_queue_t logRTQueue;
 static FILE *logOutputFd = NULL;
+static int runtimeLogLevel = AVB_LOG_LEVEL;
 
 static char msg[LOG_MSG_LEN] = "";
 static char time_msg[LOG_TIME_LEN] = "";
@@ -82,6 +85,48 @@ THREAD_DEFINITON(loggingThread);
 static MUTEX_HANDLE_ALT(gLogMutex);
 #define LOG_LOCK() MUTEX_LOCK_ALT(gLogMutex)
 #define LOG_UNLOCK() MUTEX_UNLOCK_ALT(gLogMutex)
+
+static int parseLogLevel(const char *value)
+{
+	char *end = NULL;
+	long parsed;
+
+	if (value == NULL || *value == '\0') {
+		return AVB_LOG_LEVEL;
+	}
+
+	parsed = strtol(value, &end, 10);
+	if (end != value && *end == '\0') {
+		if (parsed >= AVB_LOG_LEVEL_NONE && parsed <= AVB_LOG_LEVEL_VERBOSE) {
+			return (int)parsed;
+		}
+		return AVB_LOG_LEVEL;
+	}
+
+	if (strcasecmp(value, "none") == 0) {
+		return AVB_LOG_LEVEL_NONE;
+	}
+	if (strcasecmp(value, "error") == 0) {
+		return AVB_LOG_LEVEL_ERROR;
+	}
+	if (strcasecmp(value, "warning") == 0 || strcasecmp(value, "warn") == 0) {
+		return AVB_LOG_LEVEL_WARNING;
+	}
+	if (strcasecmp(value, "info") == 0) {
+		return AVB_LOG_LEVEL_INFO;
+	}
+	if (strcasecmp(value, "status") == 0) {
+		return AVB_LOG_LEVEL_STATUS;
+	}
+	if (strcasecmp(value, "debug") == 0) {
+		return AVB_LOG_LEVEL_DEBUG;
+	}
+	if (strcasecmp(value, "verbose") == 0) {
+		return AVB_LOG_LEVEL_VERBOSE;
+	}
+
+	return AVB_LOG_LEVEL;
+}
 
 void avbLogRTRender(log_queue_item_t *pLogItem)
 {
@@ -206,6 +251,8 @@ extern void DLL_EXPORT avbLogInitEx(FILE* file)
 		logOutputFd = file;
 	else
 		logOutputFd = AVB_LOG_OUTPUT_FD;
+
+	runtimeLogLevel = parseLogLevel(getenv("OPENAVB_LOG_LEVEL"));
   
 	logQueue = openavbQueueNewQueue(sizeof(log_queue_item_t), LOG_QUEUE_MSG_CNT);
 	if (!logQueue) {
@@ -253,7 +300,7 @@ void __avbLogFn(
 	const char *fmt, 
 	va_list args)
 {
-	if (level <= AVB_LOG_LEVEL) {
+	if (level <= runtimeLogLevel) {
 		LOG_LOCK();
 
 		vsprintf(msg, fmt, args);
@@ -332,6 +379,8 @@ extern void DLL_EXPORT avbLogFn(
 
 extern void DLL_EXPORT avbLogRT(int level, bool bBegin, bool bItem, bool bEnd, char *pFormat, log_rt_datatype_t dataType, void *pVar)
 {
+	if (level > runtimeLogLevel) { return; }
+
 	if (logRTQueue) {
 		if (bBegin) {
 			LOG_LOCK();
@@ -436,7 +485,7 @@ extern void DLL_EXPORT avbLogBuffer(
 	char *pszOut;
 	int i, j;
 
-	if (level > AVB_LOG_LEVEL) { return; }
+	if (level > runtimeLogLevel) { return; }
 
 	for (i = 0; i < dataLen; i += lineLen) {
 		/* Create the hexadecimal output for the buffer. */

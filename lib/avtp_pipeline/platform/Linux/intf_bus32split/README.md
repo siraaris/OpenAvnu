@@ -41,14 +41,8 @@ Example Milan AAF profiles are provided in this folder:
 The four AAF talkers plus CRF are intended to be started together in one
 `openavb_host` process.
 
-Example with `run_avb_stack_tmux.sh`:
+Example with `run_milan_stack_tmux.sh`:
 
 ```bash
-INI_FILES="\
-/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_0.ini \
-/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_1.ini \
-/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_2.ini \
-/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_3.ini \
-/root/src/OpenAvnu/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_crf.ini" \
-./run_avb_stack_tmux.sh restart
+STACK_PROFILE=split32 ./run_milan_stack_tmux.sh restart
 ```

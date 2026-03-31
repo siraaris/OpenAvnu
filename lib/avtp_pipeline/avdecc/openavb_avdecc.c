@@ -68,7 +68,7 @@ static U16 s_identifyControlIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
 static U8 *s_entityLogoData = NULL;
 static U64 s_entityLogoLength = 0;
 
-#define OPENAVB_AVDECC_ENTITY_LOGO_PATH "/root/src/OpenAvnu/avnu_logo.png"
+#define OPENAVB_AVDECC_ENTITY_LOGO_PATH "avnu_logo.png"
 #define OPENAVB_AVDECC_ENTITY_LOGO_START_ADDRESS (0x4f41564c4f474f00ULL)
 
 static void openavbAvdeccFreeEntityLogo(void)
