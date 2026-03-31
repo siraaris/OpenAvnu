@@ -90,6 +90,8 @@ static enum shaperState_t shaperState = SHAPER_STATE_UNKNOWN;
 static int socketfd = -1;
 static char interfaceOnly[IFNAMSIZ];
 static char shaperDaemonPort[6] = {0};
+static unsigned int shaperLinkKbit = 0;
+static bool shaperLinkWarned = FALSE;
 
 static MUTEX_HANDLE(shaperMutex);
 #define SHAPER_LOCK() { MUTEX_CREATE_ERR(); MUTEX_LOCK(shaperMutex); MUTEX_LOG_ERR("Mutex lock failure"); }
@@ -235,7 +237,7 @@ static void* shaperThread(void *arg)
 	return NULL;
 }
 
-bool openavbShaperInitialize(const char *ifname, unsigned int shaperPort)
+bool openavbShaperInitialize(const char *ifname, unsigned int shaperPort, unsigned int link_kbit)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_SHAPER);
 
@@ -255,6 +257,7 @@ bool openavbShaperInitialize(const char *ifname, unsigned int shaperPort)
 	else {
 		shaperState = SHAPER_STATE_UNKNOWN;
 		sprintf(shaperDaemonPort, "%u", shaperPort);
+		shaperLinkKbit = link_kbit;
 
 		// Save the interface-only name to pass to the daemon later.
 		const char *ifonly = strchr(ifname, ':');
@@ -357,18 +360,40 @@ void* openavbShaperHandle(SRClassIdx_t sr_class, int measurement_interval_usec, 
 	// Send the information to the Shaper daemon.
 	// Reserving Bandwidth Example:  -ri eth2 -c A -s 125 -b 74 -f 1 -a ff:ff:ff:ff:ff:11\n
 	char szCommand[200];
-	sprintf(szCommand, "-ri %s -c %c -s %u -b %u -f %u -a %02x:%02x:%02x:%02x:%02x:%02x",
-		interfaceOnly,
-		( shaperReservationList[i].sr_class == SR_CLASS_A ? 'A' : 'B' ),
-		shaperReservationList[i].measurement_interval,
-		shaperReservationList[i].max_frame_size,
-		shaperReservationList[i].max_frames_per_interval,
-		shaperReservationList[i].stream_da[0],
-		shaperReservationList[i].stream_da[1],
-		shaperReservationList[i].stream_da[2],
-		shaperReservationList[i].stream_da[3],
-		shaperReservationList[i].stream_da[4],
-		shaperReservationList[i].stream_da[5]);
+	if (shaperLinkKbit > 0) {
+		unsigned int link_mbps = (shaperLinkKbit + 999) / 1000;
+		sprintf(szCommand, "-ri %s -c %c -s %u -b %u -f %u -l %u -a %02x:%02x:%02x:%02x:%02x:%02x",
+			interfaceOnly,
+			( shaperReservationList[i].sr_class == SR_CLASS_A ? 'A' : 'B' ),
+			shaperReservationList[i].measurement_interval,
+			shaperReservationList[i].max_frame_size,
+			shaperReservationList[i].max_frames_per_interval,
+			link_mbps,
+			shaperReservationList[i].stream_da[0],
+			shaperReservationList[i].stream_da[1],
+			shaperReservationList[i].stream_da[2],
+			shaperReservationList[i].stream_da[3],
+			shaperReservationList[i].stream_da[4],
+			shaperReservationList[i].stream_da[5]);
+	}
+	else {
+		if (!shaperLinkWarned) {
+			AVB_LOG_WARNING("Shaper link speed is unknown; set network.link_kbit in endpoint.ini or SHAPER_LINK_SPEED_MBPS for CBS shaping");
+			shaperLinkWarned = TRUE;
+		}
+		sprintf(szCommand, "-ri %s -c %c -s %u -b %u -f %u -a %02x:%02x:%02x:%02x:%02x:%02x",
+			interfaceOnly,
+			( shaperReservationList[i].sr_class == SR_CLASS_A ? 'A' : 'B' ),
+			shaperReservationList[i].measurement_interval,
+			shaperReservationList[i].max_frame_size,
+			shaperReservationList[i].max_frames_per_interval,
+			shaperReservationList[i].stream_da[0],
+			shaperReservationList[i].stream_da[1],
+			shaperReservationList[i].stream_da[2],
+			shaperReservationList[i].stream_da[3],
+			shaperReservationList[i].stream_da[4],
+			shaperReservationList[i].stream_da[5]);
+	}
 	AVB_LOGF_DEBUG("Sending Shaper command:  %s", szCommand);
 	strcat(szCommand, "\n");
 	if (send(socketfd, szCommand, strlen(szCommand), 0) < 0)
