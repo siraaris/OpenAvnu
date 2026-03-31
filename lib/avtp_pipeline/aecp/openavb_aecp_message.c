@@ -51,6 +51,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_srp.h"
 #include "openavb_aecp.h"
 #include "openavb_aecp_sm_entity_model_entity.h"
+#include "openavb_time_osal_pub.h"
 
 #define INVALID_SOCKET (-1)
 
@@ -77,6 +78,23 @@ THREAD_TYPE(openavbAecpMessageRxThread);
 THREAD_DEFINITON(openavbAecpMessageRxThread);
 
 static bool bRunning = FALSE;
+
+static bool openavbAecpShouldLogNonAvtp(void)
+{
+	static time_t last_warn_sec = 0;
+	struct timespec now;
+
+	if (!CLOCK_GETTIME(OPENAVB_CLOCK_MONOTONIC, &now)) {
+		return true;
+	}
+
+	if (now.tv_sec != last_warn_sec) {
+		last_warn_sec = now.tv_sec;
+		return true;
+	}
+
+	return false;
+}
 
 void openavbAecpCloseSocket()
 {
@@ -559,9 +577,11 @@ static void openavbAecpMessageRxFrameReceive(U32 timeoutUsec)
 				}
 			}
 			else {
-				AVB_LOG_WARNING("Received non-AVTP frame!");
-				AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
-				AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+				if (openavbAecpShouldLogNonAvtp()) {
+					AVB_LOG_WARNING("Received non-AVTP frame!");
+					AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
+					AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+				}
 			}
 		}
 

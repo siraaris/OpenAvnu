@@ -36,6 +36,62 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_aem_types_pub.h"
 #include "openavb_avdecc_pipeline_interaction_pub.h"
 #include "openavb_avdecc_msg_server.h"
+#include "openavb_grandmaster_osal_pub.h"
+
+#include <string.h>
+
+static bool s_clock_domain_counters_init = false;
+static bool s_clock_domain_locked = false;
+static U32 s_clock_domain_locked_count = 0;
+static U32 s_clock_domain_unlocked_count = 0;
+
+static bool openavbClockDomainGetLockedState(bool *locked)
+{
+	uint8_t gm_id[8] = { 0 };
+	uint8_t domain = 0;
+
+	if (!locked) {
+		return false;
+	}
+
+	if (!osalAVBGrandmasterGetCurrent(gm_id, &domain)) {
+		return false;
+	}
+
+	*locked = (memcmp(gm_id, "\0\0\0\0\0\0\0\0", sizeof(gm_id)) != 0);
+	return true;
+}
+
+static bool openavbClockDomainUpdateCounters(void)
+{
+	bool locked = false;
+
+	if (!openavbClockDomainGetLockedState(&locked)) {
+		return false;
+	}
+
+	if (!s_clock_domain_counters_init) {
+		s_clock_domain_counters_init = true;
+		s_clock_domain_locked = locked;
+		if (locked) {
+			s_clock_domain_locked_count = 1;
+		} else {
+			s_clock_domain_unlocked_count = 1;
+		}
+		return true;
+	}
+
+	if (locked != s_clock_domain_locked) {
+		s_clock_domain_locked = locked;
+		if (locked) {
+			s_clock_domain_locked_count++;
+		} else {
+			s_clock_domain_unlocked_count++;
+		}
+	}
+
+	return true;
+}
 
 
 bool openavbAVDECCRunListener(openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput, U16 configIdx, openavb_acmp_ListenerStreamInfo_t *pListenerStreamInfo)
@@ -483,13 +539,17 @@ bool openavbAVDECCGetCounterValue(void *pDescriptor, U16 descriptorType, U32 cou
 		{
 			switch (counterFlag) {
 			case OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_LOCKED:
-				AVB_LOG_ERROR("OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_LOCKED Not Implemented!");
-				if (pValue) { *pValue = 1; }
+				if (!openavbClockDomainUpdateCounters()) {
+					break;
+				}
+				if (pValue) { *pValue = s_clock_domain_locked_count; }
 				return TRUE;
 
 			case OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_UNLOCKED:
-				AVB_LOG_ERROR("OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_UNLOCKED Not Implemented!");
-				if (pValue) { *pValue = 1; }
+				if (!openavbClockDomainUpdateCounters()) {
+					break;
+				}
+				if (pValue) { *pValue = s_clock_domain_unlocked_count; }
 				return TRUE;
 
 			default:
