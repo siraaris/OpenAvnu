@@ -40,6 +40,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <string.h>
 #include <stdio.h>
 #include <endian.h>
+#include <unistd.h>
+#include <pthread.h>
 #include "openavb_platform_pub.h"
 #include "openavb_osal_pub.h"
 #include "openavb_types_pub.h"
@@ -54,6 +56,12 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_log_pub.h"
 
 #define PI 3.14159265358979f
+
+typedef struct {
+	U8 *pData;
+	U32 dataLen;
+	U64 timestampNs;
+} tonegen_fifo_item_t;
 
 typedef struct {
 	/////////////
@@ -123,7 +131,53 @@ typedef struct {
 
 	bool fixedTimestampEnabled;
 
+	// Per-instance running frame count.
+	U32 runningFrameCnt;
+
+	// Optional jitter-absorbing FIFO between sample generation and MediaQ push.
+	bool jitterFifoEnabled;
+	U32 jitterFifoItemCount;
+	U32 jitterFifoPrefillItems;
+	U32 jitterFifoLowWaterItems;
+	U32 jitterFifoHighWaterItems;
+	U32 jitterFifoLogIntervalSec;
+
+	bool jitterFifoInitialized;
+	bool jitterFifoThreadRunning;
+	bool jitterFifoStopRequested;
+	bool jitterFifoPrefillDone;
+
+	pthread_t jitterFifoThread;
+	pthread_mutex_t jitterFifoMutex;
+	pthread_cond_t jitterFifoCond;
+
+	tonegen_fifo_item_t *pJitterFifoItems;
+	U32 jitterFifoReadIdx;
+	U32 jitterFifoWriteIdx;
+	U32 jitterFifoCount;
+
+	// Timestamp synth for FIFO mode.
+	bool fifoTsInitialized;
+	U64 fifoTsCurrentNs;
+	U64 fifoTsStepNs;
+	U32 fifoTsStepRem;
+	U32 fifoTsStepDen;
+	U32 fifoTsRemAccum;
+	U32 fifoTsRuntimeLeadUsec;
+
+	// FIFO diagnostics.
+	U64 jitterFifoProduced;
+	U64 jitterFifoConsumed;
+	U64 jitterFifoUnderrun;
+	U64 jitterFifoOverrun;
+	U32 jitterFifoLevelMin;
+	U32 jitterFifoLevelMax;
+	U64 jitterFifoLastLogNs;
+
 } pvt_data_t;
+
+static U16 convertToDesiredEndianOrder16(U16 hostData, avb_audio_endian_t audioEndian);
+static U32 convertToDesiredEndianOrder32(U32 hostData, avb_audio_endian_t audioEndian);
 
 #define MSEC_PER_COUNT 250
 static void xGetMelodyToneAndDuration(char note, char count, U32 *freq, U32 *sampleMSec)
@@ -206,6 +260,423 @@ static bool xSupportedMappingFormat(media_q_t *pMediaQ)
 		}
 	}
 	return FALSE;
+}
+
+static void xTonegenInitFifoTimestampSynth(
+		pvt_data_t *pPvtData,
+		const media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo)
+{
+	U64 num;
+	U64 den;
+
+	if (!pPvtData || !pPubMapUncmpAudioInfo || pPubMapUncmpAudioInfo->audioRate == 0) {
+		return;
+	}
+
+	num = (U64)NANOSECONDS_PER_SECOND * (U64)pPubMapUncmpAudioInfo->framesPerItem;
+	den = (U64)pPubMapUncmpAudioInfo->audioRate;
+
+	pPvtData->fifoTsStepNs = num / den;
+	pPvtData->fifoTsStepRem = (U32)(num % den);
+	pPvtData->fifoTsStepDen = (U32)den;
+	pPvtData->fifoTsRemAccum = 0;
+	pPvtData->fifoTsInitialized = FALSE;
+}
+
+static U64 xTonegenNextFifoTimestampNs(pvt_data_t *pPvtData)
+{
+	U64 nowNs = 0;
+
+	if (!pPvtData) {
+		return 0;
+	}
+
+	if (!pPvtData->fifoTsInitialized) {
+		U64 bufferedLeadNs = 0;
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+		if (pPvtData->jitterFifoHighWaterItems > 0) {
+			bufferedLeadNs =
+				(U64)(pPvtData->jitterFifoHighWaterItems - 1U) * pPvtData->fifoTsStepNs;
+		}
+		pPvtData->fifoTsCurrentNs =
+			nowNs
+			+ bufferedLeadNs
+			+ ((U64)pPvtData->fifoTsRuntimeLeadUsec * 1000ULL);
+		pPvtData->fifoTsInitialized = TRUE;
+	}
+	else {
+		pPvtData->fifoTsCurrentNs += pPvtData->fifoTsStepNs;
+		if (pPvtData->fifoTsStepDen > 0 && pPvtData->fifoTsStepRem > 0) {
+			pPvtData->fifoTsRemAccum += pPvtData->fifoTsStepRem;
+			if (pPvtData->fifoTsRemAccum >= pPvtData->fifoTsStepDen) {
+				U32 carry = pPvtData->fifoTsRemAccum / pPvtData->fifoTsStepDen;
+				pPvtData->fifoTsCurrentNs += (U64)carry;
+				pPvtData->fifoTsRemAccum -= carry * pPvtData->fifoTsStepDen;
+			}
+		}
+	}
+
+	return pPvtData->fifoTsCurrentNs;
+}
+
+static void xTonegenMaybeLogFifoStats(pvt_data_t *pPvtData)
+{
+	U64 nowNs;
+
+	if (!pPvtData || pPvtData->jitterFifoLogIntervalSec == 0) {
+		return;
+	}
+
+	CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+	if (pPvtData->jitterFifoLastLogNs == 0) {
+		pPvtData->jitterFifoLastLogNs = nowNs;
+		return;
+	}
+	if ((nowNs - pPvtData->jitterFifoLastLogNs) <
+			((U64)pPvtData->jitterFifoLogIntervalSec * (U64)NANOSECONDS_PER_SECOND)) {
+		return;
+	}
+
+	AVB_LOGF_INFO("ToneGen FIFO: level=%u min=%u max=%u produced=%llu consumed=%llu underrun=%llu overrun=%llu prefill_done=%u",
+			pPvtData->jitterFifoCount,
+			pPvtData->jitterFifoLevelMin,
+			pPvtData->jitterFifoLevelMax,
+			(unsigned long long)pPvtData->jitterFifoProduced,
+			(unsigned long long)pPvtData->jitterFifoConsumed,
+			(unsigned long long)pPvtData->jitterFifoUnderrun,
+			(unsigned long long)pPvtData->jitterFifoOverrun,
+			pPvtData->jitterFifoPrefillDone ? 1 : 0);
+
+	pPvtData->jitterFifoLevelMin = pPvtData->jitterFifoCount;
+	pPvtData->jitterFifoLevelMax = pPvtData->jitterFifoCount;
+	pPvtData->jitterFifoLastLogNs = nowNs;
+}
+
+static bool xTonegenGenerateItem(
+		media_q_t *pMediaQ,
+		pvt_data_t *pPvtData,
+		U8 *pData,
+		U32 *pDataLen,
+		U64 *pTimestampNs,
+		bool useFifoTimestampSynth)
+{
+	media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo;
+	U32 frameCnt;
+	U32 channelCnt;
+	U8 *pWrite;
+
+	if (!pMediaQ || !pPvtData || !pData || !pDataLen || !pTimestampNs) {
+		return FALSE;
+	}
+
+	pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
+	if (!pPubMapUncmpAudioInfo) {
+		return FALSE;
+	}
+
+	pWrite = pData;
+	for (frameCnt = 0; frameCnt < pPubMapUncmpAudioInfo->framesPerItem; frameCnt++) {
+		// Check for tone on / off toggle
+		if (!pPvtData->freqCountdown) {
+			if (pPvtData->pMelodyString) {
+				U32 intervalMSec;
+				xGetMelodyToneAndDuration(
+					pPvtData->pMelodyString[pPvtData->melodyIdx],
+					pPvtData->pMelodyString[pPvtData->melodyIdx + 1],
+					&pPvtData->freq,
+					&intervalMSec);
+				pPvtData->melodyIdx += 2;
+
+				pPvtData->freqCountdown = (pPubMapUncmpAudioInfo->audioRate / 1000) * intervalMSec;
+				if (pPvtData->melodyIdx >= pPvtData->melodyLen) {
+					pPvtData->melodyIdx = 0;
+				}
+			}
+			else {
+				if (pPvtData->onOffIntervalMSec > 0) {
+					if (pPvtData->freq == 0) {
+						pPvtData->freq = pPvtData->toneHz;
+					}
+					else {
+						pPvtData->freq = 0;
+					}
+					pPvtData->freqCountdown = (pPubMapUncmpAudioInfo->audioRate / 1000) * pPvtData->onOffIntervalMSec;
+				}
+				else {
+					pPvtData->freqCountdown = pPubMapUncmpAudioInfo->audioRate;
+					pPvtData->freq = pPvtData->toneHz;
+				}
+			}
+			pPvtData->ratio = (float)pPvtData->freq / (float)pPubMapUncmpAudioInfo->audioRate;
+		}
+		pPvtData->freqCountdown--;
+
+		{
+			float value = SIN(2 * PI * (pPvtData->runningFrameCnt++ % pPubMapUncmpAudioInfo->audioRate) * pPvtData->ratio) * pPvtData->volume;
+			for (channelCnt = 0; channelCnt < pPubMapUncmpAudioInfo->audioChannels - pPvtData->fvChannels; channelCnt++) {
+				if (pPvtData->audioType == AVB_AUDIO_TYPE_INT) {
+					if (pPvtData->audioBitDepth == 32) {
+						S32 sample32 = (S32)(value * (32000 << 16));
+						S32 tmp32 = convertToDesiredEndianOrder32(sample32, pPvtData->audioEndian);
+						memcpy(pWrite, (U8 *)&tmp32, 4);
+						pWrite += 4;
+					}
+					else if (pPvtData->audioBitDepth == 24) {
+						S32 sample24 = (S32)(value * (32000 << 16));
+						S32 tmp24 = convertToDesiredEndianOrder32(sample24, pPvtData->audioEndian);
+						if (pPvtData->audioEndian == AVB_AUDIO_ENDIAN_BIG) {
+							memcpy(pWrite, (U8 *)&tmp24, 3);
+						}
+						else {
+							memcpy(pWrite, ((U8 *)&tmp24) + 1, 3);
+						}
+						pWrite += 3;
+					}
+					else if (pPvtData->audioBitDepth == 16) {
+						S16 sample16 = (S32)(value * 32000);
+						S16 tmp16 = convertToDesiredEndianOrder16(sample16, pPvtData->audioEndian);
+						memcpy(pWrite, (U8 *)&tmp16, 2);
+						pWrite += 2;
+					}
+				}
+				else if (pPvtData->audioType == AVB_AUDIO_TYPE_FLOAT) {
+					U32 tmp32f;
+					memcpy((U8 *)&tmp32f, (U8 *)&value, 4);
+					tmp32f = convertToDesiredEndianOrder32(tmp32f, pPvtData->audioEndian);
+					memcpy(pWrite, (U8 *)&tmp32f, 4);
+					pWrite += 4;
+				}
+				else {
+					AVB_LOG_ERROR("Audio sample size format not implemented yet for tone generator interface module");
+					return FALSE;
+				}
+			}
+
+			if (pPvtData->fvChannels > 0 && pPvtData->audioType == AVB_AUDIO_TYPE_INT && pPvtData->audioBitDepth == 32) {
+				if (pPvtData->fv1Enabled) {
+					S32 tmp32 = convertToDesiredEndianOrder32(pPvtData->fv1, pPvtData->audioEndian);
+					memcpy(pWrite, (U8 *)&tmp32, 4);
+					pWrite += 4;
+				}
+				if (pPvtData->fv2Enabled) {
+					S32 tmp32 = convertToDesiredEndianOrder32(pPvtData->fv2, pPvtData->audioEndian);
+					memcpy(pWrite, (U8 *)&tmp32, 4);
+					pWrite += 4;
+				}
+			}
+		}
+	}
+
+	*pDataLen = pPubMapUncmpAudioInfo->itemSize;
+	if (useFifoTimestampSynth) {
+		*pTimestampNs = xTonegenNextFifoTimestampNs(pPvtData);
+	}
+	else if (!pPvtData->fixedTimestampEnabled) {
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, pTimestampNs);
+	}
+	else {
+		openavbMcsAdvance(&pPvtData->mcs);
+		*pTimestampNs = pPvtData->mcs.edgeTime;
+	}
+
+	return TRUE;
+}
+
+static void *openavbIntfToneGenFifoThread(void *pv)
+{
+	media_q_t *pMediaQ = pv;
+	pvt_data_t *pPvtData;
+
+	if (!pMediaQ) {
+		return NULL;
+	}
+	pPvtData = pMediaQ->pPvtIntfInfo;
+	if (!pPvtData) {
+		return NULL;
+	}
+
+	while (TRUE) {
+		U32 slotIdx;
+		U32 dataLen;
+		U64 tsNs;
+		bool stopRequested = FALSE;
+
+		pthread_mutex_lock(&pPvtData->jitterFifoMutex);
+		while (!pPvtData->jitterFifoStopRequested &&
+				pPvtData->jitterFifoCount >= pPvtData->jitterFifoHighWaterItems) {
+			pthread_cond_wait(&pPvtData->jitterFifoCond, &pPvtData->jitterFifoMutex);
+		}
+		if (pPvtData->jitterFifoStopRequested) {
+			stopRequested = TRUE;
+		}
+		slotIdx = pPvtData->jitterFifoWriteIdx;
+		pthread_mutex_unlock(&pPvtData->jitterFifoMutex);
+
+		if (stopRequested) {
+			break;
+		}
+
+		if (!xTonegenGenerateItem(
+				pMediaQ,
+				pPvtData,
+				pPvtData->pJitterFifoItems[slotIdx].pData,
+				&dataLen,
+				&tsNs,
+				TRUE)) {
+			AVB_LOG_ERROR("ToneGen FIFO: failed to generate item");
+			usleep(1000);
+			continue;
+		}
+
+		pthread_mutex_lock(&pPvtData->jitterFifoMutex);
+		if (pPvtData->jitterFifoCount >= pPvtData->jitterFifoItemCount) {
+			// Consumer fell behind unexpectedly; drop oldest to preserve forward progress.
+			pPvtData->jitterFifoReadIdx = (pPvtData->jitterFifoReadIdx + 1) % pPvtData->jitterFifoItemCount;
+			pPvtData->jitterFifoCount--;
+			pPvtData->jitterFifoOverrun++;
+		}
+
+		pPvtData->pJitterFifoItems[slotIdx].dataLen = dataLen;
+		pPvtData->pJitterFifoItems[slotIdx].timestampNs = tsNs;
+		pPvtData->jitterFifoWriteIdx = (pPvtData->jitterFifoWriteIdx + 1) % pPvtData->jitterFifoItemCount;
+		pPvtData->jitterFifoCount++;
+		pPvtData->jitterFifoProduced++;
+		if (pPvtData->jitterFifoCount > pPvtData->jitterFifoLevelMax) {
+			pPvtData->jitterFifoLevelMax = pPvtData->jitterFifoCount;
+		}
+		if (pPvtData->jitterFifoCount < pPvtData->jitterFifoLevelMin) {
+			pPvtData->jitterFifoLevelMin = pPvtData->jitterFifoCount;
+		}
+		if (!pPvtData->jitterFifoPrefillDone &&
+				pPvtData->jitterFifoCount >= pPvtData->jitterFifoPrefillItems) {
+			pPvtData->jitterFifoPrefillDone = TRUE;
+		}
+		pthread_cond_broadcast(&pPvtData->jitterFifoCond);
+		pthread_mutex_unlock(&pPvtData->jitterFifoMutex);
+	}
+
+	return NULL;
+}
+
+static bool xTonegenFifoSetup(media_q_t *pMediaQ, pvt_data_t *pPvtData)
+{
+	U32 i;
+	media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
+
+	if (!pPvtData->jitterFifoEnabled) {
+		return TRUE;
+	}
+	if (!pPubMapUncmpAudioInfo || pPubMapUncmpAudioInfo->itemSize == 0) {
+		AVB_LOG_ERROR("ToneGen FIFO: map audio info unavailable at setup.");
+		return FALSE;
+	}
+
+	if (pPvtData->jitterFifoItemCount < 4) {
+		pPvtData->jitterFifoItemCount = 4;
+	}
+	if (pPvtData->jitterFifoHighWaterItems == 0 ||
+			pPvtData->jitterFifoHighWaterItems >= pPvtData->jitterFifoItemCount) {
+		pPvtData->jitterFifoHighWaterItems = pPvtData->jitterFifoItemCount - 1;
+	}
+	if (pPvtData->jitterFifoLowWaterItems >= pPvtData->jitterFifoHighWaterItems) {
+		pPvtData->jitterFifoLowWaterItems = pPvtData->jitterFifoHighWaterItems / 2;
+	}
+	if (pPvtData->jitterFifoPrefillItems == 0 ||
+			pPvtData->jitterFifoPrefillItems > pPvtData->jitterFifoHighWaterItems) {
+		pPvtData->jitterFifoPrefillItems = pPvtData->jitterFifoLowWaterItems;
+	}
+
+	pPvtData->pJitterFifoItems = (tonegen_fifo_item_t *)calloc(pPvtData->jitterFifoItemCount, sizeof(tonegen_fifo_item_t));
+	if (!pPvtData->pJitterFifoItems) {
+		AVB_LOG_ERROR("ToneGen FIFO: failed to allocate item descriptors.");
+		return FALSE;
+	}
+
+	for (i = 0; i < pPvtData->jitterFifoItemCount; i++) {
+		pPvtData->pJitterFifoItems[i].pData = (U8 *)malloc(pPubMapUncmpAudioInfo->itemSize);
+		if (!pPvtData->pJitterFifoItems[i].pData) {
+			AVB_LOG_ERROR("ToneGen FIFO: failed to allocate item data.");
+			return FALSE;
+		}
+		pPvtData->pJitterFifoItems[i].dataLen = 0;
+		pPvtData->pJitterFifoItems[i].timestampNs = 0;
+	}
+
+	xTonegenInitFifoTimestampSynth(pPvtData, pPubMapUncmpAudioInfo);
+
+	pPvtData->jitterFifoReadIdx = 0;
+	pPvtData->jitterFifoWriteIdx = 0;
+	pPvtData->jitterFifoCount = 0;
+	pPvtData->jitterFifoProduced = 0;
+	pPvtData->jitterFifoConsumed = 0;
+	pPvtData->jitterFifoUnderrun = 0;
+	pPvtData->jitterFifoOverrun = 0;
+	pPvtData->jitterFifoLevelMin = pPvtData->jitterFifoItemCount;
+	pPvtData->jitterFifoLevelMax = 0;
+	pPvtData->jitterFifoLastLogNs = 0;
+	pPvtData->jitterFifoPrefillDone = FALSE;
+	pPvtData->jitterFifoStopRequested = FALSE;
+
+	if (pthread_mutex_init(&pPvtData->jitterFifoMutex, NULL) != 0) {
+		AVB_LOG_ERROR("ToneGen FIFO: failed to initialize mutex.");
+		return FALSE;
+	}
+	if (pthread_cond_init(&pPvtData->jitterFifoCond, NULL) != 0) {
+		AVB_LOG_ERROR("ToneGen FIFO: failed to initialize condition variable.");
+		return FALSE;
+	}
+	pPvtData->jitterFifoInitialized = TRUE;
+
+	if (pthread_create(&pPvtData->jitterFifoThread, NULL, openavbIntfToneGenFifoThread, pMediaQ) != 0) {
+		AVB_LOG_ERROR("ToneGen FIFO: failed to start producer thread.");
+		return FALSE;
+	}
+	pPvtData->jitterFifoThreadRunning = TRUE;
+
+	AVB_LOGF_INFO("ToneGen FIFO enabled: items=%u prefill=%u low=%u high=%u log=%us",
+			pPvtData->jitterFifoItemCount,
+			pPvtData->jitterFifoPrefillItems,
+			pPvtData->jitterFifoLowWaterItems,
+			pPvtData->jitterFifoHighWaterItems,
+			pPvtData->jitterFifoLogIntervalSec);
+
+	return TRUE;
+}
+
+static void xTonegenFifoTeardown(pvt_data_t *pPvtData)
+{
+	U32 i;
+
+	if (!pPvtData) {
+		return;
+	}
+
+	if (pPvtData->jitterFifoInitialized) {
+		pthread_mutex_lock(&pPvtData->jitterFifoMutex);
+		pPvtData->jitterFifoStopRequested = TRUE;
+		pthread_cond_broadcast(&pPvtData->jitterFifoCond);
+		pthread_mutex_unlock(&pPvtData->jitterFifoMutex);
+	}
+
+	if (pPvtData->jitterFifoThreadRunning) {
+		pthread_join(pPvtData->jitterFifoThread, NULL);
+		pPvtData->jitterFifoThreadRunning = FALSE;
+	}
+
+	if (pPvtData->jitterFifoInitialized) {
+		pthread_cond_destroy(&pPvtData->jitterFifoCond);
+		pthread_mutex_destroy(&pPvtData->jitterFifoMutex);
+		pPvtData->jitterFifoInitialized = FALSE;
+	}
+
+	if (pPvtData->pJitterFifoItems) {
+		for (i = 0; i < pPvtData->jitterFifoItemCount; i++) {
+			free(pPvtData->pJitterFifoItems[i].pData);
+			pPvtData->pJitterFifoItems[i].pData = NULL;
+		}
+		free(pPvtData->pJitterFifoItems);
+		pPvtData->pJitterFifoItems = NULL;
+	}
 }
 
 // Each configuration name value pair for this mapping will result in this callback being called.
@@ -349,6 +820,29 @@ void openavbIntfToneGenCfgCB(media_q_t *pMediaQ, const char *name, const char *v
 			pPvtData->fvChannels++;
 		}
 
+		else if (strcmp(name, "intf_nv_jitter_fifo_enable") == 0) {
+			pPvtData->jitterFifoEnabled = (strtol(value, &pEnd, 10) != 0);
+		}
+		else if (strcmp(name, "intf_nv_jitter_fifo_item_count") == 0) {
+			pPvtData->jitterFifoItemCount = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "intf_nv_jitter_fifo_prefill") == 0) {
+			pPvtData->jitterFifoPrefillItems = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "intf_nv_jitter_fifo_low_water") == 0) {
+			pPvtData->jitterFifoLowWaterItems = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "intf_nv_jitter_fifo_high_water") == 0) {
+			pPvtData->jitterFifoHighWaterItems = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "intf_nv_jitter_fifo_log_interval_sec") == 0) {
+			pPvtData->jitterFifoLogIntervalSec = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "intf_nv_fixed_ts_runtime_lead_usec") == 0 ||
+				strcmp(name, "intf_nv_timestamp_runtime_lead_usec") == 0) {
+			pPvtData->fifoTsRuntimeLeadUsec = strtol(value, &pEnd, 10);
+		}
+
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
@@ -367,8 +861,6 @@ void openavbIntfToneGenTxInitCB(media_q_t *pMediaQ)
 	AVB_TRACE_ENTRY(AVB_TRACE_INTF);
 
 	if (pMediaQ) {
-		
-		// U8 b;
 		pvt_data_t *pPvtData = pMediaQ->pPvtIntfInfo;
 		if (!pPvtData) {
 			AVB_LOG_ERROR("Private interface module data not allocated.");
@@ -392,8 +884,21 @@ void openavbIntfToneGenTxInitCB(media_q_t *pMediaQ)
 			pPvtData->freqCountdown = 0;
 		}
 		
-		pPvtData->melodyIdx = 0;
-	}
+			pPvtData->melodyIdx = 0;
+			pPvtData->fifoTsInitialized = FALSE;
+
+			if (pPvtData->jitterFifoEnabled) {
+				if (!xTonegenFifoSetup(pMediaQ, pPvtData)) {
+					AVB_LOG_ERROR("ToneGen FIFO setup failed; disabling FIFO path");
+					pPvtData->jitterFifoEnabled = FALSE;
+					xTonegenFifoTeardown(pPvtData);
+				}
+				else if (pPvtData->fifoTsRuntimeLeadUsec > 0) {
+					AVB_LOGF_INFO("ToneGen FIFO runtime timestamp lead: %u usec",
+						pPvtData->fifoTsRuntimeLeadUsec);
+				}
+			}
+		}
 
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 }
@@ -476,117 +981,76 @@ bool openavbIntfToneGenTxCB(media_q_t *pMediaQ)
 				AVB_LOG_ERROR("Media queue item not large enough for samples");
 			}
 
-			// Tone on
-			static U32 runningFrameCnt = 0;
-			U32 frameCnt;
-			U32 channelCnt;
-			U8 *pData = pMediaQItem->pPubData;
-
-			for (frameCnt = 0; frameCnt < pPubMapUncmpAudioInfo->framesPerItem; frameCnt++) {
-
-				// Check for tone on / off toggle
-				if (!pPvtData->freqCountdown) {
-					if (pPvtData->pMelodyString) {
-						// Melody logic
-						U32 intervalMSec;
-						xGetMelodyToneAndDuration(
-							pPvtData->pMelodyString[pPvtData->melodyIdx],
-							pPvtData->pMelodyString[pPvtData->melodyIdx + 1],
-							&pPvtData->freq, &intervalMSec);
-							pPvtData->melodyIdx += 2;
-							
-							pPvtData->freqCountdown = (pPubMapUncmpAudioInfo->audioRate / 1000) * intervalMSec;
-							if (pPvtData->melodyIdx >= pPvtData->melodyLen)
-								pPvtData->melodyIdx = 0;
-					}
-					else {
-						// Fixed tone
-						if (pPvtData->onOffIntervalMSec > 0) {
-							if (pPvtData->freq == 0) {
-								pPvtData->freq = pPvtData->toneHz;
-							} else {
-								pPvtData->freq = 0;
-							}
-							pPvtData->freqCountdown = (pPubMapUncmpAudioInfo->audioRate / 1000) * pPvtData->onOffIntervalMSec;
-						}
-						else {
-							pPvtData->freqCountdown = pPubMapUncmpAudioInfo->audioRate;		// Just run steady for 1 sec
-							pPvtData->freq = pPvtData->toneHz;
-						}
-					}
-					pPvtData->ratio = (float)pPvtData->freq / (float)pPubMapUncmpAudioInfo->audioRate;
+			if (pPvtData->jitterFifoEnabled) {
+				bool gotItem = FALSE;
+				pthread_mutex_lock(&pPvtData->jitterFifoMutex);
+				if (!pPvtData->jitterFifoPrefillDone &&
+						pPvtData->jitterFifoCount >= pPvtData->jitterFifoPrefillItems) {
+					pPvtData->jitterFifoPrefillDone = TRUE;
 				}
-				pPvtData->freqCountdown--;
+				if (pPvtData->jitterFifoPrefillDone && pPvtData->jitterFifoCount > 0) {
+					tonegen_fifo_item_t *pItem = &pPvtData->pJitterFifoItems[pPvtData->jitterFifoReadIdx];
+					memcpy(pMediaQItem->pPubData, pItem->pData, pItem->dataLen);
+					pMediaQItem->dataLen = pItem->dataLen;
+					openavbAvtpTimeSetToTimestampNS(pMediaQItem->pAvtpTime, pItem->timestampNs);
 
-				float value = SIN(2 * PI * (runningFrameCnt++ % pPubMapUncmpAudioInfo->audioRate) * pPvtData->ratio) * pPvtData->volume;
-
-				for (channelCnt = 0; channelCnt < pPubMapUncmpAudioInfo->audioChannels - pPvtData->fvChannels; channelCnt++) {
-					if (pPvtData->audioType == AVB_AUDIO_TYPE_INT) {
-						if (pPvtData->audioBitDepth == 32) {
-							S32 sample32 = (S32)(value * (32000 << 16));
-							S32 tmp32 = convertToDesiredEndianOrder32(sample32, pPvtData->audioEndian);
-							memcpy(pData, (U8 *)&tmp32, 4);
-							pData += 4;
-						} else if (pPvtData->audioBitDepth == 24) {
-							S32 sample24 = (S32)(value * (32000 << 16));
-							S32 tmp24 = convertToDesiredEndianOrder32(sample24, pPvtData->audioEndian);
-							if (pPvtData->audioEndian == AVB_AUDIO_ENDIAN_BIG) {
-								memcpy(pData, (U8 *)&tmp24, 3);
-							} else {
-								memcpy(pData, ((U8 *)&tmp24) + 1, 3);
-							}
-							pData += 3;
-						} else if (pPvtData->audioBitDepth == 16) {
-							S16 sample16 = (S32)(value * 32000);
-							S16 tmp16 = convertToDesiredEndianOrder16(sample16, pPvtData->audioEndian);
-							memcpy(pData, (U8 *)&tmp16, 2);
-							pData += 2;
-						}
-					} else if (pPvtData->audioType == AVB_AUDIO_TYPE_FLOAT) {
-						U32 tmp32f;
-						// value *= .75; // attenuate value
-						memcpy((U8 *)&tmp32f, (U8 *)&value, 4);  // done so no warning with -Wstrict-aliasing
-						tmp32f = convertToDesiredEndianOrder32(tmp32f, pPvtData->audioEndian);
-						memcpy(pData, (U8 *)&tmp32f, 4);
-						pData += 4;
-					} else {
-						// CORE_TODO
-						AVB_LOG_ERROR("Audio sample size format not implemented yet for tone generator interface module");
+					pPvtData->jitterFifoReadIdx = (pPvtData->jitterFifoReadIdx + 1) % pPvtData->jitterFifoItemCount;
+					pPvtData->jitterFifoCount--;
+					pPvtData->jitterFifoConsumed++;
+					if (pPvtData->jitterFifoCount < pPvtData->jitterFifoLevelMin) {
+						pPvtData->jitterFifoLevelMin = pPvtData->jitterFifoCount;
 					}
+					if (pPvtData->jitterFifoCount > pPvtData->jitterFifoLevelMax) {
+						pPvtData->jitterFifoLevelMax = pPvtData->jitterFifoCount;
+					}
+					gotItem = TRUE;
+					pthread_cond_broadcast(&pPvtData->jitterFifoCond);
+				}
+				else if (pPvtData->jitterFifoPrefillDone && pPvtData->jitterFifoCount == 0) {
+					// Re-enter prefill mode after a complete drain to avoid bursty restart.
+					pPvtData->jitterFifoPrefillDone = FALSE;
+					pPvtData->jitterFifoUnderrun++;
+				}
+				pthread_mutex_unlock(&pPvtData->jitterFifoMutex);
+
+				if (gotItem) {
+					openavbMediaQHeadPush(pMediaQ);
+					xTonegenMaybeLogFifoStats(pPvtData);
+					AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
+					return TRUE;
 				}
 
-				if (pPvtData->fvChannels > 0) {
-					if (pPvtData->audioType == AVB_AUDIO_TYPE_INT) {
-						if (pPvtData->audioBitDepth == 32) {
-							if (pPvtData->fv1Enabled) {
-								S32 tmp32 = convertToDesiredEndianOrder32(pPvtData->fv1, pPvtData->audioEndian);
-								memcpy(pData, (U8 *)&tmp32, 4);
-								pData += 4;
-							}
-
-							if (pPvtData->fv2Enabled) {
-								S32 tmp32 = convertToDesiredEndianOrder32(pPvtData->fv2, pPvtData->audioEndian);
-								memcpy(pData, (U8 *)&tmp32, 4);
-								pData += 4;
-							}
-						}
-					}
-				}
+				openavbMediaQHeadUnlock(pMediaQ);
+				xTonegenMaybeLogFifoStats(pPvtData);
+				AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
+				return FALSE;
 			}
-			
-			pMediaQItem->dataLen = pPubMapUncmpAudioInfo->itemSize;
+			else {
+				U32 dataLen = 0;
+				U64 tsNs = 0;
+				if (!xTonegenGenerateItem(
+						pMediaQ,
+						pPvtData,
+						(U8 *)pMediaQItem->pPubData,
+						&dataLen,
+						&tsNs,
+						FALSE)) {
+					openavbMediaQHeadUnlock(pMediaQ);
+					AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
+					return FALSE;
+				}
 
-			if (!pPvtData->fixedTimestampEnabled) {
-				openavbAvtpTimeSetToWallTime(pMediaQItem->pAvtpTime);
-			} else {
-				openavbMcsAdvance(&pPvtData->mcs);
-				openavbAvtpTimeSetToTimestampNS(pMediaQItem->pAvtpTime, pPvtData->mcs.edgeTime);
+				pMediaQItem->dataLen = dataLen;
+				if (!pPvtData->fixedTimestampEnabled) {
+					openavbAvtpTimeSetToWallTime(pMediaQItem->pAvtpTime);
+				}
+				else {
+					openavbAvtpTimeSetToTimestampNS(pMediaQItem->pAvtpTime, tsNs);
+				}
+				openavbMediaQHeadPush(pMediaQ);
+				AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
+				return TRUE;
 			}
-
-			openavbMediaQHeadPush(pMediaQ);
-
-			AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
-			return TRUE;
 		}
 		else {
 			AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
@@ -619,6 +1083,14 @@ bool openavbIntfToneGenRxCB(media_q_t *pMediaQ)
 void openavbIntfToneGenEndCB(media_q_t *pMediaQ) 
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_INTF);
+	if (pMediaQ && pMediaQ->pPvtIntfInfo) {
+		pvt_data_t *pPvtData = pMediaQ->pPvtIntfInfo;
+		xTonegenFifoTeardown(pPvtData);
+		if (pPvtData->pMelodyString) {
+			free(pPvtData->pMelodyString);
+			pPvtData->pMelodyString = NULL;
+		}
+	}
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 }
 
@@ -699,8 +1171,22 @@ extern bool DLL_EXPORT openavbIntfToneGenInitialize(media_q_t *pMediaQ, openavb_
 		pPvtData->fv2 = 0;
 		pPvtData->fvChannels = 0;
 
-		pPvtData->fixedTimestampEnabled = false;
-	}
+			pPvtData->fixedTimestampEnabled = false;
+			pPvtData->runningFrameCnt = 0;
+
+			pPvtData->jitterFifoEnabled = TRUE;
+			pPvtData->jitterFifoItemCount = 64;
+			pPvtData->jitterFifoPrefillItems = 16;
+			pPvtData->jitterFifoLowWaterItems = 12;
+			pPvtData->jitterFifoHighWaterItems = 48;
+			pPvtData->jitterFifoLogIntervalSec = 5;
+			pPvtData->jitterFifoInitialized = FALSE;
+			pPvtData->jitterFifoThreadRunning = FALSE;
+			pPvtData->jitterFifoStopRequested = FALSE;
+			pPvtData->jitterFifoPrefillDone = FALSE;
+			pPvtData->pJitterFifoItems = NULL;
+			pPvtData->fifoTsRuntimeLeadUsec = 0;
+		}
 
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 	return TRUE;

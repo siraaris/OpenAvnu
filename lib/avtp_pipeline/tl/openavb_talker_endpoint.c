@@ -50,6 +50,43 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define	AVB_LOG_COMPONENT	"Talker"
 #include "openavb_log.h"
 
+static void updateTalkerStreamParamsFromEndpoint(openavb_tl_cfg_t *pCfg,
+		talker_data_t *pTalkerData,
+		AVBStreamID_t *streamID,
+		char *ifname,
+		U8 destAddr[],
+		U8 srClass,
+		U32 classRate,
+		U16 vlanID,
+		U8 priority,
+		U16 fwmark)
+{
+	// Save endpoint/SRP values for active streaming use.
+	if (!pCfg->ifname[0]) {
+		strncpy(pTalkerData->ifname, ifname, sizeof(pTalkerData->ifname) - 1);
+	}
+	else {
+		strncpy(pTalkerData->ifname, pCfg->ifname, sizeof(pTalkerData->ifname) - 1);
+	}
+	memcpy(&pTalkerData->streamID, streamID, sizeof(AVBStreamID_t));
+	memcpy(&pTalkerData->destAddr, destAddr, ETH_ALEN);
+	pTalkerData->srClass = srClass;
+	pTalkerData->classRate = classRate;
+	pTalkerData->vlanID = vlanID;
+	pTalkerData->vlanPCP = priority;
+	pTalkerData->fwmark = fwmark;
+
+	// Mirror into cfg as well so descriptor/AECP reads and AVDECC reconnect
+	// always use the latest endpoint-assigned stream identity and destination.
+	memcpy(pCfg->stream_addr.buffer.ether_addr_octet, streamID->addr, ETH_ALEN);
+	pCfg->stream_addr.mac = &(pCfg->stream_addr.buffer);
+	pCfg->stream_uid = streamID->uniqueID;
+	memcpy(pCfg->dest_addr.buffer.ether_addr_octet, destAddr, ETH_ALEN);
+	pCfg->dest_addr.mac = &(pCfg->dest_addr.buffer);
+	pCfg->sr_class = srClass;
+	pCfg->vlan_id = vlanID;
+}
+
 /* Talker callback comes from endpoint, to indicate when listeners
  * come and go. We may need to start or stop the talker thread.
  */
@@ -67,16 +104,22 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 	AVB_TRACE_ENTRY(AVB_TRACE_TL);
 
 	tl_state_t *pTLState = TLHandleListGet(endpointHandle);
-	talker_data_t *pTalkerData = pTLState->pPvtTalkerData;
-
 	if (!pTLState) {
 		AVB_LOG_WARNING("Unable to get talker from endpoint handle.");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
+		return;
+	}
+	talker_data_t *pTalkerData = pTLState->pPvtTalkerData;
+	if (!pTalkerData) {
+		AVB_LOG_WARNING("Talker private data unavailable for endpoint callback.");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return;
 	}
 
 	// If not a talker, ignore this callback.
 	if (pTLState->cfg.role != AVB_ROLE_TALKER) {
 		AVB_LOG_DEBUG("Ignoring Talker callback");
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return;
 	}
 
@@ -86,21 +129,13 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 
 	if (!pTLState->bStreaming) {
 		if (lsnrDecl == openavbSrp_LDSt_Ready
-			|| lsnrDecl == openavbSrp_LDSt_Ready_Failed) {
+			|| lsnrDecl == openavbSrp_LDSt_Ready_Failed
+			|| lsnrDecl == openavbSrp_LDSt_Asking_Failed) {
 
-			// Save the data provided by endpoint/SRP
-			if (!pCfg->ifname[0]) {
-				strncpy(pTalkerData->ifname, ifname, sizeof(pTalkerData->ifname) - 1);
-			} else {
-				strncpy(pTalkerData->ifname, pCfg->ifname, sizeof(pTalkerData->ifname) - 1);
-			}
-			memcpy(&pTalkerData->streamID, streamID, sizeof(AVBStreamID_t));
-			memcpy(&pTalkerData->destAddr, destAddr, ETH_ALEN);
-			pTalkerData->srClass = srClass;
-			pTalkerData->classRate = classRate;
-			pTalkerData->vlanID = vlanID;
-			pTalkerData->vlanPCP = priority;
-			pTalkerData->fwmark = fwmark;
+			updateTalkerStreamParamsFromEndpoint(
+				pCfg, pTalkerData, streamID, ifname, destAddr, srClass, classRate, vlanID, priority, fwmark);
+			AVB_LOGF_INFO("Talker stream params: uid=%u class=%c classRate=%u vlanID=%u pcp=%u fwmark=%u",
+				streamID->uniqueID, AVB_CLASS_LABEL(srClass), classRate, vlanID, priority, fwmark);
 
 			// We should start streaming
 			AVB_LOGF_INFO("Starting stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
@@ -108,23 +143,15 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 		}
 		else if (lsnrDecl == openavbSrp_LDSt_Stream_Info) {
 			// Stream information is available does NOT mean listener is ready. Stream not started yet.
-			if (!pCfg->ifname[0]) {
-				strncpy(pTalkerData->ifname, ifname, sizeof(pTalkerData->ifname) - 1);
-			} else {
-				strncpy(pTalkerData->ifname, pCfg->ifname, sizeof(pTalkerData->ifname) - 1);
-			}
-			memcpy(&pTalkerData->streamID, streamID, sizeof(AVBStreamID_t));
-			memcpy(&pTalkerData->destAddr, destAddr, ETH_ALEN);
-			pTalkerData->srClass = srClass;
-			pTalkerData->classRate = classRate;
-			pTalkerData->vlanID = vlanID;
-			pTalkerData->vlanPCP = priority;
-			pTalkerData->fwmark = fwmark;
+			updateTalkerStreamParamsFromEndpoint(
+				pCfg, pTalkerData, streamID, ifname, destAddr, srClass, classRate, vlanID, priority, fwmark);
+			AVB_LOGF_INFO("Talker stream info: uid=%u class=%c classRate=%u vlanID=%u pcp=%u fwmark=%u",
+				streamID->uniqueID, AVB_CLASS_LABEL(srClass), classRate, vlanID, priority, fwmark);
 		}
 	}
 	else {
-		if (lsnrDecl != openavbSrp_LDSt_Ready
-			&& lsnrDecl != openavbSrp_LDSt_Ready_Failed) {
+		if (lsnrDecl == openavbSrp_LDSt_None
+			|| lsnrDecl == openavbSrp_LDSt_Ignore) {
 			// Nobody is listening any more
 			AVB_LOGF_INFO("Stopping stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
 			talkerStopStream(pTLState);

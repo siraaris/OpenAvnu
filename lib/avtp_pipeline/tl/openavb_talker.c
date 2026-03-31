@@ -49,6 +49,21 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "openavb_debug.h"
 
+static inline void talkerSleepUntilWallTimeNS(U64 targetWallNs)
+{
+	while (1) {
+		U64 wallNowNs = 0;
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &wallNowNs);
+		if (wallNowNs >= targetWallNs) {
+			return;
+		}
+
+		U64 monoNowNs = 0;
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &monoNowNs);
+		SLEEP_UNTIL_NSEC(monoNowNs + (targetWallNs - wallNowNs));
+	}
+}
+
 
 
 bool talkerStartStream(tl_state_t *pTLState)
@@ -126,12 +141,31 @@ bool talkerStartStream(tl_state_t *pTLState)
 
 	// setup the initial times
 	U64 nowNS;
+	pTalkerData->useWallTimePacing = FALSE;
+#if IGB_LAUNCHTIME_ENABLED || ATL_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+	if (!pCfg->tx_blocking_in_intf) {
+		pTalkerData->useWallTimePacing = TRUE;
+	}
+#endif
 
-	if (!pCfg->spin_wait) {
-		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
-	} else {
+	bool useBusySpinTimebase = FALSE;
+	if (pCfg->spin_wait && !pTalkerData->useWallTimePacing) {
+#if !IGB_LAUNCHTIME_ENABLED && !ATL_LAUNCHTIME_ENABLED && !SOCKET_LAUNCHTIME_ENABLED
+		// Busy-spin wait path compares against WALLTIME.
+		useBusySpinTimebase = TRUE;
+#endif
+	}
+
+	if (pTalkerData->useWallTimePacing || useBusySpinTimebase) {
 		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
 	}
+	else {
+		// Sleep-based wait path uses CLOCK_MONOTONIC absolute deadlines.
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
+	}
+	AVB_LOGF_INFO(STREAMID_FORMAT", talker pacing base=%s",
+		STREAMID_ARGS(&pTalkerData->streamID),
+		pTalkerData->useWallTimePacing ? "gptp-walltime" : (useBusySpinTimebase ? "walltime-spin" : "monotonic"));
 
 	// Align clock : allows for some performance gain
 	nowNS = ((nowNS + (pTalkerData->intervalNS)) / pTalkerData->intervalNS) * pTalkerData->intervalNS;
@@ -143,9 +177,11 @@ bool talkerStartStream(tl_state_t *pTLState)
 
 	// Clear stats
 	openavbTalkerClearStats(pTLState);
+	pTalkerData->aecpCounters.stream_start++;
 
 	// we're good to go!
 	pTLState->bStreaming = TRUE;
+	openavbAvdeccMsgClntPublishCounters(pTLState);
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 	return TRUE;
@@ -162,6 +198,7 @@ void talkerStopStream(tl_state_t *pTLState)
 	}
 
 	talker_data_t *pTalkerData = pTLState->pPvtTalkerData;
+	openavb_avtp_diag_counters_t liveCounters;
 	if (!pTalkerData) {
 		AVB_LOG_ERROR("Invalid listener data");
 		AVB_TRACE_EXIT(AVB_TRACE_TL);
@@ -188,9 +225,14 @@ void talkerStopStream(tl_state_t *pTLState)
 		);
 
 	if (pTLState->bStreaming) {
+		openavbAvtpGetDiagCounters(pTalkerData->avtpHandle, &liveCounters);
+		openavbAvtpDiagCountersAccumulate(&pTalkerData->aecpCounters, &liveCounters);
+		pTalkerData->aecpCounters.stream_stop++;
 		openavbAvtpShutdownTalker(pTalkerData->avtpHandle);
+		pTalkerData->avtpHandle = NULL;
 		pTLState->bStreaming = FALSE;
 	}
+	openavbAvdeccMsgClntPublishCounters(pTLState);
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 }
@@ -213,6 +255,7 @@ static inline void talkerShowStats(talker_data_t *pTalkerData, tl_state_t *pTLSt
 
 	openavbTalkerAddStat(pTLState, TL_STAT_TX_LATE, late);
 	openavbTalkerAddStat(pTLState, TL_STAT_TX_BYTES, bytes);
+	openavbAvdeccMsgClntPublishCounters(pTLState);
 }
 
 static inline bool talkerDoStream(tl_state_t *pTLState)
@@ -231,15 +274,24 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 
 	if (pTLState->bStreaming) {
 		U64 nowNS;
+		bool usedBusySpin = FALSE;
 
 		if (!pCfg->tx_blocking_in_intf) {
 
-			if (!pCfg->spin_wait) {
+			if (pTalkerData->useWallTimePacing) {
+				talkerSleepUntilWallTimeNS(pTalkerData->nextCycleNS);
+			}
+			else if (!pCfg->spin_wait) {
 				// sleep until the next interval
 				SLEEP_UNTIL_NSEC(pTalkerData->nextCycleNS);
 			} else {
-#if !IGB_LAUNCHTIME_ENABLED && !ATL_LAUNCHTIME_ENABLED
+#if !IGB_LAUNCHTIME_ENABLED && !ATL_LAUNCHTIME_ENABLED && !SOCKET_LAUNCHTIME_ENABLED
 				SPIN_UNTIL_NSEC(pTalkerData->nextCycleNS);
+				usedBusySpin = TRUE;
+#else
+				// In launch-time builds, SPIN_UNTIL_NSEC is disabled. Keep
+				// pacing by sleeping to the cycle boundary.
+				SLEEP_UNTIL_NSEC(pTalkerData->nextCycleNS);
 #endif
 			}
 
@@ -248,9 +300,11 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 			// send the frames for this interval
 			int i;
 			for (i = pTalkerData->wakeFrames; i > 0; i--) {
+				// Keep going until the final iteration so pending batched frames
+				// are always given a chance to flush on i == 1.
 				if (IS_OPENAVB_SUCCESS(openavbAvtpTx(pTalkerData->avtpHandle, i == 1, pCfg->tx_blocking_in_intf)))
 					pTalkerData->cntFrames++;
-				else
+				else if (i == 1)
 					break;
 			}
 		}
@@ -260,7 +314,10 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 				pTalkerData->cntFrames++;
 		}
 
-		if (!pCfg->spin_wait) {
+		if (pTalkerData->useWallTimePacing) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
+		}
+		else if (!usedBusySpin) {
 			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
 		} else {
 			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
@@ -541,4 +598,3 @@ U64 openavbTalkerGetStat(tl_state_t *pTLState, tl_stat_t stat)
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 	return val;
 }
-

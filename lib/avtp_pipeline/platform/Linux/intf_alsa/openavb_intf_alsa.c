@@ -36,6 +36,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 #include "openavb_types_pub.h"
 #include "openavb_audio_pub.h"
 #include "openavb_trace_pub.h"
@@ -91,6 +92,8 @@ typedef struct {
 	/////////////
 	// Handle for the PCM device
 	snd_pcm_t *pcmHandle;
+	pthread_mutex_t pcmHandleMutex;
+	bool pcmHandleMutexInit;
 
 	// ALSA stream
 	snd_pcm_stream_t pcmStream;
@@ -106,7 +109,183 @@ typedef struct {
 
 	// Use Media Clock Synth module instead of timestamps taken during Tx callback
 	bool fixedTimestampEnabled;
+
+	// If non-zero, emit ALSA vs timestamp-domain drift stats every N seconds.
+	U32 driftLogIntervalSec;
+	bool driftMonitorStarted;
+	U64 driftStartTsNs;
+	U64 driftStartFrames;
+	U64 driftLastLogTsNs;
+	U64 driftLastLogFrames;
+	U64 driftFramesCaptured;
+
+	// Optional adaptive compensation based on measured ALSA-vs-AVTP drift.
+	bool driftCompEnable;
+	double driftCompGain;
+	S32 driftCompMaxStepSkewPPB;
+	S32 driftCompMinSkewPPB;
+	S32 driftCompMaxSkewPPB;
 } pvt_data_t;
+
+static bool x_lockPcmHandle(pvt_data_t *pPvtData, snd_pcm_t **ppPcmHandle)
+{
+	if (!pPvtData || !ppPcmHandle) {
+		return FALSE;
+	}
+
+	if (pPvtData->pcmHandleMutexInit) {
+		pthread_mutex_lock(&pPvtData->pcmHandleMutex);
+	}
+	*ppPcmHandle = pPvtData->pcmHandle;
+	if (!*ppPcmHandle) {
+		{ IF_LOG_INTERVAL(1000) AVB_LOG_DEBUG("ALSA pcmHandle unavailable; stream is stopping"); }
+		if (pPvtData->pcmHandleMutexInit) {
+			pthread_mutex_unlock(&pPvtData->pcmHandleMutex);
+		}
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static void x_unlockPcmHandle(pvt_data_t *pPvtData)
+{
+	if (pPvtData && pPvtData->pcmHandleMutexInit) {
+		pthread_mutex_unlock(&pPvtData->pcmHandleMutex);
+	}
+}
+
+static bool x_calcFixedTsParams(const pvt_data_t *pPvtData,
+								const media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo,
+								S32 skewEst,
+								U64 *pNsPerAdvance,
+								S32 *pCorrectionAmount,
+								U32 *pCorrectionInterval)
+{
+	if (!pPvtData || !pPubMapUncmpAudioInfo || !pNsPerAdvance || !pCorrectionAmount || !pCorrectionInterval) {
+		return FALSE;
+	}
+
+	if (pPvtData->audioRate == 0) {
+		return FALSE;
+	}
+
+	const S64 base = (S64)MICROSECONDS_PER_SECOND * (S64)pPubMapUncmpAudioInfo->framesPerItem * 10;
+	S64 per = base + (S64)(skewEst / 10);
+	const U32 rate = pPvtData->audioRate / 100;
+	if (rate == 0 || per <= 0) {
+		return FALSE;
+	}
+
+	U64 nsPerAdvance = (U64)(per / (S64)rate);
+	S64 rem = per % (S64)rate;
+	if (rem != 0) {
+		rem *= 10;
+		rem /= (S64)rate;
+	}
+
+	*pNsPerAdvance = nsPerAdvance;
+	*pCorrectionAmount = (S32)rem;
+	*pCorrectionInterval = 10;
+	return TRUE;
+}
+
+static bool x_applyFixedTsSkew(pvt_data_t *pPvtData,
+							   const media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo,
+							   S32 skewEst,
+							   bool resetPhase)
+{
+	U64 nsPerAdvance;
+	S32 correctionAmount;
+	U32 correctionInterval;
+
+	if (!x_calcFixedTsParams(pPvtData, pPubMapUncmpAudioInfo, skewEst, &nsPerAdvance, &correctionAmount, &correctionInterval)) {
+		return FALSE;
+	}
+
+	if (resetPhase || !pPvtData->mcs.firstTimeSet) {
+		openavbMcsInit(&pPvtData->mcs, nsPerAdvance, correctionAmount, correctionInterval);
+	}
+	else {
+		pPvtData->mcs.nsPerAdvance = nsPerAdvance;
+		pPvtData->mcs.correctionAmount = correctionAmount;
+		pPvtData->mcs.correctionInterval = correctionInterval;
+	}
+	return TRUE;
+}
+
+static void x_logTalkerDriftIfDue(media_q_t *pMediaQ, pvt_data_t *pPvtData, U64 tsNs, U32 framesAdded)
+{
+	if (!pMediaQ || !pPvtData || pPvtData->driftLogIntervalSec == 0 || pPvtData->audioRate == 0) {
+		return;
+	}
+
+	pPvtData->driftFramesCaptured += framesAdded;
+	if (!pPvtData->driftMonitorStarted) {
+		pPvtData->driftMonitorStarted = TRUE;
+		pPvtData->driftStartTsNs = tsNs;
+		pPvtData->driftStartFrames = pPvtData->driftFramesCaptured;
+		pPvtData->driftLastLogTsNs = tsNs;
+		pPvtData->driftLastLogFrames = pPvtData->driftFramesCaptured;
+		return;
+	}
+
+	const U64 intervalNs = (U64)pPvtData->driftLogIntervalSec * NANOSECONDS_PER_SECOND;
+	if (tsNs <= pPvtData->driftLastLogTsNs || (tsNs - pPvtData->driftLastLogTsNs) < intervalNs) {
+		return;
+	}
+
+	const U64 totalTsNs = tsNs - pPvtData->driftStartTsNs;
+	const U64 windowTsNs = tsNs - pPvtData->driftLastLogTsNs;
+	const U64 windowFrames = pPvtData->driftFramesCaptured - pPvtData->driftLastLogFrames;
+	if (totalTsNs == 0 || windowTsNs == 0) {
+		return;
+	}
+
+	const double mediaWindowNs = ((double)windowFrames * (double)NANOSECONDS_PER_SECOND) / (double)pPvtData->audioRate;
+	const double driftWindowNs = mediaWindowNs - (double)windowTsNs;
+	const double ppmWindow = (driftWindowNs * 1000000.0) / (double)windowTsNs;
+
+	// Optional adaptive compensation: update fixed timestamp skew using measured drift.
+	if (pPvtData->driftCompEnable && pPvtData->fixedTimestampEnabled) {
+		media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
+		if (pPubMapUncmpAudioInfo && pPubMapUncmpAudioInfo->framesPerItem > 0) {
+			S32 minSkew = pPvtData->driftCompMinSkewPPB;
+			S32 maxSkew = pPvtData->driftCompMaxSkewPPB;
+			if (minSkew > maxSkew) {
+				S32 tmp = minSkew;
+				minSkew = maxSkew;
+				maxSkew = tmp;
+			}
+
+			// For this MCS formulation, skew effect in ppm is approx -skew/(100*framesPerItem).
+			const double skewStepF = pPvtData->driftCompGain * ppmWindow * (100.0 * (double)pPubMapUncmpAudioInfo->framesPerItem);
+			S64 skewStep = (S64)((skewStepF >= 0.0) ? (skewStepF + 0.5) : (skewStepF - 0.5));
+			if (skewStep > pPvtData->driftCompMaxStepSkewPPB) {
+				skewStep = pPvtData->driftCompMaxStepSkewPPB;
+			}
+			if (skewStep < -pPvtData->driftCompMaxStepSkewPPB) {
+				skewStep = -pPvtData->driftCompMaxStepSkewPPB;
+			}
+
+			S64 newSkew = (S64)pPvtData->clockSkewPPB + skewStep;
+			if (newSkew > maxSkew) {
+				newSkew = maxSkew;
+			}
+			if (newSkew < minSkew) {
+				newSkew = minSkew;
+			}
+
+			if ((S32)newSkew != pPvtData->clockSkewPPB) {
+				pPvtData->clockSkewPPB = (S32)newSkew;
+				x_applyFixedTsSkew(pPvtData, pPubMapUncmpAudioInfo, pPvtData->clockSkewPPB, FALSE);
+			}
+		}
+	}
+
+	pPvtData->driftLastLogTsNs = tsNs;
+	pPvtData->driftLastLogFrames = pPvtData->driftFramesCaptured;
+}
 
 
 static snd_pcm_format_t x_AVBAudioFormatToAlsaFormat(avb_audio_type_t type,
@@ -395,7 +574,48 @@ void openavbIntfAlsaCfgCB(media_q_t *pMediaQ, const char *name, const char *valu
 			pPvtData->clockSkewPPB = strtol(value, &pEnd, 10);
 		}
 
-	}
+			else if (strcmp(name, "intf_nv_drift_log_interval_sec") == 0) {
+				tmp = strtol(value, &pEnd, 10);
+				if (*pEnd == '\0' && tmp >= 0) {
+					pPvtData->driftLogIntervalSec = (U32)tmp;
+				}
+			}
+
+			else if (strcmp(name, "intf_nv_drift_comp_enable") == 0) {
+				tmp = strtol(value, &pEnd, 10);
+				if (*pEnd == '\0') {
+					pPvtData->driftCompEnable = (tmp != 0);
+				}
+			}
+
+			else if (strcmp(name, "intf_nv_drift_comp_gain") == 0) {
+				double gain = strtod(value, &pEnd);
+				if (*pEnd == '\0' && gain >= 0.0) {
+					pPvtData->driftCompGain = gain;
+				}
+			}
+
+			else if (strcmp(name, "intf_nv_drift_comp_max_step_skew_ppb") == 0) {
+				tmp = strtol(value, &pEnd, 10);
+				if (*pEnd == '\0' && tmp >= 0) {
+					pPvtData->driftCompMaxStepSkewPPB = (S32)tmp;
+				}
+			}
+
+			else if (strcmp(name, "intf_nv_drift_comp_min_skew_ppb") == 0) {
+				tmp = strtol(value, &pEnd, 10);
+				if (*pEnd == '\0') {
+					pPvtData->driftCompMinSkewPPB = (S32)tmp;
+				}
+			}
+
+			else if (strcmp(name, "intf_nv_drift_comp_max_skew_ppb") == 0) {
+				tmp = strtol(value, &pEnd, 10);
+				if (*pEnd == '\0') {
+					pPvtData->driftCompMaxSkewPPB = (S32)tmp;
+				}
+			}
+			}
 
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 }
@@ -559,10 +779,17 @@ void openavbIntfAlsaTxInitCB(media_q_t *pMediaQ)
 		{
 			media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
 
+			pPvtData->driftMonitorStarted = FALSE;
+			pPvtData->driftStartTsNs = 0;
+			pPvtData->driftStartFrames = 0;
+			pPvtData->driftLastLogTsNs = 0;
+			pPvtData->driftLastLogFrames = 0;
+			pPvtData->driftFramesCaptured = 0;
+
 			AVB_LOGF_INFO("Finished ALSA Setup: packingFactor %d", pPubMapUncmpAudioInfo->packingFactor);
 		}
-	}
-	AVB_TRACE_EXIT(AVB_TRACE_INTF);
+		}
+		AVB_TRACE_EXIT(AVB_TRACE_INTF);
 }
 
 // This callback will be called for each AVB transmit interval.
@@ -577,6 +804,7 @@ bool openavbIntfAlsaTxCB(media_q_t *pMediaQ)
 		media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
 		pvt_data_t *pPvtData = pMediaQ->pPvtIntfInfo;
 		media_q_item_t *pMediaQItem = NULL;
+		snd_pcm_t *pcmHandle = NULL;
 		if (!pPvtData) {
 			AVB_LOG_ERROR("Private interface module data not allocated.");
 			AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
@@ -588,52 +816,61 @@ bool openavbIntfAlsaTxCB(media_q_t *pMediaQ)
 			return TRUE;
 		}
 
-		while (moreItems) {
-			pMediaQItem = openavbMediaQHeadLock(pMediaQ);
-			if (pMediaQItem) {
-				if (pMediaQItem->itemSize < pPubMapUncmpAudioInfo->itemSize) {
-					AVB_LOG_ERROR("Media queue item not large enough for samples");
-					AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
-					return FALSE;
-				}
+			while (moreItems) {
+				pMediaQItem = openavbMediaQHeadLock(pMediaQ);
+				if (pMediaQItem) {
+					if (pMediaQItem->itemSize < pPubMapUncmpAudioInfo->itemSize) {
+						AVB_LOG_ERROR("Media queue item not large enough for samples");
+						AVB_TRACE_EXIT(AVB_TRACE_INTF_DETAIL);
+						return FALSE;
+					}
 
-				rslt = snd_pcm_readi(pPvtData->pcmHandle, pMediaQItem->pPubData + pMediaQItem->dataLen, pPubMapUncmpAudioInfo->framesPerItem - (pMediaQItem->dataLen / pPubMapUncmpAudioInfo->itemFrameSizeBytes));
-
-				if (rslt < 0) {
-					switch(rslt) {
-					case -EPIPE:
-						AVB_LOGF_ERROR("snd_pcm_readi() error: %s", snd_strerror(rslt));
-						rslt = snd_pcm_recover(pPvtData->pcmHandle, rslt, 0);
-						if (rslt < 0) {
-							AVB_LOGF_ERROR("snd_pcm_recover: %s", snd_strerror(rslt));
-						}
-						break;
-					case -EAGAIN:
-						{ IF_LOG_INTERVAL(1000) AVB_LOG_DEBUG("snd_pcm_readi() had no data available"); }
-						break;
-					default:
-						AVB_LOGF_ERROR("Unhandled snd_pcm_readi() error: %s", snd_strerror(rslt));
+					if (!x_lockPcmHandle(pPvtData, &pcmHandle)) {
+						openavbMediaQHeadUnlock(pMediaQ);
+						moreItems = FALSE;
 						break;
 					}
+
+					rslt = snd_pcm_readi(pcmHandle, pMediaQItem->pPubData + pMediaQItem->dataLen, pPubMapUncmpAudioInfo->framesPerItem - (pMediaQItem->dataLen / pPubMapUncmpAudioInfo->itemFrameSizeBytes));
 
 					if (rslt < 0) {
-						openavbMediaQHeadUnlock(pMediaQ);
-						break;
-					}
-				}
+						switch(rslt) {
+						case -EPIPE:
+							AVB_LOGF_ERROR("snd_pcm_readi() error: %s", snd_strerror(rslt));
+							rslt = snd_pcm_recover(pcmHandle, rslt, 0);
+							if (rslt < 0) {
+								AVB_LOGF_ERROR("snd_pcm_recover: %s", snd_strerror(rslt));
+							}
+							break;
+						case -EAGAIN:
+							{ IF_LOG_INTERVAL(1000) AVB_LOG_DEBUG("snd_pcm_readi() had no data available"); }
+							break;
+						default:
+							AVB_LOGF_ERROR("Unhandled snd_pcm_readi() error: %s", snd_strerror(rslt));
+							break;
+						}
 
-				pMediaQItem->dataLen += rslt * pPubMapUncmpAudioInfo->itemFrameSizeBytes;
-				if (pMediaQItem->dataLen != pPubMapUncmpAudioInfo->itemSize) {
-					openavbMediaQHeadUnlock(pMediaQ);
-				}
-				else {
-					// Always get the timestamp.  Protocols such as AAF can choose to ignore them if not needed.
-					if (!pPvtData->fixedTimestampEnabled) {
+						if (rslt < 0) {
+							x_unlockPcmHandle(pPvtData);
+							openavbMediaQHeadUnlock(pMediaQ);
+							break;
+						}
+					}
+					x_unlockPcmHandle(pPvtData);
+
+					pMediaQItem->dataLen += rslt * pPubMapUncmpAudioInfo->itemFrameSizeBytes;
+					if (pMediaQItem->dataLen != pPubMapUncmpAudioInfo->itemSize) {
+						openavbMediaQHeadUnlock(pMediaQ);
+					}
+					else {
+						// Always get the timestamp.  Protocols such as AAF can choose to ignore them if not needed.
+						if (!pPvtData->fixedTimestampEnabled) {
 						openavbAvtpTimeSetToWallTime(pMediaQItem->pAvtpTime);
 					} else {
 						openavbMcsAdvance(&pPvtData->mcs);
 						openavbAvtpTimeSetToTimestampNS(pMediaQItem->pAvtpTime, pPvtData->mcs.edgeTime);
 					}
+					x_logTalkerDriftIfDue(pMediaQ, pPvtData, openavbAvtpTimeGetAvtpTimeNS(pMediaQItem->pAvtpTime), pPubMapUncmpAudioInfo->framesPerItem);
 					openavbMediaQHeadPush(pMediaQ);
 				}
 			}
@@ -985,16 +1222,24 @@ bool openavbIntfAlsaRxCB(media_q_t *pMediaQ)
 			if (pMediaQItem) {
 				if (pMediaQItem->dataLen) {
 					S32 rslt;
+					snd_pcm_t *pcmHandle = NULL;
 
-					rslt = snd_pcm_writei(pPvtData->pcmHandle, pMediaQItem->pPubData, pPubMapUncmpAudioInfo->framesPerItem);
+					if (!x_lockPcmHandle(pPvtData, &pcmHandle)) {
+						openavbMediaQTailPull(pMediaQ);
+						moreItems = FALSE;
+						break;
+					}
+
+					rslt = snd_pcm_writei(pcmHandle, pMediaQItem->pPubData, pPubMapUncmpAudioInfo->framesPerItem);
 					if (rslt < 0) {
 						AVB_LOGF_ERROR("snd_pcm_writei: %s", snd_strerror(rslt));
-						rslt = snd_pcm_recover(pPvtData->pcmHandle, rslt, 0);
+						rslt = snd_pcm_recover(pcmHandle, rslt, 0);
 						if (rslt < 0) {
 							AVB_LOGF_ERROR("snd_pcm_recover: %s", snd_strerror(rslt));
 						}
-						rslt = snd_pcm_writei(pPvtData->pcmHandle, pMediaQItem->pPubData, pPubMapUncmpAudioInfo->framesPerItem);
+						rslt = snd_pcm_writei(pcmHandle, pMediaQItem->pPubData, pPubMapUncmpAudioInfo->framesPerItem);
 					}
+					x_unlockPcmHandle(pPvtData);
 					if (rslt != pPubMapUncmpAudioInfo->framesPerItem) {
 						AVB_LOGF_WARNING("Not all pcm data consumed written:%u  consumed:%u", pMediaQItem->dataLen, rslt * pPubMapUncmpAudioInfo->audioChannels);
 					}
@@ -1031,14 +1276,20 @@ void openavbIntfAlsaEndCB(media_q_t *pMediaQ)
 			return;
 		}
 
+		if (pPvtData->pcmHandleMutexInit) {
+			pthread_mutex_lock(&pPvtData->pcmHandleMutex);
+		}
 		if (pPvtData->pcmHandle) {
 			snd_pcm_close(pPvtData->pcmHandle);
 			pPvtData->pcmHandle = NULL;
 
 #if 0
-			// Optional call when using Valgrind to stop reports of memory leaks.
-			snd_config_update_free_global();
+		// Optional call when using Valgrind to stop reports of memory leaks.
+		snd_config_update_free_global();
 #endif
+		}
+		if (pPvtData->pcmHandleMutexInit) {
+			pthread_mutex_unlock(&pPvtData->pcmHandleMutex);
 		}
 	}
 
@@ -1048,34 +1299,37 @@ void openavbIntfAlsaEndCB(media_q_t *pMediaQ)
 void openavbIntfAlsaGenEndCB(media_q_t *pMediaQ)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_INTF);
+	if (pMediaQ && pMediaQ->pPvtIntfInfo) {
+		pvt_data_t *pPvtData = pMediaQ->pPvtIntfInfo;
+		if (pPvtData->pcmHandleMutexInit) {
+			pthread_mutex_destroy(&pPvtData->pcmHandleMutex);
+			pPvtData->pcmHandleMutexInit = FALSE;
+		}
+	}
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 }
 
 void openavbIntfAlsaEnableFixedTimestamp(media_q_t *pMediaQ, bool enabled, U32 transmitInterval, U32 batchFactor)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_INTF);
+	(void)transmitInterval;
+	(void)batchFactor;
 	if (pMediaQ && pMediaQ->pPvtIntfInfo && pMediaQ->pPubMapInfo) {
 		media_q_pub_map_uncmp_audio_info_t *pPubMapUncmpAudioInfo = pMediaQ->pPubMapInfo;
 		pvt_data_t *pPvtData = (pvt_data_t *)pMediaQ->pPvtIntfInfo;
 
 		pPvtData->fixedTimestampEnabled = enabled;
 		if (pPvtData->fixedTimestampEnabled) {
-			U32 per, rate, rem;
-			S32 skewEst = pPvtData->clockSkewPPB;
-			/* Ignore passed in transmit interval and use framesPerItem and audioRate so
-			   we work with both AAF and 61883-6 */
-			/* Carefully scale values to avoid U32 overflow or loss of precision */
-			per = MICROSECONDS_PER_SECOND * pPubMapUncmpAudioInfo->framesPerItem * 10;
-			per += (skewEst/10);
-			rate = pPvtData->audioRate/100;
-			transmitInterval = per/rate;
-			rem = per % rate;
-			if (rem != 0) {
-				rem *= 10;
-				rem /= rate;
+			if (x_applyFixedTsSkew(pPvtData, pPubMapUncmpAudioInfo, pPvtData->clockSkewPPB, TRUE)) {
+				AVB_LOGF_INFO("Fixed timestamping enabled: %" PRIu64 " %d/%d skew=%d",
+							  pPvtData->mcs.nsPerAdvance,
+							  pPvtData->mcs.correctionAmount,
+							  pPvtData->mcs.correctionInterval,
+							  pPvtData->clockSkewPPB);
 			}
-			openavbMcsInit(&pPvtData->mcs, transmitInterval, rem, 10);
-			AVB_LOGF_INFO("Fixed timestamping enabled: %d %d/%d", transmitInterval, rem, 10);
+			else {
+				AVB_LOG_ERROR("Failed to initialize fixed timestamping parameters");
+			}
 		}
 
 	}
@@ -1109,16 +1363,31 @@ extern DLL_EXPORT bool openavbIntfAlsaInitialize(media_q_t *pMediaQ, openavb_int
 		pIntfCB->intf_gen_end_cb = openavbIntfAlsaGenEndCB;
 		pIntfCB->intf_enable_fixed_timestamp = openavbIntfAlsaEnableFixedTimestamp;
 
-		pPvtData->ignoreTimestamp = FALSE;
-		pPvtData->pDeviceName = strdup(PCM_DEVICE_NAME_DEFAULT);
-		pPvtData->allowResampling = TRUE;
-		pPvtData->intervalCounter = 0;
-		pPvtData->startThresholdPeriods = 2;	// Default to 2 periods of frames as the start threshold
-		pPvtData->periodTimeUsec = 100000;
+			pPvtData->ignoreTimestamp = FALSE;
+			pPvtData->pDeviceName = strdup(PCM_DEVICE_NAME_DEFAULT);
+			pPvtData->allowResampling = TRUE;
+			pPvtData->intervalCounter = 0;
+			pPvtData->startThresholdPeriods = 2;	// Default to 2 periods of frames as the start threshold
+			pPvtData->periodTimeUsec = 100000;
 
-		pPvtData->fixedTimestampEnabled = FALSE;
-		pPvtData->clockSkewPPB = 0;
-	}
+			pPvtData->fixedTimestampEnabled = FALSE;
+			pPvtData->clockSkewPPB = 0;
+			pPvtData->driftLogIntervalSec = 0;
+			pPvtData->driftCompEnable = FALSE;
+			pPvtData->driftCompGain = 0.25;
+			pPvtData->driftCompMaxStepSkewPPB = 50000;
+			pPvtData->driftCompMinSkewPPB = -2000000;
+			pPvtData->driftCompMaxSkewPPB = 2000000;
+			if (pthread_mutex_init(&pPvtData->pcmHandleMutex, NULL) != 0) {
+				AVB_LOG_ERROR("Failed to initialize ALSA pcmHandle mutex");
+				free(pPvtData->pDeviceName);
+				free(pPvtData);
+				pMediaQ->pPvtIntfInfo = NULL;
+				AVB_TRACE_EXIT(AVB_TRACE_INTF);
+				return FALSE;
+			}
+			pPvtData->pcmHandleMutexInit = TRUE;
+		}
 
 	AVB_TRACE_EXIT(AVB_TRACE_INTF);
 	return TRUE;

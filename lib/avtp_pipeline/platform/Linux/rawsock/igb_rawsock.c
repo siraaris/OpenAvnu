@@ -35,11 +35,14 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "avb.h"
 #include "openavb_igb.h"
 #include "avb_sched.h"
+#include <inttypes.h>
 
 #include "openavb_trace.h"
 
 #define	AVB_LOG_COMPONENT	"Raw Socket"
 #include "openavb_log.h"
+
+#define IGB_TX_DIAG_LOG_EVERY 50000U
 
 #if IGB_LAUNCHTIME_ENABLED
 // needed for gptplocaltime()
@@ -77,6 +80,12 @@ void *igbRawsockOpen(igb_rawsock_t* rawsock, const char *ifname, bool rx_mode, b
 
 		// select class B queue by default
 		rawsock->queue = 1;
+		rawsock->txDebugLogCount = 0;
+		rawsock->txDiagPackets = 0;
+		rawsock->txDiagBytes = 0;
+		rawsock->txDiagErrors = 0;
+		rawsock->txLastMark = -1;
+		AVB_LOGF_INFO("IGB rawsock open: if=%s default_queue=%d", ifname, rawsock->queue);
 	}
 
 	// fill virtual functions table
@@ -128,6 +137,8 @@ bool igbRawsockTxSetMark(void *pvRawsock, int mark)
 		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 		return FALSE;
 	}
+	rawsock->txLastMark = mark;
+	AVB_LOGF_INFO("IGB tx mark set: mark=%d class=%d queue=%d", mark, fwmarkClass, rawsock->queue);
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 	return TRUE;
@@ -213,7 +224,22 @@ bool igbRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len, U64 
 
 	err = igb_xmit(rawsock->igb_dev, rawsock->queue, rawsock->tx_packet);
 	if (err) {
+		rawsock->txDiagErrors++;
 		AVB_LOGF_ERROR("igb_xmit failed: %s", strerror(err));
+	}
+	else {
+		rawsock->txDiagPackets++;
+		rawsock->txDiagBytes += len;
+		rawsock->txDebugLogCount++;
+		if (rawsock->txDebugLogCount >= IGB_TX_DIAG_LOG_EVERY) {
+			rawsock->txDebugLogCount = 0;
+			AVB_LOGF_INFO("IGB TX DIAG: queue=%d mark=%d packets=%" PRIu64 " bytes=%" PRIu64 " errors=%" PRIu64,
+					rawsock->queue,
+					rawsock->txLastMark,
+					rawsock->txDiagPackets,
+					rawsock->txDiagBytes,
+					rawsock->txDiagErrors);
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
@@ -270,4 +296,3 @@ unsigned long igbRawsockGetTXOutOfBuffersCyclic(void *pvRawsock)
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK);
 	return counter;
 }
-

@@ -94,6 +94,7 @@ static void openavbIniCfgInit(openavb_tl_data_cfg_t *pCfg)
 	pCfg->spin_wait = FALSE;
 	pCfg->thread_rt_priority = 0;
 	pCfg->thread_affinity = 0xFFFFFFFF;
+	pCfg->map_tx_rate = 0;
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 }
@@ -387,6 +388,13 @@ static int openavbIniCfgCallback(void *user, const char *tlSection, const char *
 		strncpy(pCfg->map_fn,value,sizeof(pCfg->map_fn)-1);
 		valOK = TRUE;
 	}
+	else if (MATCH(name, "map_nv_tx_rate") || MATCH(name, "map_nv_tx_interval")) {
+		errno = 0;
+		pCfg->map_tx_rate = strtol(value, &pEnd, 10);
+		if (*pEnd == '\0' && errno == 0 && pCfg->map_tx_rate > 0 && pCfg->map_tx_rate <= UINT32_MAX) {
+			valOK = TRUE;
+		}
+	}
 
 	else {
 		// Ignored item.
@@ -436,6 +444,41 @@ bool openavbReadTlDataIniFile(const char *fileName, openavb_tl_data_cfg_t *pCfg)
 		AVB_LOGF_ERROR("Error in INI file: %s, line %d", fileName, result);
 		AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 		return FALSE;
+	}
+
+	// For a Talker, use the adapter MAC Address as the stream address when one was not supplied.
+	if (pCfg->role == AVB_ROLE_TALKER &&
+	    (!pCfg->stream_addr.mac || memcmp(pCfg->stream_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
+	{
+		// Use the AVDECC network interface MAC as the talker stream source.
+		if (memcmp(gAvdeccCfg.ifmac, "\x00\x00\x00\x00\x00\x00", ETH_ALEN) != 0) {
+			memcpy(pCfg->stream_addr.buffer.ether_addr_octet, gAvdeccCfg.ifmac, ETH_ALEN);
+			pCfg->stream_addr.mac = &(pCfg->stream_addr.buffer);
+		}
+
+		if (!pCfg->stream_addr.mac || memcmp(pCfg->stream_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+			AVB_LOG_ERROR("stream_addr required, but not specified.");
+			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+			return FALSE;
+		}
+		AVB_LOGF_INFO("No stream_addr specified; defaulting to " ETH_FORMAT,
+			ETH_OCTETS(pCfg->stream_addr.buffer.ether_addr_octet));
+	}
+
+	// For talkers, ensure we always expose a non-zero destination multicast
+	// address to controllers even when the INI omits dest_addr.
+	if (pCfg->role == AVB_ROLE_TALKER &&
+		(!pCfg->dest_addr.mac ||
+		 memcmp(pCfg->dest_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
+	{
+		U8 defaultDest[ETH_ALEN] = {0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x80};
+		if (pCfg->stream_uid != 0xFFFF) {
+			defaultDest[5] = (U8)(0x80 + (pCfg->stream_uid & 0x7f));
+		}
+		memcpy(pCfg->dest_addr.buffer.ether_addr_octet, defaultDest, ETH_ALEN);
+		pCfg->dest_addr.mac = &(pCfg->dest_addr.buffer);
+		AVB_LOGF_INFO("No dest_addr specified; defaulting to " ETH_FORMAT,
+			ETH_OCTETS(pCfg->dest_addr.buffer.ether_addr_octet));
 	}
 
 	if (pCfg->current_sampling_rate != 0 && pCfg->audioRate != 0 &&

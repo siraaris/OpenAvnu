@@ -123,12 +123,37 @@ bool openavbAvdeccMsgServerOpen(void)
 	serverAddr.sun_family = AF_UNIX;
 	snprintf(serverAddr.sun_path, UNIX_PATH_MAX, AVB_AVDECC_MSG_UNIX_PATH);
 
-	// try remove old socket
-	if (unlink(serverAddr.sun_path) == -1 && errno != ENOENT) {
-		AVB_LOGF_ERROR("Failed to remove %s: %s", serverAddr.sun_path, strerror(errno));
+	int rslt = bind(lsock, (struct sockaddr*)&serverAddr, sizeof(struct sockaddr_un));
+	if (rslt != 0 && errno == EADDRINUSE) {
+		// Determine if the existing socket belongs to an active AVDECC Msg server.
+		// If active, do not steal the path by unlinking.
+		int probeSock = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (probeSock < 0) {
+			AVB_LOGF_ERROR("Failed to probe existing %s: %s", serverAddr.sun_path, strerror(errno));
+			goto error;
+		}
+
+		int probeRslt = connect(probeSock, (struct sockaddr*)&serverAddr, sizeof(struct sockaddr_un));
+		int probeErrno = errno;
+		close(probeSock);
+
+		if (probeRslt == 0) {
+			AVB_LOGF_ERROR("Active AVDECC Msg server already running on %s", serverAddr.sun_path);
+			goto error;
+		}
+		if (probeErrno != ECONNREFUSED && probeErrno != ENOENT) {
+			AVB_LOGF_ERROR("Failed to probe existing %s: %s", serverAddr.sun_path, strerror(probeErrno));
+			goto error;
+		}
+
+		// Stale socket path, remove and retry bind.
+		if (unlink(serverAddr.sun_path) == -1 && errno != ENOENT) {
+			AVB_LOGF_ERROR("Failed to remove stale socket %s: %s", serverAddr.sun_path, strerror(errno));
+			goto error;
+		}
+		rslt = bind(lsock, (struct sockaddr*)&serverAddr, sizeof(struct sockaddr_un));
 	}
 
-	int rslt = bind(lsock, (struct sockaddr*)&serverAddr, sizeof(struct sockaddr_un));
 	if (rslt != 0) {
 		AVB_LOGF_ERROR("Failed to create %s: %s", serverAddr.sun_path, strerror(errno));
 		AVB_LOG_WARNING("** If AVDECC Msg process crashed, run the cleanup script **");

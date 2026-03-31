@@ -40,16 +40,56 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 #include "openavb_platform.h"
 #include "openavb_types.h"
 #include "openavb_trace.h"
 #include "openavb_avtp.h"
+#include "openavb_avtp_time_pub.h"
 #include "openavb_rawsock.h"
 #include "openavb_mediaq.h"
 
 #define	AVB_LOG_COMPONENT	"AVTP"
 #include "openavb_log.h"
+
+#define AVTP_V0_HEADER_SIZE 12
+
+#if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+static bool avtpCalcLaunchTimeFromTimestamp(avtp_stream_t *pStream, const U8 *pAvtpFrame, U64 *launchTimeNsec, U64 *timestampTimeNsec)
+{
+	if (!pStream || !pAvtpFrame || !launchTimeNsec) {
+		return FALSE;
+	}
+
+	// TV (timestamp valid) bit is LSB of byte 1 in AVTP v0 header.
+	if ((pAvtpFrame[1] & 0x01) == 0) {
+		return FALSE;
+	}
+
+	U32 avtpTs;
+	memcpy(&avtpTs, pAvtpFrame + AVTP_V0_HEADER_SIZE, sizeof(avtpTs));
+	avtpTs = ntohl(avtpTs);
+
+	avtp_time_t tmp = {0};
+	openavbAvtpTimeSetToTimestamp(&tmp, avtpTs);
+	if (!tmp.bTimestampValid) {
+		return FALSE;
+	}
+
+	U64 launchNs = tmp.timeNsec;
+	U64 transitNs = pStream->max_transit_usec * 1000ULL;
+	if (launchNs > transitNs) {
+		launchNs -= transitNs;
+	}
+
+	if (timestampTimeNsec) {
+		*timestampTimeNsec = tmp.timeNsec;
+	}
+	*launchTimeNsec = launchNs;
+	return TRUE;
+}
+#endif
 
 // Maximum time that AVTP RX/TX calls should block before returning
 #define AVTP_MAX_BLOCK_USEC (1 * MICROSECONDS_PER_SECOND)
@@ -108,6 +148,29 @@ static void processTimestampEval(avtp_stream_t *pStream, U8 *pHdr)
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVTP_DETAIL);
+}
+
+static void openavbAvtpCountLateEarlyTimestamp(avtp_stream_t *pStream, U32 avtpTimestamp, bool timestampValid, bool timestampUncertain)
+{
+	avtp_time_t avtpTime;
+	S32 deltaUsec;
+
+	if (!pStream || !timestampValid || timestampUncertain) {
+		return;
+	}
+
+	memset(&avtpTime, 0, sizeof(avtpTime));
+	openavbAvtpTimeSetToTimestamp(&avtpTime, avtpTimestamp);
+	openavbAvtpTimeSetTimestampValid(&avtpTime, TRUE);
+	openavbAvtpTimeSetTimestampUncertain(&avtpTime, FALSE);
+
+	deltaUsec = openavbAvtpTimeUsecDelta(&avtpTime);
+	if (deltaUsec < 0) {
+		pStream->diag.late_timestamp++;
+	}
+	else if (deltaUsec > (S32)MICROSECONDS_PER_SECOND) {
+		pStream->diag.early_timestamp++;
+	}
 }
 
 
@@ -271,8 +334,7 @@ static openavbRC fillAvtpHdr(avtp_stream_t *pStream, U8 *pFill)
 			// - 1 bit		r (reserved)				= 0
 			// - 1 bit		gv (gateway valid)			= 0
 			// - 1 bit		tv (timestamp valid)		= 1
-			// TODO: set mr correctly
-			*pFill++ = 0x81;
+			*pFill++ = (pStream->media_restart_toggle ? 0x89 : 0x81);
 			// - 8 bits		sequence num				= increments with each frame
 			*pFill++ = pStream->avtp_sequence_num;
 			// - 7 bits		reserved					= 0;
@@ -331,12 +393,19 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 			// Call interface module to read data
 			pStream->pIntfCB->intf_tx_cb(pStream->pMediaQ);
 
-#if IGB_LAUNCHTIME_ENABLED
-			// lets get unmodified timestamp from mediaq item about to be sent by mapping
-			media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
-			if (item) {
-				timeNsec = item->pAvtpTime->timeNsec;
-				openavbMediaQTailUnlock(pStream->pMediaQ);
+#if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+			// Prefer mapping-provided launch time when available (e.g. CRF),
+			// otherwise use the media queue timestamp.
+			bool haveLaunchTime = FALSE;
+			if (pStream->pMapCB->map_lt_calc_cb) {
+				haveLaunchTime = pStream->pMapCB->map_lt_calc_cb(pStream->pMediaQ, &timeNsec);
+			}
+			if (!haveLaunchTime) {
+				media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
+				if (item) {
+					timeNsec = item->pAvtpTime->timeNsec;
+					openavbMediaQTailUnlock(pStream->pMediaQ);
+				}
 			}
 #elif ATL_LAUNCHTIME_ENABLED
 			if( pStream->pMapCB->map_lt_calc_cb ) {
@@ -351,12 +420,17 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 		}
 		else {
 
-#if IGB_LAUNCHTIME_ENABLED
-			// lets get unmodified timestamp from mediaq item about to be sent by mapping
-			media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
-			if (item) {
-				timeNsec = item->pAvtpTime->timeNsec;
-				openavbMediaQTailUnlock(pStream->pMediaQ);
+#if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+			bool haveLaunchTime = FALSE;
+			if (pStream->pMapCB->map_lt_calc_cb) {
+				haveLaunchTime = pStream->pMapCB->map_lt_calc_cb(pStream->pMediaQ, &timeNsec);
+			}
+			if (!haveLaunchTime) {
+				media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
+				if (item) {
+					timeNsec = item->pAvtpTime->timeNsec;
+					openavbMediaQTailUnlock(pStream->pMediaQ);
+				}
 			}
 #elif ATL_LAUNCHTIME_ENABLED
 			if( pStream->pMapCB->map_lt_calc_cb ) {
@@ -377,15 +451,74 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 		// If we got data from the mapping module and stream is not paused,
 		// notify the raw sockets.
 		if (txCBResult != TX_CB_RET_PACKET_NOT_READY && !pStream->bPause) {
+			bool txTimestampValid = (pAvtpFrame[HIDX_AVTP_HIDE7_TV1] & 0x01) ? TRUE : FALSE;
+			bool txTimestampUncertain = (pAvtpFrame[HIDX_AVTP_HIDE7_TU1] & 0x01) ? TRUE : FALSE;
 
 			if (pStream->tsEval) {
 				processTimestampEval(pStream, pAvtpFrame);
 			}
 
+			pStream->diag.frames_tx++;
+			if (txTimestampValid) {
+				pStream->diag.timestamp_valid++;
+			}
+			else {
+				pStream->diag.timestamp_not_valid++;
+			}
+			if (pStream->tx_tu_valid && pStream->tx_last_tu != txTimestampUncertain) {
+				pStream->diag.timestamp_uncertain++;
+			}
+			pStream->tx_tu_valid = TRUE;
+			pStream->tx_last_tu = txTimestampUncertain;
+
 			// Increment the sequence number now that we are sure this is a good packet.
 			pStream->avtp_sequence_num++;
 			// Mark the frame "ready to send".
+			#if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+				{
+					U64 launchTimeNs = timeNsec;
+					U64 tsTimeNs = 0;
+					bool haveMapLaunchTime = FALSE;
+
+				if (pStream->pMapCB->map_lt_calc_cb) {
+					haveMapLaunchTime = pStream->pMapCB->map_lt_calc_cb(pStream->pMediaQ, &launchTimeNs);
+				}
+
+					if (!haveMapLaunchTime) {
+						if (!avtpCalcLaunchTimeFromTimestamp(pStream, pAvtpFrame, &launchTimeNs, &tsTimeNs)) {
+							media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
+							if (item) {
+								launchTimeNs = item->pAvtpTime->timeNsec;
+								openavbMediaQTailUnlock(pStream->pMediaQ);
+							}
+						}
+					}
+
+					{
+						U64 nowNs = 0;
+						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+
+						// Guard against pathological launch targets (seconds behind/ahead of wall clock)
+						// after scheduling stalls. Rebase to a bounded lead to avoid bursts of early/late packets.
+						U64 safeLeadNs = pStream->max_transit_usec * 1000ULL;
+						if (safeLeadNs < 200000ULL) {
+							safeLeadNs = 200000ULL;     // 0.2 ms minimum lead
+						}
+						if (safeLeadNs > 20000000ULL) {
+							safeLeadNs = 20000000ULL;   // 20 ms maximum lead
+						}
+
+						int64_t deltaLaunchNs = (int64_t)(launchTimeNs - nowNs);
+						if (deltaLaunchNs < -5000000LL || deltaLaunchNs > ((int64_t)safeLeadNs + 50000000LL)) {
+							launchTimeNs = nowNs + safeLeadNs;
+							deltaLaunchNs = (int64_t)(launchTimeNs - nowNs);
+						}
+					}
+					openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, launchTimeNs);
+				}
+			#else
 			openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, timeNsec);
+			#endif
 			// Send if requested
 			if (bSend)
 				openavbRawsockSend(pStream->rawsock);
@@ -393,6 +526,21 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 			pStream->pBuf = NULL;
 		}
 		else {
+			// If this cycle didn't produce a packet, release any checked-out TX buffer.
+			// This prevents buffersOut drifting ahead of buffersReady when batching.
+			if (pStream->pBuf) {
+				(void)openavbRawsockRelTxFrame(pStream->rawsock, pStream->pBuf);
+				pStream->pBuf = NULL;
+			}
+
+			// End-of-cycle flush: if prior frames were queued in this wake, send them now
+			// even when the last map callback reported packet-not-ready.
+			if (bSend) {
+				int pending = openavbRawsockTxBufLevel(pStream->rawsock);
+				if (pending > 0) {
+					(void)openavbRawsockSend(pStream->rawsock);
+				}
+			}
 			AVB_RC_TRACE_RET(OPENAVB_AVTP_FAILURE, AVB_TRACE_AVTP_DETAIL);
 		}
 	}
@@ -493,6 +641,16 @@ static void x_avtpRxFrame(avtp_stream_t *pStream, U8 *pFrame, U32 frameLen)
 
 		// Check AVTPDU version, BZ 106
 		if (0 == avtpVersion) {
+			bool mediaRestart;
+			bool timestampValid;
+			bool timestampUncertain;
+			U32 avtpTimestamp;
+
+			if (subtype != pStream->subtype) {
+				pStream->diag.unsupported_format++;
+				AVB_TRACE_EXIT(AVB_TRACE_AVTP_DETAIL);
+				return;
+			}
 
 			rxSeq = *pRead++;
 
@@ -506,12 +664,40 @@ static void x_avtpRxFrame(avtp_stream_t *pStream, U8 *pFrame, U32 frameLen)
 				AVB_LOGF_INFO("AVTP sequence mismatch: expected: %3u,\tgot: %3u,\tlost %3d",
 					pStream->avtp_sequence_num, rxSeq, nLost);
 				pStream->nLost += nLost;
+				pStream->diag.seq_num_mismatch++;
 			}
 			pStream->avtp_sequence_num = rxSeq + 1;
 
 			pStream->bytes += frameLen;
 
 			flags2 = *pRead++;
+			mediaRestart = (flags & 0x08) ? TRUE : FALSE;
+			timestampValid = (flags & 0x01) ? TRUE : FALSE;
+			timestampUncertain = (flags2 & 0x01) ? TRUE : FALSE;
+			avtpTimestamp = ntohl(*(U32 *)(&pFrame[HIDX_AVTP_TIMESPAMP32]));
+
+			pStream->diag.frames_rx++;
+			if (timestampValid) {
+				pStream->diag.timestamp_valid++;
+			}
+			else {
+				pStream->diag.timestamp_not_valid++;
+			}
+			if (pStream->rx_mr_valid && pStream->rx_last_mr != mediaRestart) {
+				pStream->diag.media_reset++;
+			}
+			pStream->rx_mr_valid = TRUE;
+			pStream->rx_last_mr = mediaRestart;
+			if (pStream->rx_tu_valid && pStream->rx_last_tu != timestampUncertain) {
+				pStream->diag.timestamp_uncertain++;
+			}
+			pStream->rx_tu_valid = TRUE;
+			pStream->rx_last_tu = timestampUncertain;
+			openavbAvtpCountLateEarlyTimestamp(
+				pStream,
+				avtpTimestamp,
+				timestampValid,
+				timestampUncertain);
 			IF_LOG_INTERVAL(4096) AVB_LOGF_DEBUG("subtype=%u, sv=%u, ver=%u, mr=%u, tv=%u tu=%u",
 				subtype, flags & 0x80, avtpVersion,
 				flags & 0x08, flags & 0x01, flags2 & 0x01);
@@ -635,6 +821,9 @@ int openavbAvtpLost(void *pv)
 	}
 	int count = pStream->nLost;
 	pStream->nLost = 0;
+	if (count < 0) {
+		return 0;
+	}
 	return count;
 }
 
@@ -649,6 +838,22 @@ U64 openavbAvtpBytes(void *pv)
 	U64 bytes = pStream->bytes;
 	pStream->bytes = 0;
 	return bytes;
+}
+
+void openavbAvtpGetDiagCounters(void *pv, openavb_avtp_diag_counters_t *pCounters)
+{
+	avtp_stream_t *pStream = (avtp_stream_t *)pv;
+
+	if (!pCounters) {
+		return;
+	}
+
+	memset(pCounters, 0, sizeof(*pCounters));
+	if (!pStream) {
+		return;
+	}
+
+	*pCounters = pStream->diag;
 }
 
 openavbRC openavbAvtpRx(void *pv)
@@ -707,6 +912,24 @@ void openavbAvtpPause(void *handle, bool bPause)
 	pStream->bPause = bPause;
 
 	// AVDECC_TODO:  Do something with the bPause value!
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVTP);
+}
+
+void openavbAvtpRequestMediaRestart(void *handle)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVTP);
+
+	avtp_stream_t *pStream = (avtp_stream_t *)handle;
+	if (!pStream) {
+		AVB_RC_LOG(AVB_RC(OPENAVB_AVTP_FAILURE | OPENAVB_RC_INVALID_ARGUMENT));
+		AVB_TRACE_EXIT(AVB_TRACE_AVTP);
+		return;
+	}
+
+	pStream->media_restart_toggle = !pStream->media_restart_toggle;
+	pStream->diag.media_reset++;
+	AVB_LOGF_INFO("AVTP media restart toggled: mr=%u", pStream->media_restart_toggle ? 1 : 0);
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVTP);
 }

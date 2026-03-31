@@ -34,6 +34,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <ctype.h>
 #include <string.h>
 #include <glib.h>
+#include <arpa/inet.h>
 #include "./openavb_rawsock.h"
 #include "openavb_log.h"
 
@@ -53,6 +54,16 @@ static int txRate = 8000;
 static int chunkSize = 1;
 static int reportSec = 1;
 static int mode = RAWSOCK_TX_MODE_FILL;
+static char *dst = NULL;
+static char *src = NULL;
+static int vlan = -1;
+static int pcp = 3;
+static int mark = -1;
+
+static U8 gDstMac[ETH_ALEN];
+static U8 gSrcMac[ETH_ALEN];
+static bool gHaveDst = FALSE;
+static bool gHaveSrc = FALSE;
 
 static GOptionEntry entries[] =
 {
@@ -63,8 +74,29 @@ static GOptionEntry entries[] =
   { "chunk",     'c', 0, G_OPTION_ARG_INT,    &chunkSize, "Chunk size",                               "CHUNKSIZE" },
   { "rptsec",    's', 0, G_OPTION_ARG_INT,    &reportSec, "report interval in seconds",               "RPTSEC" },
   { "mode",      'm', 0, G_OPTION_ARG_INT,    &mode,      "mode: 0 = fill, 1 = sequence number",      "MODE" },
+  { "dst",       'd', 0, G_OPTION_ARG_STRING, &dst,       "destination MAC (aa:bb:cc:dd:ee:ff)",      "MAC" },
+  { "src",       'S', 0, G_OPTION_ARG_STRING, &src,       "source MAC (aa:bb:cc:dd:ee:ff)",           "MAC" },
+  { "vlan",      'v', 0, G_OPTION_ARG_INT,    &vlan,      "VLAN ID (0-4094), -1 disables tagging",     "VID" },
+  { "pcp",       'p', 0, G_OPTION_ARG_INT,    &pcp,       "VLAN PCP (0-7)",                            "PCP" },
+  { "mark",      'k', 0, G_OPTION_ARG_INT,    &mark,      "fwmark value for queue selection",          "MARK" },
   { NULL }
 };
+
+static bool parseMac(const char *txt, U8 out[ETH_ALEN])
+{
+	unsigned int v[ETH_ALEN];
+	if (!txt) {
+		return FALSE;
+	}
+	if (sscanf(txt, "%02x:%02x:%02x:%02x:%02x:%02x",
+			&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != ETH_ALEN) {
+		return FALSE;
+	}
+	for (int i = 0; i < ETH_ALEN; i++) {
+		out[i] = (U8)v[i];
+	}
+	return TRUE;
+}
 
 void dumpAscii(U8 *pFrame, int i, int *j)
 {
@@ -141,6 +173,24 @@ int main(int argc, char* argv[])
 		printf("error: must specify network interface and ethertype\n");
 		exit(2);
 	}
+	if (vlan > 4094 || vlan < -1) {
+		printf("error: invalid VLAN ID %d\n", vlan);
+		exit(2);
+	}
+	if (pcp < 0 || pcp > 7) {
+		printf("error: invalid PCP %d\n", pcp);
+		exit(2);
+	}
+	if (dst && !parseMac(dst, gDstMac)) {
+		printf("error: invalid destination MAC '%s'\n", dst);
+		exit(2);
+	}
+	if (src && !parseMac(src, gSrcMac)) {
+		printf("error: invalid source MAC '%s'\n", src);
+		exit(2);
+	}
+	gHaveDst = (dst != NULL);
+	gHaveSrc = (src != NULL);
 
 	void* rs = openavbRawsockOpen(interface, FALSE, TRUE, ethertype, 0, MAX_NUM_FRAMES);
 	if (!rs) {
@@ -155,7 +205,26 @@ int main(int argc, char* argv[])
 	avbLogInit();
 
 	memset(&hdr, 0, sizeof(hdr_info_t));
+	hdr.ethertype = ethertype;
+	if (gHaveDst) {
+		hdr.dhost = gDstMac;
+	}
+	if (gHaveSrc) {
+		hdr.shost = gSrcMac;
+	}
+	if (vlan >= 0) {
+		hdr.vlan = TRUE;
+		hdr.vlan_vid = vlan;
+		hdr.vlan_pcp = (U8)pcp;
+	}
 	openavbRawsockTxSetHdr(rs, &hdr);
+	if (mark >= 0) {
+		if (!openavbRawsockTxSetMark(rs, mark)) {
+			printf("warning: openavbRawsockTxSetMark(%d) failed\n", mark);
+		}
+	}
+	printf("TX config: if=%s ethertype=0x%x vlan=%d pcp=%d mark=%d rate=%d len=%d\n",
+		interface, ethertype, vlan, pcp, mark, txRate, txlen);
 
 	struct timespec now;
 	static U64 packetIntervalNSec = 0;

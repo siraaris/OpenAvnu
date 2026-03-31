@@ -35,6 +35,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "pcap_rawsock.h"
 #include "simple_rawsock.h"
 #include "openavb_trace.h"
+#include <errno.h>
+#include <poll.h>
 
 #define	AVB_LOG_COMPONENT	"Raw Socket"
 #include "openavb_log.h"
@@ -65,8 +67,53 @@ static pcap_t* open_pcap_dev(const char* ifname, int frameSize, char* errbuf)
 
 		err = pcap_activate(handle);
 		if (err) AVB_LOGF_WARNING("Cannot activate pcap %d", err);
+
+		err = pcap_setnonblock(handle, 1, errbuf);
+		if (err) AVB_LOGF_WARNING("Cannot set non-blocking mode: %s", errbuf);
 	}
 	return handle;
+}
+
+static bool pcapWaitForReadable(pcap_t *handle, U32 timeoutUsec)
+{
+	int fd = pcap_get_selectable_fd(handle);
+	if (fd < 0) {
+		// Fallback path handled by pcap_next_ex retry loop.
+		return TRUE;
+	}
+
+	int timeoutMsec;
+	if (timeoutUsec == (U32)OPENAVB_RAWSOCK_BLOCK) {
+		timeoutMsec = -1;
+	}
+	else if (timeoutUsec == OPENAVB_RAWSOCK_NONBLOCK) {
+		timeoutMsec = 0;
+	}
+	else {
+		// Round up to avoid an unintended 0ms poll for tiny usec values.
+		timeoutMsec = (int)((timeoutUsec + 999U) / 1000U);
+	}
+
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLIN | POLLPRI;
+	pfd.revents = 0;
+
+	int ret;
+	do {
+		ret = poll(&pfd, 1, timeoutMsec);
+	}
+	while (ret < 0 && errno == EINTR);
+
+	if (ret <= 0) {
+		return FALSE;
+	}
+	if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		IF_LOG_INTERVAL(1000) AVB_LOGF_WARNING("pcap poll returned error revents=0x%x", pfd.revents);
+		return FALSE;
+	}
+
+	return ((pfd.revents & (POLLIN | POLLPRI)) != 0);
 }
 
 // Open a rawsock for TX or RX
@@ -183,27 +230,49 @@ U8 *pcapRawsockGetRxFrame(void *pvRawsock, U32 timeout, unsigned int *offset, un
 
 	rawsock->rxHeader = 0;
 	const u_char *packet = 0;
-	int ret;
+	int ret = 0;
+	U32 waitedUsec = 0;
+	const U32 pollStepUsec = 1000;
 
 	if (rawsock) {
-		ret = pcap_next_ex(rawsock->handle, &rawsock->rxHeader, &packet);
-		switch(ret) {
-		case 1:
-			*offset = 0;
-			*len = rawsock->rxHeader->caplen;
-			return (U8*)packet;
-		case -1:
-			AVB_LOGF_ERROR("pcap_next_ex failed: %s", pcap_geterr(rawsock->handle));
-			break;
-		case 0:
-			// timeout;
-			break;
-		case -2:
-			// no packets to be read from savefile
-			// this should not happened
-			break;
-		default:
-			break;
+		if (!pcapWaitForReadable(rawsock->handle, timeout)) {
+			return NULL;
+		}
+
+		while (TRUE) {
+			ret = pcap_next_ex(rawsock->handle, &rawsock->rxHeader, &packet);
+			switch(ret) {
+			case 1:
+				*offset = 0;
+				*len = rawsock->rxHeader->caplen;
+				return (U8*)packet;
+			case -1:
+				AVB_LOGF_ERROR("pcap_next_ex failed: %s", pcap_geterr(rawsock->handle));
+				return NULL;
+			case -2:
+				// no packets to be read from savefile
+				// this should not happened
+				return NULL;
+			case 0:
+			default:
+				// No packet available yet.
+				if (timeout == OPENAVB_RAWSOCK_NONBLOCK) {
+					return NULL;
+				}
+				if (timeout != (U32)OPENAVB_RAWSOCK_BLOCK && waitedUsec >= timeout) {
+					return NULL;
+				}
+
+				SLEEP_MSEC(1);
+				if (timeout != (U32)OPENAVB_RAWSOCK_BLOCK) {
+					U32 nextWait = pollStepUsec;
+					if (timeout - waitedUsec < pollStepUsec) {
+						nextWait = timeout - waitedUsec;
+					}
+					waitedUsec += nextWait;
+				}
+				break;
+			}
 		}
 	}
 

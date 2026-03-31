@@ -58,6 +58,7 @@ bool bRunning = TRUE;
 extern bool openavbMapPipeInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
 extern bool openavbMapAVTPAudioInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
 extern bool openavbMapCtrlInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
+extern bool openavbMapCrfInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
 extern bool openavbMapH264Initialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
 extern bool openavbMapMjpegInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
 extern bool openavbMapMpeg2tsInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
@@ -74,6 +75,7 @@ extern bool openavbIntfViewerInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *p
 
 // Linux interface modules
 extern bool openavbIntfAlsaInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
+extern bool openavbIntfBus32SplitInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 extern bool openavbIntfMpeg2tsFileInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 extern bool openavbIntfWavFileInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 #ifdef AVB_FEATURE_GSTREAMER
@@ -200,6 +202,7 @@ int main(int argc, char *argv[])
 	registerStaticMapModule(openavbMapPipeInitialize);
 	registerStaticMapModule(openavbMapAVTPAudioInitialize);
 	registerStaticMapModule(openavbMapCtrlInitialize);
+	registerStaticMapModule(openavbMapCrfInitialize);
 	registerStaticMapModule(openavbMapH264Initialize);
 	registerStaticMapModule(openavbMapMjpegInitialize);
 	registerStaticMapModule(openavbMapMpeg2tsInitialize);
@@ -213,6 +216,7 @@ int main(int argc, char *argv[])
 	registerStaticIntfModule(openavbIntfToneGenInitialize);
 	registerStaticIntfModule(openavbIntfViewerInitialize);
 	registerStaticIntfModule(openavbIntfAlsaInitialize);
+	registerStaticIntfModule(openavbIntfBus32SplitInitialize);
 	registerStaticIntfModule(openavbIntfMpeg2tsFileInitialize);
 	registerStaticIntfModule(openavbIntfWavFileInitialize);
 #ifdef AVB_FEATURE_GSTREAMER

@@ -30,6 +30,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 *************************************************************************************************************/
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <linux/ptp_clock.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -52,6 +53,52 @@ static bool bInitialized = FALSE;
 static int gPtpShmFd = -1;
 static char *gPtpMmap = NULL;
 gPtpTimeData gPtpTD;
+
+#define GPTP_WALLTIME_HOLDOVER_ENTER_NS (5000000ULL)
+#define GPTP_WALLTIME_HOLDOVER_EXIT_NS  (1000000ULL)
+#define GPTP_WALLTIME_RECOVERY_DEBOUNCE_NS (500000000ULL)
+
+typedef struct {
+	bool valid;
+	bool holdoverActive;
+	U64 lastReturnedNs;
+	U64 lastMonotonicNs;
+	U64 holdoverCount;
+} openavb_walltime_holdover_t;
+
+static __thread openavb_walltime_holdover_t gWalltimeHoldover = {0};
+static U32 gWalltimeRecoveryGeneration = 0;
+static U64 gWalltimeRecoveryLastMonoNs = 0;
+
+static U32 x_noteWalltimeRecoveryEvent(U64 monoNow)
+{
+	U32 generation;
+
+	LOCK();
+	if (gWalltimeRecoveryLastMonoNs == 0 ||
+			monoNow < gWalltimeRecoveryLastMonoNs ||
+			(monoNow - gWalltimeRecoveryLastMonoNs) > GPTP_WALLTIME_RECOVERY_DEBOUNCE_NS) {
+		gWalltimeRecoveryGeneration++;
+		gWalltimeRecoveryLastMonoNs = monoNow;
+	}
+	generation = gWalltimeRecoveryGeneration;
+	UNLOCK();
+
+	return generation;
+}
+
+static bool x_getMonotonicTime(U64 *timeNsec)
+{
+	struct timespec ts;
+	if (!timeNsec) {
+		return FALSE;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return FALSE;
+	}
+	*timeNsec = ((U64)ts.tv_sec * NANOSECONDS_PER_SECOND) + (U64)ts.tv_nsec;
+	return TRUE;
+}
 
 static bool x_timeInit(void) {
 	AVB_TRACE_ENTRY(AVB_TRACE_TIME);
@@ -79,7 +126,21 @@ static bool x_timeInit(void) {
 static bool x_getPTPTime(U64 *timeNsec) {
 	AVB_TRACE_ENTRY(AVB_TRACE_TIME);
 
+	U64 monoNow = 0;
+	bool haveMonoNow = x_getMonotonicTime(&monoNow);
+
 	if (gptpgetdata(gPtpMmap, &gPtpTD) < 0) {
+		if (gWalltimeHoldover.valid && haveMonoNow) {
+			U64 projectedNs = gWalltimeHoldover.lastReturnedNs;
+			if (monoNow >= gWalltimeHoldover.lastMonotonicNs) {
+				projectedNs += (monoNow - gWalltimeHoldover.lastMonotonicNs);
+			}
+			gWalltimeHoldover.lastReturnedNs = projectedNs;
+			gWalltimeHoldover.lastMonotonicNs = monoNow;
+			*timeNsec = projectedNs;
+			AVB_TRACE_EXIT(AVB_TRACE_TIME);
+			return TRUE;
+		}
 		AVB_LOG_ERROR("GPTP data fetch failed");
 		AVB_TRACE_EXIT(AVB_TRACE_TIME);
 		return FALSE;
@@ -94,8 +155,72 @@ static bool x_getPTPTime(U64 *timeNsec) {
 		update_8021as = gPtpTD.local_time - gPtpTD.ml_phoffset;
 		delta_local = now_local - gPtpTD.local_time;
 		delta_8021as = gPtpTD.ml_freqoffset * delta_local;
-		*timeNsec = update_8021as + delta_8021as;
+		U64 rawTimeNs = update_8021as + delta_8021as;
+		U64 filteredTimeNs = rawTimeNs;
 
+		if (haveMonoNow) {
+			if (!gWalltimeHoldover.valid) {
+				gWalltimeHoldover.valid = TRUE;
+			}
+			else {
+				U64 projectedNs = gWalltimeHoldover.lastReturnedNs;
+				if (monoNow >= gWalltimeHoldover.lastMonotonicNs) {
+					projectedNs += (monoNow - gWalltimeHoldover.lastMonotonicNs);
+				}
+
+				S64 wallErrNs = (rawTimeNs >= projectedNs)
+					? (S64)(rawTimeNs - projectedNs)
+					: -((S64)(projectedNs - rawTimeNs));
+				U64 absWallErrNs = (U64)llabs(wallErrNs);
+
+				if (gWalltimeHoldover.holdoverActive) {
+					if (absWallErrNs <= GPTP_WALLTIME_HOLDOVER_EXIT_NS) {
+						gWalltimeHoldover.holdoverActive = FALSE;
+						AVB_LOGF_WARNING(
+							"GPTP walltime holdover recovered: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " holds=%" PRIu64,
+							rawTimeNs,
+							projectedNs,
+							wallErrNs,
+							gWalltimeHoldover.holdoverCount);
+						filteredTimeNs = rawTimeNs;
+					}
+					else {
+						filteredTimeNs = projectedNs;
+					}
+				}
+				else if (absWallErrNs > GPTP_WALLTIME_HOLDOVER_ENTER_NS) {
+					U32 recoveryGeneration = x_noteWalltimeRecoveryEvent(monoNow);
+					gWalltimeHoldover.holdoverActive = TRUE;
+					gWalltimeHoldover.holdoverCount++;
+					filteredTimeNs = projectedNs;
+					AVB_LOGF_WARNING(
+						"GPTP walltime discontinuity detected: raw=%" PRIu64 " projected=%" PRIu64 " err=%" PRId64 " hold=%" PRIu64 " generation=%u",
+						rawTimeNs,
+						projectedNs,
+						wallErrNs,
+						gWalltimeHoldover.holdoverCount,
+						recoveryGeneration);
+				}
+			}
+
+			gWalltimeHoldover.lastReturnedNs = filteredTimeNs;
+			gWalltimeHoldover.lastMonotonicNs = monoNow;
+		}
+
+		*timeNsec = filteredTimeNs;
+
+		AVB_TRACE_EXIT(AVB_TRACE_TIME);
+		return TRUE;
+	}
+
+	if (gWalltimeHoldover.valid && haveMonoNow) {
+		U64 projectedNs = gWalltimeHoldover.lastReturnedNs;
+		if (monoNow >= gWalltimeHoldover.lastMonotonicNs) {
+			projectedNs += (monoNow - gWalltimeHoldover.lastMonotonicNs);
+		}
+		gWalltimeHoldover.lastReturnedNs = projectedNs;
+		gWalltimeHoldover.lastMonotonicNs = monoNow;
+		*timeNsec = projectedNs;
 		AVB_TRACE_EXIT(AVB_TRACE_TIME);
 		return TRUE;
 	}
@@ -195,3 +320,13 @@ bool osalClockGettime64(openavb_clockId_t openavbClockId, U64 *timeNsec) {
 	return FALSE;
 }
 
+U32 osalClockGetWalltimeRecoveryGeneration(void)
+{
+	U32 generation;
+
+	LOCK();
+	generation = gWalltimeRecoveryGeneration;
+	UNLOCK();
+
+	return generation;
+}

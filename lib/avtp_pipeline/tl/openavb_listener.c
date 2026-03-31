@@ -51,6 +51,31 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "openavb_debug.h"
 
+#define LISTENER_EMPTY_RX_BACKOFF_THRESHOLD 64U
+#define LISTENER_EMPTY_RX_BACKOFF_MAX_MSEC 5U
+
+static void listenerLockStream(listener_data_t *pListenerData)
+{
+	if (!pListenerData) {
+		return;
+	}
+
+	MUTEX_CREATE_ERR();
+	MUTEX_LOCK(pListenerData->streamMutex);
+	MUTEX_LOG_ERR("Mutex lock failure");
+}
+
+static void listenerUnlockStream(listener_data_t *pListenerData)
+{
+	if (!pListenerData) {
+		return;
+	}
+
+	MUTEX_CREATE_ERR();
+	MUTEX_UNLOCK(pListenerData->streamMutex);
+	MUTEX_LOG_ERR("Mutex unlock failure");
+}
+
 bool listenerStartStream(tl_state_t *pTLState)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_TL);
@@ -61,10 +86,16 @@ bool listenerStartStream(tl_state_t *pTLState)
 		return FALSE;
 	}
 
-	assert(!pTLState->bStreaming);
-
 	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
 	listener_data_t *pListenerData = pTLState->pPvtListenerData;
+	bool started = FALSE;
+
+	listenerLockStream(pListenerData);
+	if (pTLState->bStreaming || pListenerData->avtpHandle) {
+		listenerUnlockStream(pListenerData);
+		AVB_TRACE_EXIT(AVB_TRACE_TL);
+		return TRUE;
+	}
 
 	openavbRC rc = openavbAvtpRxInit(pTLState->pMediaQ,
 		&pCfg->map_cb,
@@ -77,9 +108,15 @@ bool listenerStartStream(tl_state_t *pTLState)
 		&pListenerData->avtpHandle);
 	if (IS_OPENAVB_FAILURE(rc)) {
 		AVB_LOG_ERROR("Failed to create AVTP stream");
+		listenerUnlockStream(pListenerData);
 		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return FALSE;
 	}
+
+	AVB_LOGF_INFO("Listener RX config: if=%s stream=" STREAMID_FORMAT " dest=" ETH_FORMAT,
+		pListenerData->ifname,
+		STREAMID_ARGS(&pListenerData->streamID),
+		ETH_OCTETS(pListenerData->destAddr));
 
 	// Setup timers
 	U64 nowNS;
@@ -91,15 +128,24 @@ bool listenerStartStream(tl_state_t *pTLState)
 	// Clear counters
 	pListenerData->nReportCalls = 0;
 	pListenerData->nReportFrames = 0;
+	pListenerData->emptyRxStreak = 0;
 
 	// Clear stats
 	openavbListenerClearStats(pTLState);
+	// Keep Milan media lock counters aligned to logical lock state even if
+	// the listener is internally restarted while remaining bound.
+	if (pListenerData->aecpCounters.media_locked <= pListenerData->aecpCounters.media_unlocked) {
+		pListenerData->aecpCounters.media_locked = pListenerData->aecpCounters.media_unlocked + 1;
+	}
 
 	// we're good to go!
 	pTLState->bStreaming = TRUE;
+	started = TRUE;
+	listenerUnlockStream(pListenerData);
+	openavbAvdeccMsgClntPublishCounters(pTLState);
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
-	return TRUE;
+	return started;
 }
 
 void listenerStopStream(tl_state_t *pTLState)
@@ -113,27 +159,41 @@ void listenerStopStream(tl_state_t *pTLState)
 	}
 
 	listener_data_t *pListenerData = pTLState->pPvtListenerData;
+	openavb_avtp_diag_counters_t liveCounters;
+	bool stopped = FALSE;
 	if (!pListenerData) {
 		AVB_LOG_ERROR("Invalid listener data");
 		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return;
 	}
 
-	openavbListenerAddStat(pTLState, TL_STAT_RX_CALLS, pListenerData->nReportCalls);
-	openavbListenerAddStat(pTLState, TL_STAT_RX_FRAMES, pListenerData->nReportFrames);
-	openavbListenerAddStat(pTLState, TL_STAT_RX_LOST, openavbAvtpLost(pListenerData->avtpHandle));
-	openavbListenerAddStat(pTLState, TL_STAT_RX_BYTES, openavbAvtpBytes(pListenerData->avtpHandle));
+	listenerLockStream(pListenerData);
+	if (pTLState->bStreaming && pListenerData->avtpHandle) {
+		openavbListenerAddStat(pTLState, TL_STAT_RX_CALLS, pListenerData->nReportCalls);
+		openavbListenerAddStat(pTLState, TL_STAT_RX_FRAMES, pListenerData->nReportFrames);
+		openavbListenerAddStat(pTLState, TL_STAT_RX_LOST, openavbAvtpLost(pListenerData->avtpHandle));
+		openavbListenerAddStat(pTLState, TL_STAT_RX_BYTES, openavbAvtpBytes(pListenerData->avtpHandle));
 
-	AVB_LOGF_INFO("RX "STREAMID_FORMAT", Totals: calls=%" PRIu64 ", frames=%" PRIu64 ", lost=%" PRIu64 ", bytes=%" PRIu64,
-		STREAMID_ARGS(&pListenerData->streamID),
-		openavbListenerGetStat(pTLState, TL_STAT_RX_CALLS),
-		openavbListenerGetStat(pTLState, TL_STAT_RX_FRAMES),
-		openavbListenerGetStat(pTLState, TL_STAT_RX_LOST),
-		openavbListenerGetStat(pTLState, TL_STAT_RX_BYTES));
+		AVB_LOGF_INFO("RX "STREAMID_FORMAT", Totals: calls=%" PRIu64 ", frames=%" PRIu64 ", lost=%" PRIu64 ", bytes=%" PRIu64,
+			STREAMID_ARGS(&pListenerData->streamID),
+			openavbListenerGetStat(pTLState, TL_STAT_RX_CALLS),
+			openavbListenerGetStat(pTLState, TL_STAT_RX_FRAMES),
+			openavbListenerGetStat(pTLState, TL_STAT_RX_LOST),
+			openavbListenerGetStat(pTLState, TL_STAT_RX_BYTES));
 
-	if (pTLState->bStreaming) {
-		openavbAvtpShutdownListener(pListenerData->avtpHandle);
+		openavbAvtpGetDiagCounters(pListenerData->avtpHandle, &liveCounters);
+		openavbAvtpDiagCountersAccumulate(&pListenerData->aecpCounters, &liveCounters);
+		if (pListenerData->aecpCounters.media_unlocked < pListenerData->aecpCounters.media_locked) {
+			pListenerData->aecpCounters.media_unlocked = pListenerData->aecpCounters.media_locked;
+		}
 		pTLState->bStreaming = FALSE;
+		openavbAvtpShutdownListener(pListenerData->avtpHandle);
+		pListenerData->avtpHandle = NULL;
+		stopped = TRUE;
+	}
+	listenerUnlockStream(pListenerData);
+	if (stopped) {
+		openavbAvdeccMsgClntPublishCounters(pTLState);
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
@@ -173,15 +233,43 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
 	listener_data_t *pListenerData = pTLState->pPvtListenerData;
 	bool bRet = FALSE;
+	bool publishCounters = FALSE;
 
 	if (pTLState->bStreaming) {
 		U64 nowNS;
+		void *avtpHandle;
 
+		listenerLockStream(pListenerData);
+		if (!pTLState->bStreaming || !pListenerData->avtpHandle) {
+			listenerUnlockStream(pListenerData);
+			SLEEP_MSEC(1);
+			AVB_TRACE_EXIT(AVB_TRACE_TL);
+			return TRUE;
+		}
+		avtpHandle = pListenerData->avtpHandle;
 		pListenerData->nReportCalls++;
 
 		// Try to receive a frame
-		if (IS_OPENAVB_SUCCESS(openavbAvtpRx(pListenerData->avtpHandle))) {
+		openavbRC rxRc = openavbAvtpRx(avtpHandle);
+		if (IS_OPENAVB_SUCCESS(rxRc)) {
 			pListenerData->nReportFrames++;
+			pListenerData->emptyRxStreak = 0;
+		}
+		else if ((rxRc & OPENAVB_RC_MODULE_MASK) == OPENAVB_MODULE_AVTP &&
+				 (rxRc & OPENAVB_RC_CODE_MASK) == OPENAVBAVTP_RC_NO_FRAMES_PROCESSED) {
+			if (pListenerData->emptyRxStreak < 0xFFFFFFFFU) {
+				pListenerData->emptyRxStreak++;
+			}
+			if (pListenerData->emptyRxStreak >= LISTENER_EMPTY_RX_BACKOFF_THRESHOLD) {
+				U32 backoffMsec = pListenerData->emptyRxStreak / LISTENER_EMPTY_RX_BACKOFF_THRESHOLD;
+				if (backoffMsec > LISTENER_EMPTY_RX_BACKOFF_MAX_MSEC) {
+					backoffMsec = LISTENER_EMPTY_RX_BACKOFF_MAX_MSEC;
+				}
+				SLEEP_MSEC(backoffMsec);
+			}
+		}
+		else {
+			pListenerData->emptyRxStreak = 0;
 		}
 
 		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
@@ -189,6 +277,7 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 		if (pCfg->report_seconds > 0) {
 			if (nowNS > pListenerData->nextReportNS) {
 				listenerShowStats(pListenerData, pTLState);
+				publishCounters = TRUE;
 
 				openavbListenerAddStat(pTLState, TL_STAT_RX_CALLS, pListenerData->nReportCalls);
 				openavbListenerAddStat(pTLState, TL_STAT_RX_FRAMES, pListenerData->nReportFrames);
@@ -200,6 +289,7 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 		} else if (pCfg->report_frames > 0 && pListenerData->nReportFrames != pListenerData->lastReportFrames) {
 			if (pListenerData->nReportFrames % pCfg->report_frames == 1) {
 				listenerShowStats(pListenerData, pTLState);
+				publishCounters = TRUE;
 				pListenerData->lastReportFrames = pListenerData->nReportFrames;
 			}
 		}
@@ -207,6 +297,10 @@ static inline bool listenerDoStream(tl_state_t *pTLState)
 		if (nowNS > pListenerData->nextSecondNS) {
 			pListenerData->nextSecondNS += NANOSECONDS_PER_SECOND;
 			bRet = TRUE;
+		}
+		listenerUnlockStream(pListenerData);
+		if (publishCounters) {
+			openavbAvdeccMsgClntPublishCounters(pTLState);
 		}
 	}
 	else {
@@ -237,12 +331,32 @@ void openavbTLRunListener(tl_state_t *pTLState)
 		return;
 	}
 
+	// Create stream mutex immediately so AVDECC counter/state callbacks can safely use it.
+	{
+		MUTEX_ATTR_HANDLE(mta);
+		MUTEX_ATTR_INIT(mta);
+		MUTEX_ATTR_SET_TYPE(mta, MUTEX_ATTR_TYPE_DEFAULT);
+		MUTEX_ATTR_SET_NAME(mta, "TLListenerStreamMutex");
+		MUTEX_CREATE_ERR();
+		MUTEX_CREATE(((listener_data_t *)pTLState->pPvtListenerData)->streamMutex, mta);
+		MUTEX_LOG_ERR("Could not create/initialize 'TLListenerStreamMutex' mutex");
+	}
+
 	AVBStreamID_t streamID;
+	U8 emptyMAC[ETH_ALEN] = {0};
 	memset(&streamID, 0, sizeof(streamID));
 	memcpy(streamID.addr, pCfg->stream_addr.mac, ETH_ALEN);
 	streamID.uniqueID = pCfg->stream_uid;
 
 	AVB_LOGF_INFO("Attach "STREAMID_FORMAT, STREAMID_ARGS(&streamID));
+
+	if ((memcmp(streamID.addr, emptyMAC, ETH_ALEN) == 0 && streamID.uniqueID == 0) ||
+		streamID.uniqueID == 0xFFFF) {
+		AVB_LOGF_WARNING("Listener stream ID is unresolved (" STREAMID_FORMAT "); deferring attach",
+			STREAMID_ARGS(&streamID));
+		SLEEP_MSEC(100);
+		goto avb_listener_cleanup;
+	}
 
 	// Create Stats Mutex
 	{
@@ -301,7 +415,11 @@ void openavbTLRunListener(tl_state_t *pTLState)
 		AVB_LOGF_WARNING("Failed to connect to endpoint "STREAMID_FORMAT, STREAMID_ARGS(&streamID));
 	}
 
+avb_listener_cleanup:
 	if (pTLState->pPvtListenerData) {
+		MUTEX_CREATE_ERR();
+		MUTEX_DESTROY(((listener_data_t *)pTLState->pPvtListenerData)->streamMutex);
+		MUTEX_LOG_ERR("Error destroying listener stream mutex");
 		free(pTLState->pPvtListenerData);
 		pTLState->pPvtListenerData = NULL;
 	}
@@ -327,7 +445,11 @@ void openavbTLPauseListener(tl_state_t *pTLState, bool bPause)
 	}
 
 	pTLState->bPaused = bPause;
-	openavbAvtpPause(pListenerData->avtpHandle, bPause);
+	listenerLockStream(pListenerData);
+	if (pListenerData->avtpHandle) {
+		openavbAvtpPause(pListenerData->avtpHandle, bPause);
+	}
+	listenerUnlockStream(pListenerData);
 
 	// Notify AVDECC Msg of the state change.
 	openavbAvdeccMsgClntNotifyCurrentState(pTLState);
@@ -444,5 +566,3 @@ U64 openavbListenerGetStat(tl_state_t *pTLState, tl_stat_t stat)
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 	return val;
 }
-
-

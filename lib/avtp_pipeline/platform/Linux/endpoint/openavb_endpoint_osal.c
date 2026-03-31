@@ -31,6 +31,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
 
 #include "openavb_platform.h"
 #include "openavb_trace.h"
@@ -48,6 +50,45 @@ extern openavb_endpoint_cfg_t 	x_cfg;
 extern bool endpointRunning;
 static pthread_t endpointServerHandle;
 static void* endpointServerThread(void *arg);
+
+static bool fileReadable(const char *path)
+{
+	return (path && path[0] != '\0' && access(path, R_OK) == 0);
+}
+
+static bool buildSiblingPath(const char *path, const char *name, char *outPath, size_t outPathLen)
+{
+	if (!path || !name || !outPath || outPathLen == 0) {
+		return FALSE;
+	}
+
+	const char *slash = strrchr(path, '/');
+	if (!slash) {
+		return FALSE;
+	}
+
+	size_t dirLen = (size_t)(slash - path);
+	if (dirLen == 0 || dirLen + 1 + strlen(name) + 1 > outPathLen) {
+		return FALSE;
+	}
+
+	memcpy(outPath, path, dirLen);
+	outPath[dirLen] = '/';
+	strcpy(outPath + dirLen + 1, name);
+	return TRUE;
+}
+
+static bool buildExeRelativePath(const char *name, char *outPath, size_t outPathLen)
+{
+	char exePath[PATH_MAX];
+	ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+	if (len <= 0 || len >= (ssize_t)sizeof(exePath)) {
+		return FALSE;
+	}
+
+	exePath[len] = '\0';
+	return buildSiblingPath(exePath, name, outPath, outPathLen);
+}
 
 
 bool startEndpoint(int mode, int ifindex, const char* ifname, unsigned mtu, unsigned link_kbit, unsigned nsr_kbit)
@@ -72,7 +113,31 @@ bool startEndpoint(int mode, int ifindex, const char* ifname, unsigned mtu, unsi
 	x_cfg.link_kbit = link_kbit;
 	x_cfg.nsr_kbit = nsr_kbit;
 
-	openavbReadConfig(DEFAULT_INI_FILE, DEFAULT_SAVE_INI_FILE, &x_cfg);
+	// Allow overriding endpoint config locations so openavb_host/openavb_harness
+	// can be launched outside the directory containing endpoint.ini.
+	char endpointIniResolved[PATH_MAX] = {0};
+	char endpointSaveIniResolved[PATH_MAX] = {0};
+	const char *endpointIni = getenv("OPENAVB_ENDPOINT_INI");
+	const char *endpointSaveIni = getenv("OPENAVB_ENDPOINT_SAVE_INI");
+
+	if (!endpointIni || endpointIni[0] == '\0') {
+		endpointIni = DEFAULT_INI_FILE;
+		if (!fileReadable(endpointIni) &&
+			buildExeRelativePath(DEFAULT_INI_FILE, endpointIniResolved, sizeof(endpointIniResolved)) &&
+			fileReadable(endpointIniResolved)) {
+			endpointIni = endpointIniResolved;
+		}
+	}
+
+	if (!endpointSaveIni || endpointSaveIni[0] == '\0') {
+		endpointSaveIni = DEFAULT_SAVE_INI_FILE;
+		if (buildSiblingPath(endpointIni, DEFAULT_SAVE_INI_FILE, endpointSaveIniResolved, sizeof(endpointSaveIniResolved))) {
+			endpointSaveIni = endpointSaveIniResolved;
+		}
+	}
+
+	AVB_LOGF_INFO("Endpoint config: ini=%s save=%s", endpointIni, endpointSaveIni);
+	openavbReadConfig(endpointIni, endpointSaveIni, &x_cfg);
 
 	if_info_t ifinfo;
 	if (ifname && openavbCheckInterface(ifname, &ifinfo)) {

@@ -90,6 +90,12 @@ typedef struct {
 	// Shared properties
 	///////////////////////////
 
+	/// Stream unique ID for diagnostics.
+	U16 debug_stream_uid;
+
+	/// Friendly name for diagnostics.
+	char debug_friendly_name[64];
+
 	/// Common name for mapping data format. Set by mapping modules and used by
 	/// interface modules to validate
 	///  the media queue data format compatibility.

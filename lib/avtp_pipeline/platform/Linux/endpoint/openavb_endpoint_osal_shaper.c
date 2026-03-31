@@ -71,7 +71,9 @@ typedef struct shaper_reservation
 	unsigned char stream_da[ETH_ALEN];
 } shaper_reservation;
 
-#define MAX_SHAPER_RESERVATIONS 4
+// Allow more than the historical 4-stream limit so mixed Milan profiles
+// (e.g. 4x AAF + 1x CRF) can reserve shaping concurrently.
+#define MAX_SHAPER_RESERVATIONS 16
 static shaper_reservation shaperReservationList[MAX_SHAPER_RESERVATIONS];
 
 static bool shaperRunning = FALSE;

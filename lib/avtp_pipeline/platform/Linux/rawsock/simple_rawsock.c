@@ -34,11 +34,62 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <sys/ioctl.h>
 #include <linux/if_packet.h>
 #include <linux/filter.h>
+#include "avb_sched.h"
 
 #include "openavb_trace.h"
 
 #define	AVB_LOG_COMPONENT	"Raw Socket"
 #include "openavb_log.h"
+
+#define SR_CLASS_A_DEFAULT_PRIORITY 3
+#define SR_CLASS_B_DEFAULT_PRIORITY 2
+
+static bool simpleRawsockSetPriority(simple_rawsock_t *rawsock, U32 priority, const char *source)
+{
+	if (priority > 7) {
+		AVB_LOGF_WARNING("SO_PRIORITY source=%s requested out-of-range value=%u, clamping to 7",
+			source ? source : "unknown", priority);
+		priority = 7;
+	}
+
+	int sockPriority = (int)priority;
+	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_PRIORITY, &sockPriority, sizeof(sockPriority)) < 0) {
+		AVB_LOGF_ERROR("Setting TX priority from %s failed (%d: %s)",
+			source ? source : "unknown", errno, strerror(errno));
+		return FALSE;
+	}
+
+	AVB_LOGF_DEBUG("SO_PRIORITY=%d set from %s", sockPriority, source ? source : "unknown");
+	return TRUE;
+}
+
+static bool simpleRawsockClassMarkToPriority(int mark, U32 *pPriority)
+{
+	int fwmarkClass = TC_AVB_MARK_CLASS(mark);
+	if (fwmarkClass == SR_CLASS_A) {
+		*pPriority = SR_CLASS_A_DEFAULT_PRIORITY;
+		return TRUE;
+	}
+	if (fwmarkClass == SR_CLASS_B) {
+		*pPriority = SR_CLASS_B_DEFAULT_PRIORITY;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void simpleRawsockForceQdiscPath(simple_rawsock_t *rawsock)
+{
+#ifdef PACKET_QDISC_BYPASS
+	int bypass = 0;
+	if (setsockopt(rawsock->sock, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass)) < 0) {
+		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass taprio/CBS",
+			errno, strerror(errno));
+	}
+	else {
+		AVB_LOG_DEBUG("PACKET_QDISC_BYPASS=0 (qdisc path enabled)");
+	}
+#endif
+}
 
 // Get information about an interface
 bool simpleAvbCheckInterface(const char *ifname, if_info_t *info)
@@ -179,6 +230,7 @@ void* simpleRawsockOpen(simple_rawsock_t* rawsock, const char *ifname, bool rx_m
 		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK);
 		return NULL;
 	}
+	simpleRawsockForceQdiscPath(rawsock);
 
 	// Bind to interface
 	struct sockaddr_ll my_addr;
@@ -266,7 +318,7 @@ bool simpleRawsockTxSetMark(void *pvRawsock, int mark)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_RAWSOCK_DETAIL);
 	simple_rawsock_t *rawsock = (simple_rawsock_t*)pvRawsock;
-	bool retval = FALSE;
+	bool retval = TRUE;
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
 		AVB_LOG_ERROR("Setting TX mark; invalid argument passed");
@@ -276,10 +328,19 @@ bool simpleRawsockTxSetMark(void *pvRawsock, int mark)
 
 	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
 		AVB_LOGF_ERROR("Setting TX mark; setsockopt failed: %s", strerror(errno));
+		retval = FALSE;
 	}
 	else {
 		AVB_LOGF_DEBUG("SO_MARK=%d OK", mark);
-		retval = TRUE;
+		U32 classPriority = 0;
+		if (simpleRawsockClassMarkToPriority(mark, &classPriority)) {
+			if (!simpleRawsockSetPriority(rawsock, classPriority, "fwmark class")) {
+				retval = FALSE;
+			}
+		}
+		else {
+			AVB_LOGF_DEBUG("SO_PRIORITY unchanged for non-SR mark=%d", mark);
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
@@ -294,11 +355,7 @@ bool simpleRawsockTxSetHdr(void *pvRawsock, hdr_info_t *pHdr)
 
 	bool ret = baseRawsockTxSetHdr(pvRawsock, pHdr);
 	if (ret && pHdr->vlan) {
-		// set the class'es priority on the TX socket
-		// (required by Telechips platform for FQTSS Credit Based Shaper to work)
-		U32 pcp = pHdr->vlan_pcp;
-		if (setsockopt(rawsock->sock, SOL_SOCKET, SO_PRIORITY, (char *)&pcp, sizeof(pcp)) < 0) {
-			AVB_LOGF_ERROR("stcRawsockTxSetHdr; SO_PRIORITY setsockopt failed (%d: %s)\n", errno, strerror(errno));
+		if (!simpleRawsockSetPriority(rawsock, pHdr->vlan_pcp, "vlan PCP")) {
 			AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
 			return FALSE;
 		}

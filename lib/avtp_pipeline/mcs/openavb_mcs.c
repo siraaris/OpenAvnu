@@ -65,7 +65,7 @@ void openavbMcsAdvance(mcs_t *mediaClockSynth)
 		if (mediaClockSynth->tickCount % mediaClockSynth->correctionInterval == 0) {
 			mediaClockSynth->edgeTime += mediaClockSynth->correctionAmount;
 		}
-#if !IGB_LAUNCHTIME_ENABLED && !ATL_LAUNCHTIME_ENABLED
+#if !IGB_LAUNCHTIME_ENABLED && !ATL_LAUNCHTIME_ENABLED && !SOCKET_LAUNCHTIME_ENABLED
 		IF_LOG_INTERVAL(8000) {
 			U64 nowNS;
 			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);

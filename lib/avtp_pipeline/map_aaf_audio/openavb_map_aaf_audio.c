@@ -38,12 +38,16 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include <stdlib.h>
 #include <string.h>
 #include "openavb_mcr_hal_pub.h"
+#include "openavb_osal_pub.h"
 #include "openavb_types_pub.h"
 #include "openavb_trace_pub.h"
 #include "openavb_avtp_time_pub.h"
 #include "openavb_mediaq_pub.h"
 #include "openavb_map_pub.h"
 #include "openavb_map_aaf_audio_pub.h"
+#include "openavb_aem_types_pub.h"
+#include "openavb_clock_source_runtime_pub.h"
+#include "openavb_time_osal_pub.h"
 
 #define	AVB_LOG_COMPONENT	"AAF Mapping"
 #include "openavb_log_pub.h"
@@ -150,12 +154,180 @@ typedef struct {
 	bool dataValid;
 
 	U32 intervalCounter;
+	U32 txLeadLogEveryPackets;
+	U32 txLeadLogCounter;
+	U32 txMinLeadUsec;
+	U32 selectedClockWarmupUsec;
 
 	avb_audio_sparse_mode_t sparseMode;
 
 	bool mediaQItemSyncTS;
+	bool usingSelectedInputClock;
+	U32 selectedClockGeneration;
+	U32 selectedCrfGeneration;
+	U32 selectedClockRecoveryGeneration;
+	U32 selectedClockPendingGeneration;
+	bool selectedClockPendingLogged;
+	bool selectedClockCadenceValid;
+	bool selectedClockCadenceUsingMediaClock;
+	U64 selectedClockCadenceBaseNs;
+	U32 selectedClockCadenceGeneration;
+	U32 selectedClockCadenceCrfGeneration;
+	bool selectedClockFollowUpdates;
+	bool selectedClockWarmupActive;
+	bool selectedClockWarmupLogged;
+	U64 selectedClockWarmupUntilNs;
+	U64 selectedClockWarmupDropCount;
+	U64 txCadenceSlewEventCount;
+	U64 txCadenceHardRebaseCount;
+
+	// TX timestamp continuity diagnostics.
+	bool txDiagPrevPacketTsValid;
+	U64 txDiagPrevPacketTsNs;
+	U64 txDiagPacketCount;
+	U64 txDiagAnomalyCount;
+
+	// TX phase diagnostics against the currently selected stream/media clock.
+	U32 txPhaseDiagEveryPackets;
+	U64 txPhaseDiagPacketCounter;
+	bool txPhaseDiagWindowValid;
+	S64 txPhaseDiagErrMinNs;
+	S64 txPhaseDiagErrMaxNs;
+	S64 txPhaseDiagErrSumNs;
+	S64 txPhaseDiagErrAbsMaxNs;
+	U64 txPhaseDiagClampMaxNs;
+	U64 txPhaseDiagWindowPackets;
+	U64 txPhaseDiagLogCount;
+	U32 txPhaseDiagSourceGeneration;
+	bool txPhaseDiagUsingLocalMediaClock;
+
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+	U64 lastLaunchTimeNs;
+	bool lastLaunchTimeValid;
+#endif
 
 } pvt_data_t;
+
+static void mapAafResetTxPhaseDiag(pvt_data_t *pPvtData)
+{
+	if (!pPvtData) {
+		return;
+	}
+
+	pPvtData->txPhaseDiagPacketCounter = 0;
+	pPvtData->txPhaseDiagWindowValid = FALSE;
+	pPvtData->txPhaseDiagErrMinNs = 0;
+	pPvtData->txPhaseDiagErrMaxNs = 0;
+	pPvtData->txPhaseDiagErrSumNs = 0;
+	pPvtData->txPhaseDiagErrAbsMaxNs = 0;
+	pPvtData->txPhaseDiagClampMaxNs = 0;
+	pPvtData->txPhaseDiagWindowPackets = 0;
+	pPvtData->txPhaseDiagLogCount = 0;
+	pPvtData->txPhaseDiagSourceGeneration = 0;
+	pPvtData->txPhaseDiagUsingLocalMediaClock = FALSE;
+}
+
+static void mapAafUpdateTxPhaseDiag(
+	media_q_t *pMediaQ,
+	media_q_pub_map_aaf_audio_info_t *pPubMapInfo,
+	pvt_data_t *pPvtData,
+	U64 sourcePacketTsNs,
+	U64 unclampedPacketTsNs,
+	U64 clampDeltaNs,
+	const openavb_clock_source_runtime_t *pClockSelection,
+	U32 crfGeneration,
+	bool usingLocalMediaClock)
+{
+	if (!pMediaQ || !pPubMapInfo || !pPvtData || !pClockSelection) {
+		return;
+	}
+
+	if (!pPvtData->txPhaseDiagWindowValid ||
+			pPvtData->txPhaseDiagSourceGeneration != pClockSelection->generation ||
+			pPvtData->txPhaseDiagUsingLocalMediaClock != usingLocalMediaClock) {
+		pPvtData->txPhaseDiagWindowValid = TRUE;
+		pPvtData->txPhaseDiagErrMinNs = 0;
+		pPvtData->txPhaseDiagErrMaxNs = 0;
+		pPvtData->txPhaseDiagErrSumNs = 0;
+		pPvtData->txPhaseDiagErrAbsMaxNs = 0;
+		pPvtData->txPhaseDiagClampMaxNs = 0;
+		pPvtData->txPhaseDiagWindowPackets = 0;
+		pPvtData->txPhaseDiagSourceGeneration = pClockSelection->generation;
+		pPvtData->txPhaseDiagUsingLocalMediaClock = usingLocalMediaClock;
+	}
+
+	S64 phaseErrNs = (unclampedPacketTsNs >= sourcePacketTsNs)
+		? (S64)(unclampedPacketTsNs - sourcePacketTsNs)
+		: -((S64)(sourcePacketTsNs - unclampedPacketTsNs));
+	S64 absErrNs = llabs(phaseErrNs);
+
+	if (pPvtData->txPhaseDiagWindowPackets == 0) {
+		pPvtData->txPhaseDiagErrMinNs = phaseErrNs;
+		pPvtData->txPhaseDiagErrMaxNs = phaseErrNs;
+	}
+	else {
+		if (phaseErrNs < pPvtData->txPhaseDiagErrMinNs) {
+			pPvtData->txPhaseDiagErrMinNs = phaseErrNs;
+		}
+		if (phaseErrNs > pPvtData->txPhaseDiagErrMaxNs) {
+			pPvtData->txPhaseDiagErrMaxNs = phaseErrNs;
+		}
+	}
+
+	pPvtData->txPhaseDiagErrSumNs += phaseErrNs;
+	if (absErrNs > pPvtData->txPhaseDiagErrAbsMaxNs) {
+		pPvtData->txPhaseDiagErrAbsMaxNs = absErrNs;
+	}
+	if (clampDeltaNs > pPvtData->txPhaseDiagClampMaxNs) {
+		pPvtData->txPhaseDiagClampMaxNs = clampDeltaNs;
+	}
+	pPvtData->txPhaseDiagWindowPackets++;
+	pPvtData->txPhaseDiagPacketCounter++;
+
+	U32 logEveryPackets = pPvtData->txPhaseDiagEveryPackets;
+	if (logEveryPackets == 0) {
+		logEveryPackets = (pPvtData->txInterval > 0) ? pPvtData->txInterval : 4000;
+	}
+
+	if (logEveryPackets > 0 &&
+			(pPvtData->txPhaseDiagPacketCounter % logEveryPackets) == 0 &&
+			pPvtData->txPhaseDiagWindowPackets > 0) {
+		S64 avgErrNs = pPvtData->txPhaseDiagErrSumNs / (S64)pPvtData->txPhaseDiagWindowPackets;
+		S64 avgErrMilliSamples = (avgErrNs * (S64)pPubMapInfo->audioRate * 1000LL) / (S64)NANOSECONDS_PER_SECOND;
+		S64 absMaxMilliSamples = (pPvtData->txPhaseDiagErrAbsMaxNs * (S64)pPubMapInfo->audioRate * 1000LL) / (S64)NANOSECONDS_PER_SECOND;
+		S64 avgWholeSamples = avgErrMilliSamples / 1000LL;
+		S64 avgFracSamples = llabs(avgErrMilliSamples % 1000LL);
+		S64 absWholeSamples = absMaxMilliSamples / 1000LL;
+		S64 absFracSamples = llabs(absMaxMilliSamples % 1000LL);
+
+		pPvtData->txPhaseDiagLogCount++;
+		AVB_LOGF_INFO(
+			"AAF TX phase delta: stream=%u name=%s avg=%lldns (%lld.%03lld samples) min=%lldns max=%lldns abs_max=%lldns (%lld.%03lld samples) clamp_max=%lluns packets=%llu source=%s gen=%u crf_gen=%u windows=%llu",
+			pMediaQ->debug_stream_uid,
+			pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
+			(long long)avgErrNs,
+			(long long)avgWholeSamples,
+			(long long)avgFracSamples,
+			(long long)pPvtData->txPhaseDiagErrMinNs,
+			(long long)pPvtData->txPhaseDiagErrMaxNs,
+			(long long)pPvtData->txPhaseDiagErrAbsMaxNs,
+			(long long)absWholeSamples,
+			(long long)absFracSamples,
+			(unsigned long long)pPvtData->txPhaseDiagClampMaxNs,
+			(unsigned long long)pPvtData->txPhaseDiagWindowPackets,
+			usingLocalMediaClock ? "local_media" : "projected_crf",
+			pClockSelection->generation,
+			crfGeneration,
+			(unsigned long long)pPvtData->txPhaseDiagLogCount);
+
+		pPvtData->txPhaseDiagErrMinNs = 0;
+		pPvtData->txPhaseDiagErrMaxNs = 0;
+		pPvtData->txPhaseDiagErrSumNs = 0;
+		pPvtData->txPhaseDiagErrAbsMaxNs = 0;
+		pPvtData->txPhaseDiagClampMaxNs = 0;
+		pPvtData->txPhaseDiagWindowPackets = 0;
+	}
+}
 
 static void x_calculateSizes(media_q_t *pMediaQ)
 {
@@ -359,6 +531,32 @@ void openavbMapAVTPAudioCfgCB(media_q_t *pMediaQ, const char *name, const char *
 			char *pEnd;
 			pPvtData->mcrRecoveryInterval = strtol(value, &pEnd, 10);
 		}
+		else if (strcmp(name, "map_nv_tx_lead_log_every") == 0) {
+			char *pEnd;
+			pPvtData->txLeadLogEveryPackets = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "map_nv_tx_phase_log_every") == 0 ||
+				strcmp(name, "map_nv_tx_phase_diag_every") == 0) {
+			char *pEnd;
+			pPvtData->txPhaseDiagEveryPackets = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "map_nv_tx_min_lead_usec") == 0) {
+			char *pEnd;
+			pPvtData->txMinLeadUsec = strtol(value, &pEnd, 10);
+		}
+		else if (strcmp(name, "map_nv_selected_clock_follow_updates") == 0 ||
+				strcmp(name, "map_nv_clock_follow_selected_stream") == 0) {
+			char *pEnd;
+			long tmp = strtol(value, &pEnd, 10);
+			if (*pEnd == '\0') {
+				pPvtData->selectedClockFollowUpdates = (tmp != 0);
+			}
+		}
+		else if (strcmp(name, "map_nv_selected_clock_warmup_usec") == 0 ||
+				strcmp(name, "map_nv_clock_warmup_usec") == 0) {
+			char *pEnd;
+			pPvtData->selectedClockWarmupUsec = strtol(value, &pEnd, 10);
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_MAP);
@@ -451,9 +649,157 @@ void openavbMapAVTPAudioTxInitCB(media_q_t *pMediaQ)
 		pvt_data_t *pPvtData = pMediaQ->pPvtMapInfo;
 		if (pPvtData) {
 			pPvtData->isTalker = TRUE;
+			pPvtData->selectedClockPendingGeneration = 0;
+			pPvtData->selectedClockPendingLogged = FALSE;
+			pPvtData->selectedClockCadenceValid = FALSE;
+			pPvtData->selectedClockCadenceUsingMediaClock = FALSE;
+			pPvtData->selectedClockCadenceBaseNs = 0;
+			pPvtData->selectedClockCadenceGeneration = 0;
+			pPvtData->selectedClockCadenceCrfGeneration = 0;
+			pPvtData->selectedClockWarmupActive = FALSE;
+			pPvtData->selectedClockWarmupLogged = FALSE;
+			pPvtData->selectedClockWarmupUntilNs = 0;
+			pPvtData->selectedClockWarmupDropCount = 0;
+			pPvtData->txCadenceSlewEventCount = 0;
+			pPvtData->txCadenceHardRebaseCount = 0;
+			pPvtData->txDiagPrevPacketTsValid = FALSE;
+			pPvtData->txDiagPrevPacketTsNs = 0;
+			pPvtData->txDiagPacketCount = 0;
+			pPvtData->txDiagAnomalyCount = 0;
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+			pPvtData->lastLaunchTimeNs = 0;
+			pPvtData->lastLaunchTimeValid = FALSE;
+#endif
+			mapAafResetTxPhaseDiag(pPvtData);
 		}
 	}
 	AVB_TRACE_EXIT(AVB_TRACE_MAP);
+}
+
+static bool mapAafGetSelectedStreamClock(
+	U64 *pClockNs,
+	bool *pClockUncertain,
+	openavb_clock_source_runtime_t *pSelection,
+	U32 *pCrfGeneration,
+	bool *pUsingLocalMediaClock)
+{
+	openavb_clock_source_runtime_t selection = {0};
+	U64 clockNs = 0;
+	bool clockUncertain = FALSE;
+	U32 crfGeneration = 0;
+	bool usingLocalMediaClock = FALSE;
+
+	if (!openavbClockSourceRuntimeGetSelection(&selection)) {
+		return FALSE;
+	}
+
+	if ((selection.clock_source_flags & OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID) == 0) {
+		return FALSE;
+	}
+
+	if (selection.clock_source_location_type != OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT &&
+			selection.clock_source_location_type != OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		return FALSE;
+	}
+
+	// Prefer a transport-free media-clock phase anchor when the selected source
+	// publishes one locally (e.g. our CRF talker feeding our AAF talkers). This
+	// keeps CRF and AAF on the same underlying clock timeline instead of deriving
+	// AAF from already offset CRF packet timestamps.
+	if (openavbClockSourceRuntimeGetMediaClockForLocation(
+			selection.clock_source_location_type,
+			selection.clock_source_location_index,
+			&clockNs,
+			&clockUncertain,
+			&crfGeneration)) {
+		usingLocalMediaClock = TRUE;
+		if (pClockNs) {
+			*pClockNs = clockNs;
+		}
+		if (pClockUncertain) {
+			*pClockUncertain = clockUncertain;
+		}
+		if (pSelection) {
+			*pSelection = selection;
+		}
+		if (pCrfGeneration) {
+			*pCrfGeneration = crfGeneration;
+		}
+		if (pUsingLocalMediaClock) {
+			*pUsingLocalMediaClock = usingLocalMediaClock;
+		}
+		return TRUE;
+	}
+
+	if (!openavbClockSourceRuntimeGetCrfTimeForLocation(
+			selection.clock_source_location_type,
+			selection.clock_source_location_index,
+			&clockNs,
+			&clockUncertain,
+			&crfGeneration)) {
+		return FALSE;
+	}
+
+	if (pClockNs) {
+		*pClockNs = clockNs;
+	}
+	if (pClockUncertain) {
+		*pClockUncertain = clockUncertain;
+	}
+	if (pSelection) {
+		*pSelection = selection;
+	}
+	if (pCrfGeneration) {
+		*pCrfGeneration = crfGeneration;
+	}
+	if (pUsingLocalMediaClock) {
+		*pUsingLocalMediaClock = usingLocalMediaClock;
+	}
+	return TRUE;
+}
+
+static bool mapAafSelectedStreamClockPending(openavb_clock_source_runtime_t *pSelection)
+{
+	openavb_clock_source_runtime_t selection = {0};
+	U64 ignoredNs = 0;
+	bool ignoredUncertain = FALSE;
+	U32 ignoredGeneration = 0;
+
+	if (!openavbClockSourceRuntimeGetSelection(&selection)) {
+		return FALSE;
+	}
+
+	if ((selection.clock_source_flags & OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID) == 0) {
+		return FALSE;
+	}
+
+	if (selection.clock_source_location_type != OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT &&
+			selection.clock_source_location_type != OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		return FALSE;
+	}
+
+	if (openavbClockSourceRuntimeGetMediaClockForLocation(
+			selection.clock_source_location_type,
+			selection.clock_source_location_index,
+			&ignoredNs,
+			&ignoredUncertain,
+			&ignoredGeneration)) {
+		return FALSE;
+	}
+
+	if (openavbClockSourceRuntimeGetCrfTimeForLocation(
+			selection.clock_source_location_type,
+			selection.clock_source_location_index,
+			&ignoredNs,
+			&ignoredUncertain,
+			&ignoredGeneration)) {
+		return FALSE;
+	}
+
+	if (pSelection) {
+		*pSelection = selection;
+	}
+	return TRUE;
 }
 
 // CORE_TODO: This callback should be updated to work in a similar way the uncompressed audio mapping. With allowing AVTP packets to be built
@@ -494,6 +840,26 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 		return TX_CB_RET_PACKET_NOT_READY;
 	}
 
+	openavb_clock_source_runtime_t pendingSelection = {0};
+	if (mapAafSelectedStreamClockPending(&pendingSelection)) {
+		if (!pPvtData->selectedClockPendingLogged ||
+				pPvtData->selectedClockPendingGeneration != pendingSelection.generation) {
+			AVB_LOGF_INFO(
+				"AAF TX waiting for selected stream clock: domain=%u source=%u type=0x%04x location=%s/%u generation=%u",
+				pendingSelection.clock_domain_index,
+				pendingSelection.clock_source_index,
+				pendingSelection.clock_source_type,
+				(pendingSelection.clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) ? "input" : "output",
+				pendingSelection.clock_source_location_index,
+				pendingSelection.generation);
+			pPvtData->selectedClockPendingLogged = TRUE;
+			pPvtData->selectedClockPendingGeneration = pendingSelection.generation;
+		}
+		AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
+		return TX_CB_RET_PACKET_NOT_READY;
+	}
+	pPvtData->selectedClockPendingLogged = FALSE;
+
 	if ((*dataLen - TOTAL_HEADER_SIZE) < pPvtData->payloadSize) {
 		AVB_LOG_ERROR("Not enough room in packet for payload");
 		openavbMediaQTailUnlock(pMediaQ);
@@ -507,9 +873,11 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 	U8  *pPayload = pData + TOTAL_HEADER_SIZE;
 
 	U32 bytesProcessed = 0;
+	bool dropForWarmup = FALSE;
 	while (bytesProcessed < bytesNeeded) {
 		pMediaQItem = openavbMediaQTailLock(pMediaQ, TRUE);
 		if (pMediaQItem && pMediaQItem->pPubData && pMediaQItem->dataLen > 0) {
+			bool dropThisPacketForWarmup = FALSE;
 
 			// timestamp set in the interface module, here just validate
 			// In sparse mode, the timestamp valid flag should be set every eighth AAF AVPTDU.
@@ -529,46 +897,398 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 			else {
 				// Compute per-packet timestamp from the media queue item's base time.
 				U64 baseNs = openavbAvtpTimeGetAvtpTimeNS(pMediaQItem->pAvtpTime);
+				U64 sourceBaseNs = baseNs;
 				U64 intervalNs = 0;
+				U64 itemIntervalNs = 0;
+				U64 packetTsNs;
+				U64 launchTimeNs = 0;
 				U32 packetIndex = 0;
-
-				baseNs += (U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC;
+				U64 nowNs = 0;
+				bool clamped = FALSE;
+				bool timestampUncertain = openavbAvtpTimeTimestampIsUncertain(pMediaQItem->pAvtpTime);
+				openavb_clock_source_runtime_t clockSelection = {0};
+				U32 crfGeneration = 0;
+				U32 recoveryGeneration = osalClockGetWalltimeRecoveryGeneration();
+				bool usingLocalMediaClock = FALSE;
+				bool usingSelectedInputClock =
+					mapAafGetSelectedStreamClock(
+						&sourceBaseNs,
+						&timestampUncertain,
+						&clockSelection,
+						&crfGeneration,
+						&usingLocalMediaClock);
+				if (usingSelectedInputClock) {
+					baseNs = sourceBaseNs;
+				}
 				if (pPvtData->txInterval > 0) {
 					intervalNs = NANOSECONDS_PER_SECOND / pPvtData->txInterval;
 				}
 				if (pPvtData->payloadSize > 0) {
 					packetIndex = pMediaQItem->readIdx / pPvtData->payloadSize;
 				}
+				itemIntervalNs = intervalNs;
+				if (pPubMapInfo->packingFactor > 1) {
+					itemIntervalNs *= pPubMapInfo->packingFactor;
+				}
 
-				// Set timestamp valid flag
-				pHdrV0[HIDX_AVTP_HIDE7_TV1] |= 0x01;
+				bool recoveryGenerationChanged = usingSelectedInputClock &&
+					(recoveryGeneration != pPvtData->selectedClockRecoveryGeneration);
 
-				// Set (clear) timestamp uncertain flag
-				if (openavbAvtpTimeTimestampIsUncertain(pMediaQItem->pAvtpTime))
-					pHdrV0[HIDX_AVTP_HIDE7_TU1] |= 0x01;
-				else pHdrV0[HIDX_AVTP_HIDE7_TU1] &= ~0x01;
+				if (usingSelectedInputClock != pPvtData->usingSelectedInputClock ||
+						(usingSelectedInputClock &&
+						 (clockSelection.generation != pPvtData->selectedClockGeneration ||
+						  recoveryGenerationChanged))) {
+					if (recoveryGenerationChanged &&
+							pPvtData->selectedClockRecoveryGeneration != 0) {
+						AVB_LOGF_WARNING(
+							"AAF TX clock recovery epoch change: domain=%u source=%u location=%s/%u recovery_generation=%u previous=%u",
+							clockSelection.clock_domain_index,
+							clockSelection.clock_source_index,
+							(clockSelection.clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) ? "input" : "output",
+							clockSelection.clock_source_location_index,
+							recoveryGeneration,
+							pPvtData->selectedClockRecoveryGeneration);
+					}
+					if (usingSelectedInputClock) {
+						AVB_LOGF_INFO("AAF TX clock source: STREAM selected (domain=%u source=%u type=0x%04x location=%s/%u generation=%u crf_generation=%u)",
+							clockSelection.clock_domain_index,
+							clockSelection.clock_source_index,
+							clockSelection.clock_source_type,
+							(clockSelection.clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) ? "input" : "output",
+							clockSelection.clock_source_location_index,
+							clockSelection.generation,
+							crfGeneration);
+						AVB_LOGF_INFO("AAF TX selected clock follow updates: %s (%s)",
+							(pPvtData->selectedClockFollowUpdates || usingLocalMediaClock) ? "enabled" : "disabled",
+							usingLocalMediaClock ? "local media phase" : "projected CRF time");
+					}
+					else {
+						AVB_LOG_INFO("AAF TX clock source: using interface-provided media timestamp");
+					}
+					pPvtData->usingSelectedInputClock = usingSelectedInputClock;
+					pPvtData->selectedClockGeneration = clockSelection.generation;
+					pPvtData->selectedCrfGeneration = crfGeneration;
+					pPvtData->selectedClockRecoveryGeneration = recoveryGeneration;
+					pPvtData->txDiagPrevPacketTsValid = FALSE;
+					mapAafResetTxPhaseDiag(pPvtData);
+					if (usingSelectedInputClock && usingLocalMediaClock &&
+							pPvtData->selectedClockWarmupUsec > 0) {
+						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+						pPvtData->selectedClockWarmupActive = TRUE;
+						pPvtData->selectedClockWarmupLogged = FALSE;
+						pPvtData->selectedClockWarmupUntilNs =
+							nowNs + ((U64)pPvtData->selectedClockWarmupUsec * NANOSECONDS_PER_USEC);
+						pPvtData->selectedClockWarmupDropCount = 0;
+					}
+					else {
+						pPvtData->selectedClockWarmupActive = FALSE;
+						pPvtData->selectedClockWarmupLogged = FALSE;
+						pPvtData->selectedClockWarmupUntilNs = 0;
+						pPvtData->selectedClockWarmupDropCount = 0;
+					}
+				}
 
-				// - 4 bytes	avtp_timestamp
-				*pHdr++ = htonl((U32)((baseNs + (intervalNs * packetIndex)) & 0xFFFFFFFF));
+				// Selected CRF clocks can be produced at lower packet rates (e.g. 500 pps)
+				// than AAF (e.g. 8000 pps). Synthesize an AAF-rate timeline from the selected
+				// clock, and only rebase when the selected clock meaningfully diverges.
+				if (usingSelectedInputClock && intervalNs > 0) {
+					bool sourceSelectionChanged = (!pPvtData->selectedClockCadenceValid) ||
+						(clockSelection.generation != pPvtData->selectedClockCadenceGeneration) ||
+						recoveryGenerationChanged ||
+						(usingLocalMediaClock != pPvtData->selectedClockCadenceUsingMediaClock);
+					bool freshCrfSample =
+						(crfGeneration != pPvtData->selectedClockCadenceCrfGeneration);
+					bool followSelectedClockUpdates =
+						pPvtData->selectedClockFollowUpdates;
+
+					if (sourceSelectionChanged) {
+						pPvtData->selectedClockCadenceBaseNs = baseNs;
+						pPvtData->selectedClockCadenceValid = TRUE;
+						pPvtData->selectedClockCadenceUsingMediaClock = usingLocalMediaClock;
+						pPvtData->selectedClockCadenceGeneration = clockSelection.generation;
+						pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
+					}
+					else if (packetIndex > 0) {
+						/*
+						 * Continuing to packetize the same media-queue item. Keep the
+						 * cadence base anchored to the start of that item and let
+						 * packetIndex provide the per-packet offset. Advancing the base
+						 * here would double-count the packet step for packed items.
+						 */
+					}
+					else {
+						U64 nextCadenceNs = pPvtData->selectedClockCadenceBaseNs + itemIntervalNs;
+						if (usingLocalMediaClock) {
+							/*
+							 * For the local shared-media-clock path, keep packet cadence
+							 * strictly monotonic once the source is selected. The warm-up
+							 * gate handles the initial lock-on transient; after that the
+							 * safest behavior is to avoid introducing any runtime packet-step
+							 * perturbation from fresh local phase samples.
+							 */
+							pPvtData->selectedClockCadenceBaseNs = nextCadenceNs;
+							pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
+						}
+						else if (freshCrfSample && !followSelectedClockUpdates) {
+							// Keep a stable synthesized cadence once selected. Ignore
+							// subsequent CRF sample phase updates to avoid introducing
+							// network-jitter artifacts into AAF packet timestamps.
+							pPvtData->selectedClockCadenceBaseNs = nextCadenceNs;
+							pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
+						}
+						else if (freshCrfSample) {
+							S64 cadenceErrNs = (baseNs >= nextCadenceNs)
+								? (S64)(baseNs - nextCadenceNs)
+								: -((S64)(nextCadenceNs - baseNs));
+							// Pull toward CRF with bounded slew to avoid frequent hard phase jumps.
+							// Hard rebase is only for very large discontinuities.
+							S64 hardRebaseNs = (S64)(itemIntervalNs * 256ULL);
+							S64 maxSlewNs = (S64)(itemIntervalNs * 4ULL);
+							S64 phaseAdjustNs = cadenceErrNs / 8;
+							if (phaseAdjustNs > maxSlewNs) {
+								phaseAdjustNs = maxSlewNs;
+							}
+							else if (phaseAdjustNs < -maxSlewNs) {
+								phaseAdjustNs = -maxSlewNs;
+							}
+
+							if (llabs(cadenceErrNs) > hardRebaseNs) {
+								pPvtData->txCadenceHardRebaseCount++;
+								if (pPvtData->txCadenceHardRebaseCount <= 16 ||
+										(pPvtData->txCadenceHardRebaseCount % 2000) == 0) {
+									AVB_LOGF_WARNING(
+										"AAF TX clock cadence hard rebase: err=%lldns expected_step=%lluns gen=%u crf_gen=%u rebases=%llu",
+										(long long)cadenceErrNs,
+										(unsigned long long)itemIntervalNs,
+										clockSelection.generation,
+										crfGeneration,
+										(unsigned long long)pPvtData->txCadenceHardRebaseCount);
+								}
+								pPvtData->selectedClockCadenceBaseNs = baseNs;
+							}
+							else {
+								if (llabs(cadenceErrNs) > maxSlewNs) {
+									pPvtData->txCadenceSlewEventCount++;
+									if (pPvtData->txCadenceSlewEventCount <= 16 ||
+											(pPvtData->txCadenceSlewEventCount % 5000) == 0) {
+										AVB_LOGF_INFO(
+											"AAF TX clock cadence slew: err=%lldns adj=%lldns expected_step=%lluns gen=%u crf_gen=%u slews=%llu",
+											(long long)cadenceErrNs,
+											(long long)phaseAdjustNs,
+											(unsigned long long)itemIntervalNs,
+											clockSelection.generation,
+											crfGeneration,
+											(unsigned long long)pPvtData->txCadenceSlewEventCount);
+									}
+								}
+								pPvtData->selectedClockCadenceBaseNs = nextCadenceNs + (S64)phaseAdjustNs;
+							}
+							pPvtData->selectedClockCadenceCrfGeneration = crfGeneration;
+						}
+						else {
+							// No fresh CRF sample yet; keep advancing the synthesized AAF timeline.
+							pPvtData->selectedClockCadenceBaseNs = nextCadenceNs;
+						}
+					}
+					baseNs = pPvtData->selectedClockCadenceBaseNs;
+				}
+				else {
+					pPvtData->selectedClockCadenceValid = FALSE;
+					pPvtData->selectedClockCadenceUsingMediaClock = FALSE;
+				}
+				launchTimeNs = baseNs + (intervalNs * packetIndex);
+				if (usingSelectedInputClock && pPvtData->txMinLeadUsec > 0) {
+					launchTimeNs += ((U64)pPvtData->txMinLeadUsec * NANOSECONDS_PER_USEC);
+				}
+				packetTsNs = launchTimeNs +
+					((U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC);
+
+				U64 unclampedPacketTsNs = packetTsNs;
+				if (!usingSelectedInputClock && pPvtData->txMinLeadUsec > 0) {
+					U64 minTsNs = 0;
+					CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+					minTsNs = nowNs + ((U64)pPvtData->txMinLeadUsec * NANOSECONDS_PER_USEC);
+					if (packetTsNs < minTsNs) {
+						packetTsNs = minTsNs;
+						clamped = TRUE;
+					}
+				}
+				// If we clamped to maintain minimum lead, also pull the synthesized
+				// cadence anchor forward. Without this, repeated clamping can force
+				// per-packet timestamps to track callback jitter instead of txInterval.
+				if (clamped && usingSelectedInputClock && pPvtData->selectedClockCadenceValid &&
+						packetTsNs > unclampedPacketTsNs) {
+					U64 clampDeltaNs = packetTsNs - unclampedPacketTsNs;
+					pPvtData->selectedClockCadenceBaseNs += clampDeltaNs;
+				}
+				if (usingSelectedInputClock && usingLocalMediaClock &&
+						pPvtData->selectedClockWarmupActive) {
+					if (nowNs == 0) {
+						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+					}
+					if (nowNs < pPvtData->selectedClockWarmupUntilNs) {
+						dropThisPacketForWarmup = TRUE;
+						if (!pPvtData->selectedClockWarmupLogged) {
+							U64 remainingUsec =
+								(pPvtData->selectedClockWarmupUntilNs - nowNs) / NANOSECONDS_PER_USEC;
+							AVB_LOGF_INFO(
+								"AAF TX warming selected clock before transmit: domain=%u source=%u location=%s/%u remaining=%lluus",
+								clockSelection.clock_domain_index,
+								clockSelection.clock_source_index,
+								(clockSelection.clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) ? "input" : "output",
+								clockSelection.clock_source_location_index,
+								(unsigned long long)remainingUsec);
+							pPvtData->selectedClockWarmupLogged = TRUE;
+						}
+					}
+					else {
+						pPvtData->selectedClockWarmupActive = FALSE;
+						if (pPvtData->selectedClockWarmupLogged ||
+								pPvtData->selectedClockWarmupDropCount > 0) {
+							AVB_LOGF_INFO(
+								"AAF TX selected clock warm-up complete: dropped_packets=%llu duration=%uus",
+								(unsigned long long)pPvtData->selectedClockWarmupDropCount,
+								pPvtData->selectedClockWarmupUsec);
+						}
+						pPvtData->selectedClockWarmupLogged = FALSE;
+						pPvtData->selectedClockWarmupUntilNs = 0;
+					}
+				}
+				if (usingSelectedInputClock) {
+					U64 sourcePacketTsNs = sourceBaseNs +
+						((U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC) +
+						(intervalNs * packetIndex);
+					if (!dropThisPacketForWarmup) {
+						U64 clampDeltaNs = (packetTsNs > unclampedPacketTsNs)
+							? (packetTsNs - unclampedPacketTsNs)
+							: 0;
+						mapAafUpdateTxPhaseDiag(
+							pMediaQ,
+							pPubMapInfo,
+							pPvtData,
+							sourcePacketTsNs + ((usingSelectedInputClock && pPvtData->txMinLeadUsec > 0)
+								? ((U64)pPvtData->txMinLeadUsec * NANOSECONDS_PER_USEC)
+								: 0),
+							unclampedPacketTsNs,
+							clampDeltaNs,
+							&clockSelection,
+							crfGeneration,
+							usingLocalMediaClock);
+					}
+				}
+
+				// Detect timestamp cadence anomalies (e.g., 2ms steps on 8kpps stream).
+				if (!dropThisPacketForWarmup && intervalNs > 0) {
+					pPvtData->txDiagPacketCount++;
+					if (pPvtData->txDiagPrevPacketTsValid) {
+						S64 deltaNs = (packetTsNs >= pPvtData->txDiagPrevPacketTsNs)
+							? (S64)(packetTsNs - pPvtData->txDiagPrevPacketTsNs)
+							: -((S64)(pPvtData->txDiagPrevPacketTsNs - packetTsNs));
+						S64 errNs = deltaNs - (S64)intervalNs;
+						S64 thresholdNs = (S64)(intervalNs / 8); // 12.5% tolerance
+						if (llabs(errNs) > thresholdNs) {
+							pPvtData->txDiagAnomalyCount++;
+							if (pPvtData->txDiagAnomalyCount <= 16 ||
+									(pPvtData->txDiagAnomalyCount % 2000) == 0) {
+								AVB_LOGF_WARNING(
+									"AAF TX timestamp cadence anomaly: delta=%lldns expected=%lluns err=%lldns ts=%llu prev=%llu packets=%llu anomalies=%llu",
+									(long long)deltaNs,
+									(unsigned long long)intervalNs,
+									(long long)errNs,
+									(unsigned long long)packetTsNs,
+									(unsigned long long)pPvtData->txDiagPrevPacketTsNs,
+									(unsigned long long)pPvtData->txDiagPacketCount,
+									(unsigned long long)pPvtData->txDiagAnomalyCount);
+							}
+						}
+					}
+					pPvtData->txDiagPrevPacketTsNs = packetTsNs;
+					pPvtData->txDiagPrevPacketTsValid = TRUE;
+				}
+				else if (dropThisPacketForWarmup) {
+					pPvtData->txDiagPrevPacketTsValid = FALSE;
+				}
+
+				if (!dropThisPacketForWarmup) {
+					// Set timestamp valid flag
+					pHdrV0[HIDX_AVTP_HIDE7_TV1] |= 0x01;
+
+					// Set (clear) timestamp uncertain flag
+					if (timestampUncertain)
+						pHdrV0[HIDX_AVTP_HIDE7_TU1] |= 0x01;
+					else pHdrV0[HIDX_AVTP_HIDE7_TU1] &= ~0x01;
+
+					// - 4 bytes	avtp_timestamp
+					U32 avtpTs = (U32)(packetTsNs & 0xFFFFFFFF);
+					*pHdr++ = htonl(avtpTs);
+
+					if (pPvtData->txLeadLogEveryPackets > 0) {
+						pPvtData->txLeadLogCounter++;
+						if ((pPvtData->txLeadLogCounter % pPvtData->txLeadLogEveryPackets) == 0) {
+							S32 baseLeadUsec = openavbAvtpTimeUsecDelta(pMediaQItem->pAvtpTime);
+							S64 packetOffsetUsec = (S64)((intervalNs * (U64)packetIndex) / NANOSECONDS_PER_USEC);
+							S64 finalLeadUsec;
+							if (pPvtData->txMinLeadUsec > 0) {
+								if (nowNs == 0) {
+									CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+								}
+								finalLeadUsec = (packetTsNs >= nowNs)
+									? (S64)((packetTsNs - nowNs) / NANOSECONDS_PER_USEC)
+									: -((S64)((nowNs - packetTsNs) / NANOSECONDS_PER_USEC));
+							}
+							else {
+								finalLeadUsec = (S64)baseLeadUsec + (S64)pPvtData->maxTransitUsec + packetOffsetUsec;
+							}
+							AVB_LOGF_INFO("AAF TX lead: stream=%u name=%s final=%lldus base=%dus transit=%uus packet=%u offset=%lldus tx_interval=%u launch_lead=%u clamp=%u",
+									pMediaQ->debug_stream_uid,
+									pMediaQ->debug_friendly_name[0] ? pMediaQ->debug_friendly_name : "<unknown>",
+									(long long)finalLeadUsec,
+									baseLeadUsec,
+									pPvtData->maxTransitUsec,
+									packetIndex,
+									(long long)packetOffsetUsec,
+									pPvtData->txInterval,
+									pPvtData->txMinLeadUsec,
+									clamped ? 1U : 0U);
+						}
+					}
+				}
+
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+				if (!dropThisPacketForWarmup) {
+					pPvtData->lastLaunchTimeNs = launchTimeNs;
+					pPvtData->lastLaunchTimeValid = TRUE;
+				}
+				else {
+					pPvtData->lastLaunchTimeNs = 0;
+					pPvtData->lastLaunchTimeValid = FALSE;
+				}
+#endif
 			}
 
-			// - 4 bytes	format info (format, sample rate, channels per frame, bit depth)
-			tmp32 = pPvtData->aaf_format << 24;
-			tmp32 |= pPvtData->aaf_rate  << 20;
-			tmp32 |= pPubMapInfo->audioChannels << 8;
-			tmp32 |= pPvtData->aaf_bit_depth;
-			*pHdr++ = htonl(tmp32);
+			if (dropThisPacketForWarmup) {
+				dropForWarmup = TRUE;
+			}
 
-			// - 4 bytes	packet info (data length, evt field)
-			tmp32 = pPvtData->payloadSize << 16;
-			tmp32 |= pPvtData->aaf_event_field << 8;
-			*pHdr++ = htonl(tmp32);
+			if (!dropThisPacketForWarmup) {
+				// - 4 bytes	format info (format, sample rate, channels per frame, bit depth)
+				tmp32 = pPvtData->aaf_format << 24;
+				tmp32 |= pPvtData->aaf_rate  << 20;
+				tmp32 |= pPubMapInfo->audioChannels << 8;
+				tmp32 |= pPvtData->aaf_bit_depth;
+				*pHdr++ = htonl(tmp32);
 
-			// Set (clear) sparse mode flag
-			if (pPvtData->sparseMode == TS_SPARSE_MODE_ENABLED) {
-				pHdrV0[HIDX_AVTP_HIDE7_SP] |= SP_M0_BIT;
-			} else {
-				pHdrV0[HIDX_AVTP_HIDE7_SP] &= ~SP_M0_BIT;
+				// - 4 bytes	packet info (data length, evt field)
+				tmp32 = pPvtData->payloadSize << 16;
+				tmp32 |= pPvtData->aaf_event_field << 8;
+				*pHdr++ = htonl(tmp32);
+
+				// Set (clear) sparse mode flag
+				if (pPvtData->sparseMode == TS_SPARSE_MODE_ENABLED) {
+					pHdrV0[HIDX_AVTP_HIDE7_SP] |= SP_M0_BIT;
+				} else {
+					pHdrV0[HIDX_AVTP_HIDE7_SP] &= ~SP_M0_BIT;
+				}
 			}
 
 			if ((pMediaQItem->dataLen - pMediaQItem->readIdx) < pPvtData->payloadSize) {
@@ -579,9 +1299,11 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				return TX_CB_RET_PACKET_NOT_READY;
 			}
 
-			memcpy(pPayload, (uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx, pPvtData->payloadSize);
+			if (!dropThisPacketForWarmup) {
+				memcpy(pPayload, (uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx, pPvtData->payloadSize);
+				pPayload += pPvtData->payloadSize;
+			}
 			bytesProcessed += pPvtData->payloadSize;
-
 			pMediaQItem->readIdx += pPvtData->payloadSize;
 			if (pMediaQItem->readIdx >= pMediaQItem->dataLen) {
 				// Finished reading the entire item
@@ -592,6 +1314,9 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				// More to read next interval
 				openavbMediaQTailUnlock(pMediaQ);
 			}
+			if (dropThisPacketForWarmup) {
+				pPvtData->selectedClockWarmupDropCount++;
+			}
 		}
 		else {
 			openavbMediaQTailPull(pMediaQ);
@@ -600,10 +1325,41 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 
 	// Set out bound data length (entire packet length)
 	*dataLen = bytesNeeded + TOTAL_HEADER_SIZE;
+	if (dropForWarmup) {
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+		pPvtData->lastLaunchTimeNs = 0;
+		pPvtData->lastLaunchTimeValid = FALSE;
+#endif
+		*dataLen = 0;
+		AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
+		return TX_CB_RET_PACKET_NOT_READY;
+	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
 	return TX_CB_RET_PACKET_READY;
 }
+
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+bool openavbMapAVTPAudioLTCalcCB(media_q_t *pMediaQ, U64 *lt)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_MAP_DETAIL);
+
+	if (!pMediaQ || !lt) {
+		AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
+		return FALSE;
+	}
+
+	pvt_data_t *pPvtData = pMediaQ->pPvtMapInfo;
+	if (!pPvtData || !pPvtData->lastLaunchTimeValid) {
+		AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
+		return FALSE;
+	}
+
+	*lt = pPvtData->lastLaunchTimeNs;
+	AVB_TRACE_EXIT(AVB_TRACE_MAP_DETAIL);
+	return TRUE;
+}
+#endif
 
 // A call to this callback indicates that this mapping module will be
 // a listener. Any listener initialization can be done in this function.
@@ -921,6 +1677,9 @@ extern DLL_EXPORT bool openavbMapAVTPAudioInitialize(media_q_t *pMediaQ, openavb
 		pMapCB->map_rx_cb = openavbMapAVTPAudioRxCB;
 		pMapCB->map_end_cb = openavbMapAVTPAudioEndCB;
 		pMapCB->map_gen_end_cb = openavbMapAVTPAudioGenEndCB;
+#if ATL_LAUNCHTIME_ENABLED || IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+		pMapCB->map_lt_calc_cb = openavbMapAVTPAudioLTCalcCB;
+#endif
 
 		pPvtData->itemCount = 20;
 		pPvtData->txInterval = 4000;  // default to something that wont cause divide by zero
@@ -931,7 +1690,14 @@ extern DLL_EXPORT bool openavbMapAVTPAudioInitialize(media_q_t *pMediaQ, openavb
 		pPvtData->mcrRecoveryInterval = 512;
 		pPvtData->aaf_event_field = AAF_STATIC_CHANNELS_LAYOUT;
 		pPvtData->intervalCounter = 0;
+		pPvtData->txLeadLogEveryPackets = 4000;
+		pPvtData->txLeadLogCounter = 0;
+		pPvtData->txPhaseDiagEveryPackets = 0;
+		pPvtData->txMinLeadUsec = 1000;
+		pPvtData->selectedClockWarmupUsec = 0;
+		pPvtData->selectedClockFollowUpdates = TRUE;
 		pPvtData->mediaQItemSyncTS = FALSE;
+		mapAafResetTxPhaseDiag(pPvtData);
 		openavbMediaQSetMaxLatency(pMediaQ, inMaxTransitUsec);
 	}
 
