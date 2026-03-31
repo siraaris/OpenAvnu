@@ -58,11 +58,45 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define OPENAVB_AECP_MESSAGE_TYPE_EXTENDED_COMMAND (14)
 #define OPENAVB_AECP_MESSAGE_TYPE_EXTENDED_RESPONSE (15)
 
-#define OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS (62)
+#define OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS (63)
+#define OPENAVB_AECP_DYNAMIC_INFO_DATA_LENGTH (1400)
+#define OPENAVB_AECP_MVU_PROTOCOL_ID_LENGTH (6)
+
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MILAN_INFO (0x0000)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_SET_SYSTEM_UNIQUE_ID (0x0001)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_GET_SYSTEM_UNIQUE_ID (0x0002)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_SET_MEDIA_CLOCK_REFERENCE_INFO (0x0003)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MEDIA_CLOCK_REFERENCE_INFO (0x0004)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_BIND_STREAM (0x0005)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_UNBIND_STREAM (0x0006)
+#define OPENAVB_AECP_MVU_COMMAND_TYPE_GET_STREAM_INPUT_INFO_EX (0x0007)
+
+#define OPENAVB_AECP_MILAN_INFO_FEATURE_FLAG_REDUNDANCY (1u << 0)
+#define OPENAVB_AECP_MILAN_INFO_FEATURE_FLAG_TALKER_DYNAMIC_MAPPINGS_WHILE_RUNNING (1u << 1)
+#define OPENAVB_AECP_MILAN_INFO_FEATURE_FLAG_MVU_BINDING (1u << 2)
+#define OPENAVB_AECP_MILAN_INFO_FEATURE_FLAG_TALKER_SIGNAL_PRESENCE (1u << 3)
 
 // status field IEEE Std 1722.1-2013 clause 9.2.1.1.6
 #define OPENAVB_AECP_STATUS_SUCCESS (0)
 #define OPENAVB_AECP_STATUS_NOT_IMPLEMENTED (1)
+
+#define OPENAVB_AECP_AA_STATUS_SUCCESS (0)
+#define OPENAVB_AECP_AA_STATUS_NOT_IMPLEMENTED (1)
+#define OPENAVB_AECP_AA_STATUS_ADDRESS_TOO_LOW (2)
+#define OPENAVB_AECP_AA_STATUS_ADDRESS_TOO_HIGH (3)
+#define OPENAVB_AECP_AA_STATUS_ADDRESS_INVALID (4)
+#define OPENAVB_AECP_AA_STATUS_TLV_INVALID (5)
+#define OPENAVB_AECP_AA_STATUS_DATA_INVALID (6)
+#define OPENAVB_AECP_AA_STATUS_UNSUPPORTED (7)
+
+// Milan Vendor Unique AECP status field
+#define OPENAVB_AECP_MVU_STATUS_SUCCESS (0)
+#define OPENAVB_AECP_MVU_STATUS_NOT_IMPLEMENTED (1)
+#define OPENAVB_AECP_MVU_STATUS_NO_SUCH_DESCRIPTOR (2)
+#define OPENAVB_AECP_MVU_STATUS_ENTITY_LOCKED (3)
+#define OPENAVB_AECP_MVU_STATUS_BAD_ARGUMENTS (7)
+#define OPENAVB_AECP_MVU_STATUS_ENTITY_MISBEHAVING (10)
+#define OPENAVB_AECP_MVU_STATUS_PAYLOAD_TOO_SHORT (13)
 
 typedef struct {
 	U8 cd;
@@ -88,7 +122,10 @@ typedef struct {
 } openavb_aecp_command_data_acquire_entity_t;
 
 typedef struct {
-	// No command specific data
+	U32 flags;
+	U8 locked_id[8];
+	U16 descriptor_type;
+	U16 descriptor_index;
 } openavb_aecp_commandresponse_data_lock_entity_t;
 
 typedef struct {
@@ -112,6 +149,20 @@ typedef struct {
 	U16 descriptor_length;
 	U8 descriptor_data[508];
 } openavb_aecp_response_data_read_descriptor_t;
+
+typedef struct {
+	U16 reserved;
+	U16 configuration_index;
+} openavb_aecp_commandresponse_data_set_configuration_t;
+
+typedef struct {
+	// No command specific data
+} openavb_aecp_command_data_get_configuration_t;
+
+typedef struct {
+	U16 reserved;
+	U16 configuration_index;
+} openavb_aecp_response_data_get_configuration_t;
 
 // SET_STREAM_FORMAT command and response IEEE Std 1722.1-2013 clause 7.4.9
 typedef struct {
@@ -169,7 +220,54 @@ typedef struct {
 	U8 msrp_failure_bridge_id[8];
 	U16 stream_vlan_id;
 	U16 reserved_2;
+	U32 flags_ex;			// Extension flags (Milan / IEEE 1722.1-2021)
 } openavb_aecp_response_data_get_stream_info_t;
+
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 name_index;
+	U16 configuration_index;
+	U8 name[OPENAVB_AEM_STRLEN_MAX];
+} openavb_aecp_commandresponse_data_set_name_t;
+
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 name_index;
+	U16 configuration_index;
+} openavb_aecp_command_data_get_name_t;
+
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 name_index;
+	U16 configuration_index;
+	U8 name[OPENAVB_AEM_STRLEN_MAX];
+} openavb_aecp_response_data_get_name_t;
+
+typedef struct {
+	U8 association_id[8];
+} openavb_aecp_commandresponse_data_set_association_id_t;
+
+typedef struct {
+	// No command specific data
+} openavb_aecp_command_data_get_association_id_t;
+
+typedef struct {
+	U8 association_id[8];
+} openavb_aecp_response_data_get_association_id_t;
+
+typedef struct {
+	U16 configuration_index;
+	U16 memory_object_index;
+} openavb_aecp_command_data_get_memory_object_length_t;
+
+typedef struct {
+	U16 configuration_index;
+	U16 memory_object_index;
+	U64 length;
+} openavb_aecp_response_data_get_memory_object_length_t;
 
 // SET_SAMPLING_RATE command and response IEEE Std 1722.1-2013 clause 7.4.21
 typedef struct {
@@ -386,6 +484,7 @@ typedef struct {
 	U16 descriptor_type;
 	U16 descriptor_index;
 	U16 map_index;
+	U16 reserved;
 } openavb_aecp_command_data_get_audio_map_t;
 
 // GET_AUDIO_MAP response IEEE Std 1722.1-2013 clause 7.4.46
@@ -399,6 +498,15 @@ typedef struct {
 	openavb_aecp_audio_mapping_t mappings[OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS];
 	U16 mappingsCount;		// Not part of spec. Used to track elements in arrays.
 } openavb_aecp_response_data_get_audio_map_t;
+
+typedef struct {
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U16 number_of_mappings;
+	U16 reserved;
+	openavb_aecp_audio_mapping_t mappings[OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS];
+	U16 mappingsCount;		// Not part of spec. Used to track elements in arrays.
+} openavb_aecp_commandresponse_data_audio_mappings_t;
 
 // GET_COUNTERS command IEEE Std 1722.1-2013 clause 7.4.42
 typedef struct {
@@ -415,6 +523,74 @@ typedef struct {
 	U8 counters_block[128];
 } openavb_aecp_response_data_get_counters_t;
 
+typedef struct {
+	U16 payload_length;
+	U8 payload[OPENAVB_AECP_DYNAMIC_INFO_DATA_LENGTH];
+} openavb_aecp_commandresponse_data_get_dynamic_info_t;
+
+typedef struct {
+	U16 flags;
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U8 talker_entity_id[8];
+	U16 talker_stream_index;
+	U16 reserved;
+} openavb_aecp_mvu_commandresponse_data_bind_stream_t;
+
+typedef struct {
+	U16 reserved_0;
+	U16 descriptor_type;
+	U16 descriptor_index;
+} openavb_aecp_mvu_commandresponse_data_unbind_stream_t;
+
+typedef struct {
+	U16 reserved_0;
+} openavb_aecp_mvu_commandresponse_data_get_milan_info_t;
+
+typedef struct {
+	U16 reserved_0;
+	U32 protocol_version;
+	U32 features_flags;
+	U32 certification_version;
+	U32 specification_version;
+} openavb_aecp_mvu_response_data_get_milan_info_t;
+
+typedef struct {
+	U16 reserved_0;
+	U64 system_unique_id;
+	U8 system_name[OPENAVB_AEM_STRLEN_MAX];
+} openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t;
+
+typedef struct {
+	U16 reserved_0;
+} openavb_aecp_mvu_commandresponse_data_get_system_unique_id_t;
+
+typedef openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t openavb_aecp_mvu_response_data_get_system_unique_id_t;
+
+typedef struct {
+	U16 clock_domain_index;
+} openavb_aecp_mvu_commandresponse_data_get_media_clock_reference_info_t;
+
+typedef struct {
+	U16 clock_domain_index;
+	U8 flags;
+	U8 reserved_0;
+	U8 default_media_clock_priority;
+	U8 user_media_clock_priority;
+	U32 reserved_1;
+	U8 media_clock_domain_name[OPENAVB_AEM_STRLEN_MAX];
+} openavb_aecp_mvu_response_data_get_media_clock_reference_info_t;
+
+typedef struct {
+	U16 reserved_0;
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U8 talker_entity_id[8];
+	U16 talker_unique_id;
+	U8 probing_acmp_status;
+	U8 reserved_1;
+} openavb_aecp_mvu_response_data_get_stream_input_info_ex_t;
+
 
 typedef struct {
 	U8 u;
@@ -430,6 +606,10 @@ typedef struct {
 		openavb_aecp_commandresponse_data_controller_available_t controllerAvailableRsp;
 		openavb_aecp_command_data_read_descriptor_t readDescriptorCmd;
 		openavb_aecp_response_data_read_descriptor_t readDescriptorRsp;
+		openavb_aecp_commandresponse_data_set_configuration_t setConfigurationCmd;
+		openavb_aecp_commandresponse_data_set_configuration_t setConfigurationRsp;
+		openavb_aecp_command_data_get_configuration_t getConfigurationCmd;
+		openavb_aecp_response_data_get_configuration_t getConfigurationRsp;
 		openavb_aecp_commandresponse_data_set_stream_format_t setStreamFormatCmd;
 		openavb_aecp_commandresponse_data_set_stream_format_t setStreamFormatRsp;
 		openavb_aecp_command_data_get_stream_format_t getStreamFormatCmd;
@@ -438,6 +618,14 @@ typedef struct {
 		openavb_aecp_commandresponse_data_set_stream_info_t setStreamInfoRsp;
 		openavb_aecp_command_data_get_stream_info_t getStreamInfoCmd;
 		openavb_aecp_response_data_get_stream_info_t getStreamInfoRsp;
+		openavb_aecp_commandresponse_data_set_name_t setNameCmd;
+		openavb_aecp_commandresponse_data_set_name_t setNameRsp;
+		openavb_aecp_command_data_get_name_t getNameCmd;
+		openavb_aecp_response_data_get_name_t getNameRsp;
+		openavb_aecp_commandresponse_data_set_association_id_t setAssociationIDCmd;
+		openavb_aecp_commandresponse_data_set_association_id_t setAssociationIDRsp;
+		openavb_aecp_command_data_get_association_id_t getAssociationIDCmd;
+		openavb_aecp_response_data_get_association_id_t getAssociationIDRsp;
 		openavb_aecp_commandresponse_data_set_sampling_rate_t setSamplingRateCmd;
 		openavb_aecp_commandresponse_data_set_sampling_rate_t setSamplingRateRsp;
 		openavb_aecp_command_data_get_sampling_rate_t getSamplingRateCmd;
@@ -462,8 +650,30 @@ typedef struct {
 		openavb_aecp_response_data_get_max_transit_time_t getMaxTransitTimeRsp;
 		openavb_aecp_command_data_get_audio_map_t getAudioMapCmd;
 		openavb_aecp_response_data_get_audio_map_t getAudioMapRsp;
+		openavb_aecp_commandresponse_data_audio_mappings_t addAudioMappingsCmd;
+		openavb_aecp_commandresponse_data_audio_mappings_t addAudioMappingsRsp;
+		openavb_aecp_commandresponse_data_audio_mappings_t removeAudioMappingsCmd;
+		openavb_aecp_commandresponse_data_audio_mappings_t removeAudioMappingsRsp;
 		openavb_aecp_command_data_get_counters_t getCountersCmd;
 		openavb_aecp_response_data_get_counters_t getCountersRsp;
+		openavb_aecp_command_data_get_memory_object_length_t getMemoryObjectLengthCmd;
+		openavb_aecp_response_data_get_memory_object_length_t getMemoryObjectLengthRsp;
+		openavb_aecp_commandresponse_data_get_dynamic_info_t getDynamicInfoCmd;
+		openavb_aecp_commandresponse_data_get_dynamic_info_t getDynamicInfoRsp;
+		openavb_aecp_mvu_commandresponse_data_get_milan_info_t getMilanInfoCmd;
+		openavb_aecp_mvu_response_data_get_milan_info_t getMilanInfoRsp;
+		openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t setSystemUniqueIdCmd;
+		openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t setSystemUniqueIdRsp;
+		openavb_aecp_mvu_commandresponse_data_get_system_unique_id_t getSystemUniqueIdCmd;
+		openavb_aecp_mvu_response_data_get_system_unique_id_t getSystemUniqueIdRsp;
+		openavb_aecp_mvu_commandresponse_data_get_media_clock_reference_info_t getMediaClockReferenceInfoCmd;
+		openavb_aecp_mvu_response_data_get_media_clock_reference_info_t getMediaClockReferenceInfoRsp;
+		openavb_aecp_mvu_commandresponse_data_bind_stream_t bindStreamCmd;
+		openavb_aecp_mvu_commandresponse_data_bind_stream_t bindStreamRsp;
+		openavb_aecp_mvu_commandresponse_data_unbind_stream_t unbindStreamCmd;
+		openavb_aecp_mvu_commandresponse_data_unbind_stream_t unbindStreamRsp;
+		openavb_aecp_mvu_commandresponse_data_unbind_stream_t getStreamInputInfoExCmd;
+		openavb_aecp_mvu_response_data_get_stream_input_info_ex_t getStreamInputInfoExRsp;
 	} command_data;
 } openavb_aecp_entity_model_data_unit_t;
 
@@ -477,6 +687,7 @@ typedef struct {
 	U8 host[ETH_ALEN];
 	openavb_aecp_control_header_t headers;
 	openavb_aecp_common_data_unit_t commonPdu;
+	U8 protocol_id[OPENAVB_AECP_MVU_PROTOCOL_ID_LENGTH];
 	openavb_aecp_entity_model_data_unit_t entityModelPdu;
 } openavb_aecp_AEMCommandResponse_t;
 

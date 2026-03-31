@@ -43,7 +43,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_aem_types_pub.h"
 #include "openavb_aem_pub.h"
 
-#define OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_SAMPLING_RATES (62)
+#define OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS (63)
+#define OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_SAMPLING_RATES OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS
 
 // AUDIO UNIT Descriptor : Audio Mappings Format IEEE Std 1722.1-2013 clause 7.2.19.1
 typedef struct {
@@ -61,7 +62,7 @@ typedef struct {
 	U16 descriptor_index;											// Set internally
 	U16 mappings_offset;
 	U16 number_of_mappings;
-	openavb_aem_descriptor_audio_map_audio_mapping_format_t mapping_formats[OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_SAMPLING_RATES];
+	openavb_aem_descriptor_audio_map_audio_mapping_format_t mapping_formats[OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS];
 } openavb_aem_descriptor_audio_map_t;
 
 openavb_aem_descriptor_audio_map_t *openavbAemDescriptorAudioMapNew();

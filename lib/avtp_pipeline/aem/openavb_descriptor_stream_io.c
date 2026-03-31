@@ -353,17 +353,114 @@ extern DLL_EXPORT openavb_aem_descriptor_stream_io_t *openavbAemDescriptorStream
  *      Initial and static values for stream input / output descriptors.
  *      ToDo : read actual endpoint configuration.
  */
+static U8 aafNominalSampleRateFromHz(U32 rateHz)
+{
+	switch (rateHz) {
+	case 8000:   return 0x01;
+	case 16000:  return 0x02;
+	case 32000:  return 0x03;
+	case 44100:  return 0x04;
+	case 48000:  return 0x05;
+	case 88200:  return 0x06;
+	case 96000:  return 0x07;
+	case 176400: return 0x08;
+	case 192000: return 0x09;
+	case 24000:  return 0x0a;
+	default:     return 0x05;
+	}
+}
+
 static void fillInStreamFormat(openavb_aem_descriptor_stream_io_t *pDescriptor, const openavb_avdecc_configuration_cfg_t *pConfig)
 {	// AVDECC_TODO - Specify the stream format information for MMA Stream Format.
-	if (strcmp(pConfig->stream->map_fn,"openavbMapAVTPAudioInitialize") == 0)
+	U32 crfBaseFreq = 0;
+	U8 crfFormatBytes[8] = {0};
+	U8 audioChannels = 2;
+	U8 audioBitDepth = 32;
+	U8 nominalSampleRate = 0x05;
+
+	if (pConfig && pConfig->stream) {
+		crfBaseFreq = pConfig->stream->audioRate;
+		if (pConfig->stream->audioChannels > 0) {
+			audioChannels = pConfig->stream->audioChannels;
+		}
+		if (pConfig->stream->audioBitDepth > 0) {
+			audioBitDepth = pConfig->stream->audioBitDepth;
+		}
+		if (pConfig->stream->current_sampling_rate > 0) {
+			nominalSampleRate = aafNominalSampleRateFromHz(pConfig->stream->current_sampling_rate);
+		}
+		else if (pConfig->stream->audioRate > 0) {
+			nominalSampleRate = aafNominalSampleRateFromHz(pConfig->stream->audioRate);
+		}
+	}
+
+	switch (crfBaseFreq) {
+	case 44100:
+		crfFormatBytes[0] = 0x04;
+		crfFormatBytes[1] = 0x10;
+		crfFormatBytes[2] = 0x60;
+		crfFormatBytes[3] = 0x01;
+		crfFormatBytes[4] = 0x00;
+		crfFormatBytes[5] = 0x00;
+		crfFormatBytes[6] = 0xAC;
+		crfFormatBytes[7] = 0x44;
+		break;
+	case 96000:
+		crfFormatBytes[0] = 0x04;
+		crfFormatBytes[1] = 0x10;
+		crfFormatBytes[2] = 0xC0;
+		crfFormatBytes[3] = 0x01;
+		crfFormatBytes[4] = 0x00;
+		crfFormatBytes[5] = 0x01;
+		crfFormatBytes[6] = 0x77;
+		crfFormatBytes[7] = 0x00;
+		break;
+	case 192000:
+		crfFormatBytes[0] = 0x04;
+		crfFormatBytes[1] = 0x11;
+		crfFormatBytes[2] = 0x80;
+		crfFormatBytes[3] = 0x01;
+		crfFormatBytes[4] = 0x00;
+		crfFormatBytes[5] = 0x02;
+		crfFormatBytes[6] = 0xEE;
+		crfFormatBytes[7] = 0x00;
+		break;
+	case 48000:
+	default:
+		crfFormatBytes[0] = 0x04;
+		crfFormatBytes[1] = 0x10;
+		crfFormatBytes[2] = 0x60;
+		crfFormatBytes[3] = 0x01;
+		crfFormatBytes[4] = 0x00;
+		crfFormatBytes[5] = 0x00;
+		crfFormatBytes[6] = 0xBB;
+		crfFormatBytes[7] = 0x80;
+		break;
+	}
+
+	if (strcmp(pConfig->stream->map_fn,"openavbMapAVTPAudioInitialize") == 0 ||
+			strcmp(pConfig->stream->map_fn,"openavbMapNullInitialize") == 0)
 	{
+		U32 samplesPerFrame = 6;
+		if (pConfig->stream->audioRate > 0 && pConfig->stream->map_tx_rate > 0) {
+			samplesPerFrame = pConfig->stream->audioRate / pConfig->stream->map_tx_rate;
+			if ((pConfig->stream->audioRate % pConfig->stream->map_tx_rate) != 0) {
+				samplesPerFrame += 1;
+			}
+			if (samplesPerFrame == 0) {
+				samplesPerFrame = 1;
+			}
+			if (samplesPerFrame > 1023) {
+				samplesPerFrame = 1023;
+			}
+		}
 		pDescriptor->stream_formats[0].v = 0;
 		pDescriptor->stream_formats[0].subtype = OPENAVB_AEM_STREAM_FORMAT_AVTP_AUDIO_SUBTYPE;
-		pDescriptor->stream_formats[0].subtypes.avtp_audio.nominal_sample_rate = 0x05;
+		pDescriptor->stream_formats[0].subtypes.avtp_audio.nominal_sample_rate = nominalSampleRate;
 		pDescriptor->stream_formats[0].subtypes.avtp_audio.format = 2;
-		pDescriptor->stream_formats[0].subtypes.avtp_audio.bit_depth = 32;
-		pDescriptor->stream_formats[0].subtypes.avtp_audio.channels_per_frame = 2;
-		pDescriptor->stream_formats[0].subtypes.avtp_audio.samples_per_frame = 6;
+		pDescriptor->stream_formats[0].subtypes.avtp_audio.bit_depth = audioBitDepth;
+		pDescriptor->stream_formats[0].subtypes.avtp_audio.channels_per_frame = audioChannels;
+		pDescriptor->stream_formats[0].subtypes.avtp_audio.samples_per_frame = (U16)samplesPerFrame;
 	}
 	else if (strcmp(pConfig->stream->map_fn,"openavbMapUncmpAudioInitialize") == 0)
 	{
@@ -402,6 +499,14 @@ static void fillInStreamFormat(openavb_aem_descriptor_stream_io_t *pDescriptor, 
 		pDescriptor->stream_formats[0].subtypes.avtp_control.format_id[4] = 0x00;
 		pDescriptor->stream_formats[0].subtypes.avtp_control.format_id[5] = 0x00;
 	}
+	else if (strcmp(pConfig->stream->map_fn,"openavbMapCrfInitialize") == 0)
+	{
+		pDescriptor->stream_formats[0].v = 0;
+		pDescriptor->stream_formats[0].subtype = OPENAVB_AEM_STREAM_FORMAT_AVTP_CONTROL_SUBTYPE;
+		// protocol_type is a 4-bit field; the high nibble of the packed CRF byte carries the type.
+		pDescriptor->stream_formats[0].subtypes.avtp_control.protocol_type = (crfFormatBytes[1] >> 4);
+		memcpy(pDescriptor->stream_formats[0].subtypes.avtp_control.format_id, &crfFormatBytes[2], 6);
+	}
 	else if (strcmp(pConfig->stream->map_fn,"openavbMapMpeg2tsInitialize") == 0)
 	{
 		pDescriptor->stream_formats[0].v = 0;
@@ -435,8 +540,14 @@ extern DLL_EXPORT bool openavbAemDescriptorStreamInputInitialize(openavb_aem_des
 		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVDECC_FAILURE | OPENAVB_RC_INVALID_ARGUMENT), AVB_TRACE_AEM);
 	}
 
-	// Specify a name.
-	sprintf((char *)(pDescriptor->object_name), "Stream Input %u", pDescriptor->descriptor_index);
+	// Use a Milan-style name for CRF stream inputs so controllers display
+	// them distinctly from audio streams.
+	if (pConfig->stream_is_crf) {
+		sprintf((char *)(pDescriptor->object_name), "Input Clock Stream");
+	}
+	else {
+		sprintf((char *)(pDescriptor->object_name), "Stream Input %u", pDescriptor->descriptor_index);
+	}
 
 	// Specify the stream flags.
 	// The stream configuration is ignored for Listeners, as Listeners will accept both Class A and Class B.
@@ -458,8 +569,14 @@ extern DLL_EXPORT bool openavbAemDescriptorStreamOutputInitialize(openavb_aem_de
 		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVDECC_FAILURE | OPENAVB_RC_INVALID_ARGUMENT), AVB_TRACE_AEM);
 	}
 
-	// Specify a name.
-	sprintf((char *)(pDescriptor->object_name), "Stream Output %u", pDescriptor->descriptor_index);
+	// Use a Milan-style name for CRF stream outputs so controllers display
+	// them distinctly from audio streams.
+	if (pConfig->stream_is_crf) {
+		sprintf((char *)(pDescriptor->object_name), "Output Clock Stream");
+	}
+	else {
+		sprintf((char *)(pDescriptor->object_name), "Stream Output %u", pDescriptor->descriptor_index);
+	}
 
 	// Specify the stream flags.
 	if (pConfig->stream->sr_class == SR_CLASS_A) { pDescriptor->stream_flags |= OPENAVB_AEM_STREAM_FLAG_CLASS_A; }

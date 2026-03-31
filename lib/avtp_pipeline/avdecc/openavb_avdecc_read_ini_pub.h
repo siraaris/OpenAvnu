@@ -126,6 +126,8 @@ struct openavb_tl_data_cfg {
 	char friendly_name[FRIENDLY_NAME_SIZE];
 	/// The name of the initialize function in the mapper
 	char map_fn[100];
+	/// map_nv_tx_rate (packets/sec), used by AVDECC descriptor generation
+	U32 map_tx_rate;
 
 	// Pointer to the client Talker/Listener.
 	// Do not free this item; it is for reference only.

@@ -56,6 +56,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_adp.h"
 #include "openavb_acmp_sm_talker.h"
 #include "openavb_acmp_sm_listener.h"
+#include "openavb_aecp_sm_entity_model_entity.h"
+#include "openavb_srp_api.h"
 
 #include "openavb_avdecc_msg_server.h"
 #include "openavb_trace.h"
@@ -72,6 +74,125 @@ static bool openavbAvdeccMsgSrvrReceiveFromClient(int avdeccMsgHandle, openavbAv
 // the following are from openavb_avdecc.c
 extern openavb_avdecc_cfg_t gAvdeccCfg;
 extern openavb_tl_data_cfg_t * streamList;
+
+static openavb_aem_descriptor_stream_io_t *openavbAvdeccMsgFindStreamDescriptor(
+	U16 configIdx,
+	openavb_tl_data_cfg_t *pStream,
+	U16 *pDescriptorType,
+	U16 *pDescriptorIndex)
+{
+	U16 descriptorTypes[2] = {
+		OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT,
+		OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT
+	};
+	U16 typeIdx;
+
+	if (!pStream) {
+		return NULL;
+	}
+
+	for (typeIdx = 0; typeIdx < 2; ++typeIdx) {
+		U16 descriptorType = descriptorTypes[typeIdx];
+		U16 descriptorIndex = 0;
+		while (1) {
+			openavb_aem_descriptor_stream_io_t *pDescriptor =
+				openavbAemGetDescriptor(configIdx, descriptorType, descriptorIndex);
+			if (!pDescriptor) {
+				break;
+			}
+
+			if (pDescriptor->stream == pStream) {
+				if (pDescriptorType) {
+					*pDescriptorType = descriptorType;
+				}
+				if (pDescriptorIndex) {
+					*pDescriptorIndex = descriptorIndex;
+				}
+				return pDescriptor;
+			}
+			descriptorIndex++;
+		}
+	}
+
+	return NULL;
+}
+
+static bool openavbAvdeccMsgCountersAffectStreamState(
+	const openavb_avtp_diag_counters_t *pPrevious,
+	const openavb_avtp_diag_counters_t *pCurrent)
+{
+	if (!pPrevious || !pCurrent) {
+		return FALSE;
+	}
+
+	return (
+		pPrevious->stream_start != pCurrent->stream_start ||
+		pPrevious->stream_stop != pCurrent->stream_stop ||
+		pPrevious->stream_interrupted != pCurrent->stream_interrupted ||
+		pPrevious->media_locked != pCurrent->media_locked ||
+		pPrevious->media_unlocked != pCurrent->media_unlocked);
+}
+
+static void openavbAvdeccMsgSrvrSyncInitialClockSourceToClient(
+	int avdeccMsgHandle,
+	openavb_tl_data_cfg_t *pStream)
+{
+	U16 configIdx = openavbAemGetConfigIdx();
+	U16 streamDescriptorType = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 streamDescriptorIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_stream_io_t *pStreamDescriptor =
+		openavbAvdeccMsgFindStreamDescriptor(
+			configIdx,
+			pStream,
+			&streamDescriptorType,
+			&streamDescriptorIndex);
+
+	if (!pStreamDescriptor) {
+		AVB_LOGF_WARNING("Clock source init sync skipped: stream descriptor not found (client=%d, name=%s)",
+			avdeccMsgHandle,
+			(pStream && pStream->friendly_name[0]) ? pStream->friendly_name : "<unknown>");
+		return;
+	}
+
+	if (pStreamDescriptor->clock_domain_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return;
+	}
+
+	openavb_aem_descriptor_clock_domain_t *pClockDomain =
+		openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, pStreamDescriptor->clock_domain_index);
+	if (!pClockDomain || pClockDomain->clock_source_index == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+		return;
+	}
+
+	openavb_aem_descriptor_clock_source_t *pClockSource =
+		openavbAemGetDescriptor(configIdx, OPENAVB_AEM_DESCRIPTOR_CLOCK_SOURCE, pClockDomain->clock_source_index);
+	if (!pClockSource) {
+		return;
+	}
+
+	if (!openavbAvdeccMsgSrvrClockSourceUpdate(
+			avdeccMsgHandle,
+			pClockDomain->descriptor_index,
+			pClockSource->descriptor_index,
+			pClockSource->clock_source_flags,
+			pClockSource->clock_source_type,
+			pClockSource->clock_source_location_type,
+			pClockSource->clock_source_location_index)) {
+		AVB_LOGF_WARNING("Clock source init sync failed: client=%d domain=%u source=%u",
+			avdeccMsgHandle,
+			pClockDomain->descriptor_index,
+			pClockSource->descriptor_index);
+		return;
+	}
+
+	AVB_LOGF_INFO("Clock source init sync: client=%d stream=%s type=0x%04x idx=%u domain=%u source=%u",
+		avdeccMsgHandle,
+		(pStream && pStream->friendly_name[0]) ? pStream->friendly_name : "<unknown>",
+		streamDescriptorType,
+		streamDescriptorIndex,
+		pClockDomain->descriptor_index,
+		pClockSource->descriptor_index);
+}
 
 
 static bool openavbAvdeccMsgSrvrReceiveFromClient(int avdeccMsgHandle, openavbAvdeccMessage_t *msg)
@@ -105,9 +226,20 @@ static bool openavbAvdeccMsgSrvrReceiveFromClient(int avdeccMsgHandle, openavbAv
 				msg->params.c2sTalkerStreamID.stream_dest_mac,
 				ntohs(msg->params.c2sTalkerStreamID.stream_vlan_id));
 			break;
+		case OPENAVB_AVDECC_MSG_C2S_LISTENER_SRP_INFO:
+			AVB_LOG_DEBUG("Message received:  OPENAVB_AVDECC_MSG_C2S_LISTENER_SRP_INFO");
+			ret = openavbAvdeccMsgSrvrHndlListenerSrpInfoFromClient(avdeccMsgHandle,
+				msg->params.c2sListenerSrpInfo.talker_decl,
+				msg->params.c2sListenerSrpInfo.msrp_failure_code,
+				msg->params.c2sListenerSrpInfo.msrp_failure_bridge_id);
+			break;
 		case OPENAVB_AVDECC_MSG_CLIENT_CHANGE_NOTIFICATION:
 			AVB_LOG_DEBUG("Message received:  OPENAVB_AVDECC_MSG_CLIENT_CHANGE_NOTIFICATION");
 			ret = openavbAvdeccMsgSrvrHndlChangeNotificationFromClient(avdeccMsgHandle, (openavbAvdeccMsgStateType_t) msg->params.clientChangeNotification.current_state);
+			break;
+		case OPENAVB_AVDECC_MSG_C2S_COUNTERS_UPDATE:
+			AVB_LOG_DEBUG("Message received:  OPENAVB_AVDECC_MSG_C2S_COUNTERS_UPDATE");
+			ret = openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(avdeccMsgHandle, &msg->params.c2sCountersUpdate.counters);
 			break;
 		default:
 			AVB_LOG_ERROR("Unexpected message received at server");
@@ -199,6 +331,9 @@ bool openavbAvdeccMsgSrvrHndlInitIdentifyFromClient(int avdeccMsgHandle, char * 
 	pState->stream = currentStream;
 	currentStream->client = pState;
 
+	// Push the active clock-domain source to newly attached clients.
+	openavbAvdeccMsgSrvrSyncInitialClockSourceToClient(avdeccMsgHandle, currentStream);
+
 	AVB_LOGF_INFO("Client %d Detected, friendly_name:  %s",
 		avdeccMsgHandle, friendly_name);
 
@@ -249,6 +384,108 @@ bool openavbAvdeccMsgSrvrHndlTalkerStreamIDFromClient(int avdeccMsgHandle, U8 sr
 	return true;
 }
 
+bool openavbAvdeccMsgSrvrHndlListenerSrpInfoFromClient(int avdeccMsgHandle, U8 talker_decl, U8 msrp_failure_code, const U8 msrp_failure_bridge_id[8])
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	if (!pState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	if (!pState->stream) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d stream not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	U16 streamDescriptorType = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	U16 streamDescriptorIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	openavb_aem_descriptor_stream_io_t *pDescriptor = openavbAvdeccMsgFindStreamDescriptor(
+		openavbAemGetConfigIdx(),
+		pState->stream,
+		&streamDescriptorType,
+		&streamDescriptorIndex);
+	if (!pDescriptor) {
+		AVB_LOGF_WARNING("Unable to map Listener SRP info to descriptor (client=%d, stream=%s)",
+			avdeccMsgHandle,
+			(pState->stream->friendly_name[0] ? pState->stream->friendly_name : "<unknown>"));
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	if (talker_decl == openavbSrp_AtTyp_TalkerFailed) {
+		pDescriptor->acmp_flags |= OPENAVB_ACMP_FLAG_TALKER_FAILED;
+		pDescriptor->msrp_failure_code = msrp_failure_code;
+		if (msrp_failure_bridge_id != NULL) {
+			memcpy(pDescriptor->msrp_failure_bridge_id, msrp_failure_bridge_id, sizeof(pDescriptor->msrp_failure_bridge_id));
+		}
+		else {
+			memset(pDescriptor->msrp_failure_bridge_id, 0, sizeof(pDescriptor->msrp_failure_bridge_id));
+		}
+	}
+	else {
+		pDescriptor->acmp_flags &= ~OPENAVB_ACMP_FLAG_TALKER_FAILED;
+		pDescriptor->msrp_failure_code = 0;
+		memset(pDescriptor->msrp_failure_bridge_id, 0, sizeof(pDescriptor->msrp_failure_bridge_id));
+	}
+
+	if (talker_decl == openavbSrp_AtTyp_TalkerAdvertise ||
+			talker_decl == openavbSrp_AtTyp_TalkerFailed) {
+		pDescriptor->stream_info_flags_ex |= OPENAVB_STREAM_INFO_FLAGS_EX_REGISTERING;
+	}
+	else {
+		pDescriptor->stream_info_flags_ex &= ~OPENAVB_STREAM_INFO_FLAGS_EX_REGISTERING;
+	}
+
+	AVB_LOGF_INFO("Listener SRP info: client=%d desc=%u/%u decl=0x%02x failure=0x%02x flags_ex=0x%08x",
+		avdeccMsgHandle,
+		streamDescriptorType,
+		streamDescriptorIndex,
+		talker_decl,
+		pDescriptor->msrp_failure_code,
+		pDescriptor->stream_info_flags_ex);
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+	return true;
+}
+
+bool openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(int avdeccMsgHandle, const openavb_avtp_diag_counters_t *pCounters)
+{
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	openavb_avtp_diag_counters_t previousCounters;
+	bool notifyStreamState = FALSE;
+
+	if (!pState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		return false;
+	}
+	if (!pCounters) {
+		return false;
+	}
+
+	previousCounters = pState->counters;
+	pState->counters = *pCounters;
+	notifyStreamState = openavbAvdeccMsgCountersAffectStreamState(&previousCounters, pCounters);
+
+	if (notifyStreamState && pState->stream) {
+		U16 descriptorType = OPENAVB_AEM_DESCRIPTOR_INVALID;
+		U16 descriptorIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
+		openavb_aem_descriptor_stream_io_t *pDescriptor = openavbAvdeccMsgFindStreamDescriptor(
+			openavbAemGetConfigIdx(),
+			pState->stream,
+			&descriptorType,
+			&descriptorIndex);
+		if (pDescriptor) {
+			openavbAecpSMEntityModelEntityNotifyStreamState(descriptorType, descriptorIndex);
+		}
+	}
+
+	return true;
+}
+
 bool openavbAvdeccMsgSrvrListenerStreamID(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
@@ -270,6 +507,13 @@ bool openavbAvdeccMsgSrvrListenerStreamID(int avdeccMsgHandle, U8 sr_class, cons
 	pParams->stream_uid = htons(stream_uid);
 	memcpy(pParams->stream_dest_mac, stream_dest_mac, 6);
 	pParams->stream_vlan_id = htons(stream_vlan_id);
+	AVB_LOGF_INFO("Sending listener stream update: handle=%d class=%c stream=" ETH_FORMAT "/%u dest=" ETH_FORMAT " vlan=%u",
+		avdeccMsgHandle,
+		AVB_CLASS_LABEL(sr_class),
+		ETH_OCTETS(stream_src_mac),
+		stream_uid,
+		ETH_OCTETS(stream_dest_mac),
+		stream_vlan_id);
 	bool ret = openavbAvdeccMsgSrvrSendToClient(avdeccMsgHandle, &msgBuf);
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
@@ -325,11 +569,47 @@ bool openavbAvdeccMsgSrvrChangeRequest(int avdeccMsgHandle, openavbAvdeccMsgStat
 	openavbAvdeccMsgParams_ClientChangeRequest_t * pParams =
 		&(msgBuf.params.clientChangeRequest);
 	pParams->desired_state = (U8) desiredState;
+	AVB_LOGF_INFO("Sending change request: handle=%d state=%u", avdeccMsgHandle, desiredState);
 	bool ret = openavbAvdeccMsgSrvrSendToClient(avdeccMsgHandle, &msgBuf);
 	if (ret) {
 		// Save the requested state for future reference.
 		pState->lastRequestedState = desiredState;
 	}
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+	return ret;
+}
+
+bool openavbAvdeccMsgSrvrClockSourceUpdate(
+	int avdeccMsgHandle,
+	U16 clock_domain_index,
+	U16 clock_source_index,
+	U16 clock_source_flags,
+	U16 clock_source_type,
+	U16 clock_source_location_type,
+	U16 clock_source_location_index)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+	openavbAvdeccMessage_t msgBuf;
+
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	if (!pState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	memset(&msgBuf, 0, OPENAVB_AVDECC_MSG_LEN);
+	msgBuf.type = OPENAVB_AVDECC_MSG_CLOCK_SOURCE_UPDATE;
+	openavbAvdeccMsgParams_ClockSourceUpdate_t *pParams =
+		&(msgBuf.params.clockSourceUpdate);
+	pParams->clock_domain_index = htons(clock_domain_index);
+	pParams->clock_source_index = htons(clock_source_index);
+	pParams->clock_source_flags = htons(clock_source_flags);
+	pParams->clock_source_type = htons(clock_source_type);
+	pParams->clock_source_location_type = htons(clock_source_location_type);
+	pParams->clock_source_location_index = htons(clock_source_location_index);
+	bool ret = openavbAvdeccMsgSrvrSendToClient(avdeccMsgHandle, &msgBuf);
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
 	return ret;
@@ -425,8 +705,17 @@ bool openavbAvdeccMsgSrvrHndlChangeNotificationFromClient(int avdeccMsgHandle, o
 										ENTITYID_ARGS(controller_entity_id));
 								pDescriptor->fast_connect_status = OPENAVB_FAST_CONNECT_STATUS_TIMED_OUT;
 								memcpy(pDescriptor->fast_connect_talker_entity_id, talker_entity_id, sizeof(pDescriptor->fast_connect_talker_entity_id));
+								memset(pDescriptor->acmp_stream_id, 0, sizeof(pDescriptor->acmp_stream_id));
+								memset(pDescriptor->acmp_dest_addr, 0, sizeof(pDescriptor->acmp_dest_addr));
+								pDescriptor->acmp_stream_vlan_id = 0;
+								pDescriptor->acmp_flags = 0;
+								pDescriptor->msrp_failure_code = 0;
+								memset(pDescriptor->msrp_failure_bridge_id, 0, sizeof(pDescriptor->msrp_failure_bridge_id));
+								pDescriptor->stream_info_flags_ex &= ~OPENAVB_STREAM_INFO_FLAGS_EX_REGISTERING;
+								pDescriptor->mvu_acmp_status = OPENAVB_ACMP_STATUS_LISTENER_TALKER_TIMEOUT;
 								CLOCK_GETTIME(OPENAVB_CLOCK_REALTIME, &pDescriptor->fast_connect_start_time);
 								pDescriptor->fast_connect_start_time.tv_sec += 5;	// Give the Talker some time to shutdown or stabilize
+								openavbAecpSMEntityModelEntityNotifyStreamState(OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, listenerUniqueId);
 								break;
 							}
 						}
@@ -454,8 +743,9 @@ void openavbAvdeccMsgSrvrCloseClientConnection(int avdeccMsgHandle)
 	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
 	if (pState) {
 		AvdeccMsgStateListRemove(pState);
-		if (streamList && pState->stream) {
-			// Clear the stream pointer to this object.
+		if (pState->stream) {
+			// Clear the stream's back-pointer to this client state.
+			pState->stream->client = NULL;
 			pState->stream = NULL;
 		}
 		free(pState);

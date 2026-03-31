@@ -34,6 +34,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "openavb_acmp.h"
 #include "openavb_descriptor_stream_io_pub.h"
+#include "openavb_descriptor_clock_domain_pub.h"
+#include "openavb_descriptor_clock_source_pub.h"
 #include "openavb_avdecc_msg.h"
 
 
@@ -55,6 +57,12 @@ bool openavbAVDECCSetTalkerStreamInfo(
 	U8 stream_id_valid, const U8 stream_src_mac[6], U16 stream_uid,
 	U8 stream_dest_valid, const U8 stream_dest_mac[6],
 	U8 stream_vlan_id_valid, U16 stream_vlan_id);
+
+// Apply selected clock source for a clock domain.
+bool openavbAVDECCSetClockSource(
+	openavb_aem_descriptor_clock_domain_t *pDescriptorClockDomain,
+	openavb_aem_descriptor_clock_source_t *pDescriptorClockSource,
+	U16 configIdx);
 
 // Get the streaming state (stopped, running, paused, etc.) AVDECC told the talker or listener to use.
 openavbAvdeccMsgStateType_t openavbAVDECCGetRequestedState(openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput, U16 configIdx);

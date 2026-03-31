@@ -37,13 +37,19 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 
 #define	AVB_LOG_COMPONENT	"AEM"
 #include "openavb_log.h"
 
 #include "openavb_rawsock.h"
 #include "openavb_aem.h"
+#include "openavb_descriptor_entity_pub.h"
 #include "openavb_descriptor_clock_source.h"
+
+#ifndef AVB_PTP_AVAILABLE
+#include "openavb_grandmaster_osal_pub.h"
+#endif
 
 
 ////////////////////////////////
@@ -176,30 +182,90 @@ extern DLL_EXPORT openavb_aem_descriptor_clock_source_t *openavbAemDescriptorClo
 extern DLL_EXPORT bool openavbAemDescriptorClockSourceInitialize(openavb_aem_descriptor_clock_source_t *pDescriptor, U16 nConfigIdx, const openavb_avdecc_configuration_cfg_t *pConfig)
 {
 	(void) nConfigIdx;
-	if (!pDescriptor || !pConfig) {
+	if (!pDescriptor || !pConfig || !pConfig->stream) {
 		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVDECC_FAILURE | OPENAVB_RC_INVALID_ARGUMENT), AVB_TRACE_AEM);
 	}
 
-	// AVDECC_TODO:  These values need to be verified.
-	if (pConfig->stream->role == AVB_ROLE_TALKER)
-	{
-		// Make this an internal clock.
-		strcpy((char *) pDescriptor->object_name, "Internal Clock");
-		pDescriptor->clock_source_flags = 0;
-		pDescriptor->clock_source_type = OPENAVB_AEM_CLOCK_SOURCE_TYPE_INTERNAL;
-		pDescriptor->clock_source_location_type = OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT;
-		pDescriptor->clock_source_location_index = 0;
+	memset(pDescriptor->clock_source_identifier, 0, sizeof(pDescriptor->clock_source_identifier));
+	pDescriptor->clock_source_location_type = pConfig->stream_descriptor_type;
+	pDescriptor->clock_source_location_index = pConfig->stream_descriptor_index;
+
+	if (pConfig->stream && pConfig->stream->stream_addr.mac) {
+		memcpy(pDescriptor->clock_source_identifier,
+			pConfig->stream->stream_addr.buffer.ether_addr_octet, ETH_ALEN);
+		pDescriptor->clock_source_identifier[6] = (U8)((pConfig->stream->stream_uid >> 8) & 0xff);
+		pDescriptor->clock_source_identifier[7] = (U8)(pConfig->stream->stream_uid & 0xff);
 	}
-	else if (pConfig->stream->role == AVB_ROLE_LISTENER)
-	{
-		// Use the Talker's clock.
-		strcpy((char *) pDescriptor->object_name, "Input Stream");
+
+	if (pConfig->stream->role == AVB_ROLE_TALKER) {
+		if (pConfig->stream_is_crf && pConfig->stream_descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+			strcpy((char *)pDescriptor->object_name, "Output Clock Stream");
+			pDescriptor->clock_source_flags = OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID;
+		}
+		else {
+			strcpy((char *)pDescriptor->object_name, "Internal Clock");
+			pDescriptor->clock_source_flags = 0;
+			if (pDescriptor->clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+				pDescriptor->clock_source_location_type = OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT;
+				pDescriptor->clock_source_location_index = 0;
+			}
+		}
+		pDescriptor->clock_source_type = OPENAVB_AEM_CLOCK_SOURCE_TYPE_INTERNAL;
+	}
+	else if (pConfig->stream->role == AVB_ROLE_LISTENER) {
+		if (pConfig->stream_is_crf && pConfig->stream_descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) {
+			strcpy((char *)pDescriptor->object_name, "Input Clock Stream");
+		}
+		else {
+			strcpy((char *)pDescriptor->object_name, "Input Stream");
+		}
 		pDescriptor->clock_source_flags = OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID;
 		pDescriptor->clock_source_type = OPENAVB_AEM_CLOCK_SOURCE_TYPE_INPUT_STREAM;
-		memcpy(pDescriptor->clock_source_identifier, pConfig->stream->stream_addr.buffer.ether_addr_octet, ETH_ALEN);
-		pDescriptor->clock_source_location_type = OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT;
-		pDescriptor->clock_source_location_index = 0;
+		if (pDescriptor->clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_INVALID) {
+			pDescriptor->clock_source_location_type = OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT;
+			pDescriptor->clock_source_location_index = 0;
+		}
 	}
+
+	return TRUE;
+}
+
+extern DLL_EXPORT bool openavbAemDescriptorClockSourceInitializeForTiming(openavb_aem_descriptor_clock_source_t *pDescriptor, U16 timingDescriptorIdx)
+{
+	openavb_aem_descriptor_entity_t *pEntityDescriptor;
+
+	if (!pDescriptor) {
+		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVDECC_FAILURE | OPENAVB_RC_INVALID_ARGUMENT), AVB_TRACE_AEM);
+	}
+
+	strcpy((char *)pDescriptor->object_name, "gPTP Network Clock");
+	pDescriptor->clock_source_flags = 0;
+	pDescriptor->clock_source_type = OPENAVB_AEM_CLOCK_SOURCE_TYPE_EXTERNAL;
+	pDescriptor->clock_source_location_type = OPENAVB_AEM_DESCRIPTOR_TIMING;
+	pDescriptor->clock_source_location_index = timingDescriptorIdx;
+	memset(pDescriptor->clock_source_identifier, 0, sizeof(pDescriptor->clock_source_identifier));
+
+	pEntityDescriptor = openavbAemGetDescriptor(0, OPENAVB_AEM_DESCRIPTOR_ENTITY, 0);
+	if (pEntityDescriptor) {
+		memcpy(pDescriptor->clock_source_identifier, pEntityDescriptor->entity_id, sizeof(pDescriptor->clock_source_identifier));
+	}
+
+#ifndef AVB_PTP_AVAILABLE
+	if (!osalClockGrandmasterGetInterface(
+			pDescriptor->clock_source_identifier,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL)) {
+		AVB_LOG_WARNING("osalClockGrandmasterGetInterface failure while initializing timing clock source");
+	}
+#endif
 
 	return TRUE;
 }

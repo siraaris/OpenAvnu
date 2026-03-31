@@ -279,11 +279,11 @@ static void openavbAcmpMessageRxFrameReceive(U32 timeoutUsec)
 					openavbAcmpMessageRxFrameParse(pFrame + offset, len - offset, &hdrInfo);
 				}
 			}
-			else {
-				AVB_LOG_WARNING("Received non-AVTP frame!");
-				AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
-				AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
-			}
+				else {
+					AVB_LOG_DEBUG("Received non-AVTP frame.");
+					AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
+					AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+				}
 		}
 
 		// Release the frame
@@ -420,4 +420,3 @@ openavbRC openavbAcmpMessageSend(U8 messageType, openavb_acmp_ACMPCommandRespons
 	openavbAcmpMessageTxFrame(messageType, pACMPCommandResponse, status);
 	AVB_RC_TRACE_RET(OPENAVB_AVDECC_SUCCESS, AVB_TRACE_ACMP);
 }
-

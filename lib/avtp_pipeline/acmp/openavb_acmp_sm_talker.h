@@ -56,7 +56,7 @@ typedef struct {
 
 // State machine functions IEEE Std 1722.1-2013 clause 8.2.2.6.2
 bool openavbAcmpSMTalker_validTalkerUnique(U16 talkerUniqueId);
-U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command);
+U8 openavbAcmpSMTalker_connectTalker(openavb_acmp_ACMPCommandResponse_t *command, bool *pDeferredResponse);
 void openavbAcmpSMTalker_txResponse(U8 messageType, openavb_acmp_ACMPCommandResponse_t *response, U8 error);
 U8 openavbAcmpSMTalker_disconnectTalker(openavb_acmp_ACMPCommandResponse_t *command);
 U8 openavbAcmpSMTalker_getState(openavb_acmp_ACMPCommandResponse_t *command);
