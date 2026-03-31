@@ -11,6 +11,14 @@ interval meets the suggested values in 1722a:
 For audio sample rates which are a multiple of  8000hz: use 8000 for class A, 4000 for class B
 For audio sample rates which are a multiple of 44100hz: use 7350 for class A, 3675 for class B
 
+Optional diagnostic setting:
+
+- map_nv_disable_network_swap = 0|1
+  When set to 1 on a talker, suppresses the normal byte-swap from little-endian
+  MediaQ samples to network-order AAF payload samples. This is intended only as
+  a temporary diagnostic bypass; little-endian PCM will no longer be serialized
+  as spec-compliant AAF on the wire.
+
 AAF supports the following ALSA sample parameters:
 
 - sample rate:
