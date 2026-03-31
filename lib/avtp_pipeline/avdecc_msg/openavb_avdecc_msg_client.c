@@ -58,9 +58,13 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_tl.h"
 #include "openavb_talker.h"
 #include "openavb_listener.h"
+#include "openavb_avtp.h"
+#include "openavb_clock_source_runtime_pub.h"
 
 // forward declarations
 static bool openavbAvdeccMsgClntReceiveFromServer(int avdeccMsgHandle, openavbAvdeccMessage_t *msg);
+static avdecc_msg_state_t *openavbAvdeccMsgClntGetStateForTL(tl_state_t *pTLState);
+static bool openavbAvdeccMsgClntGetCurrentCounters(tl_state_t *pTLState, openavb_avtp_diag_counters_t *pCounters);
 
 // OSAL specific functions
 #include "openavb_avdecc_msg_client_osal.c"
@@ -105,6 +109,17 @@ static bool openavbAvdeccMsgClntReceiveFromServer(int avdeccMsgHandle, openavbAv
 			AVB_LOG_DEBUG("Message received:  OPENAVB_AVDECC_MSG_CLIENT_CHANGE_REQUEST");
 			openavbAvdeccMsgClntHndlChangeRequestFromServer(avdeccMsgHandle, (openavbAvdeccMsgStateType_t) msg->params.clientChangeRequest.desired_state);
 			break;
+		case OPENAVB_AVDECC_MSG_CLOCK_SOURCE_UPDATE:
+			AVB_LOG_DEBUG("Message received:  OPENAVB_AVDECC_MSG_CLOCK_SOURCE_UPDATE");
+			openavbAvdeccMsgClntHndlClockSourceUpdateFromServer(
+				avdeccMsgHandle,
+				ntohs(msg->params.clockSourceUpdate.clock_domain_index),
+				ntohs(msg->params.clockSourceUpdate.clock_source_index),
+				ntohs(msg->params.clockSourceUpdate.clock_source_flags),
+				ntohs(msg->params.clockSourceUpdate.clock_source_type),
+				ntohs(msg->params.clockSourceUpdate.clock_source_location_type),
+				ntohs(msg->params.clockSourceUpdate.clock_source_location_index));
+			break;
 		default:
 			AVB_LOG_ERROR("Client receive: unexpected message");
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
@@ -112,6 +127,80 @@ static bool openavbAvdeccMsgClntReceiveFromServer(int avdeccMsgHandle, openavbAv
 	}
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
 	return TRUE;
+}
+
+static avdecc_msg_state_t *openavbAvdeccMsgClntGetStateForTL(tl_state_t *pTLState)
+{
+	int i;
+
+	if (!pTLState) {
+		return NULL;
+	}
+
+	for (i = 0; i < MAX_AVDECC_MSG_CLIENTS; ++i) {
+		avdecc_msg_state_t *pAvdeccMsgState = AvdeccMsgStateListGetIndex(i);
+		if (!pAvdeccMsgState) {
+			break;
+		}
+		if (pAvdeccMsgState->pTLState == pTLState) {
+			return pAvdeccMsgState;
+		}
+	}
+
+	return NULL;
+}
+
+static bool openavbAvdeccMsgClntGetCurrentCounters(tl_state_t *pTLState, openavb_avtp_diag_counters_t *pCounters)
+{
+	if (!pTLState || !pCounters) {
+		return false;
+	}
+
+	memset(pCounters, 0, sizeof(*pCounters));
+
+	if (pTLState->cfg.role == AVB_ROLE_LISTENER) {
+		listener_data_t *pListenerData = pTLState->pPvtListenerData;
+
+		if (!pListenerData) {
+			return true;
+		}
+
+		*pCounters = pListenerData->aecpCounters;
+		{
+			MUTEX_CREATE_ERR();
+			MUTEX_LOCK(pListenerData->streamMutex);
+			MUTEX_LOG_ERR("Mutex lock failure");
+		}
+		if (pListenerData->avtpHandle) {
+			openavb_avtp_diag_counters_t liveCounters;
+			openavbAvtpGetDiagCounters(pListenerData->avtpHandle, &liveCounters);
+			openavbAvtpDiagCountersAccumulate(pCounters, &liveCounters);
+		}
+		{
+			MUTEX_CREATE_ERR();
+			MUTEX_UNLOCK(pListenerData->streamMutex);
+			MUTEX_LOG_ERR("Mutex unlock failure");
+		}
+		return true;
+	}
+
+	if (pTLState->cfg.role == AVB_ROLE_TALKER) {
+		talker_data_t *pTalkerData = pTLState->pPvtTalkerData;
+
+		if (!pTalkerData) {
+			return true;
+		}
+
+		*pCounters = pTalkerData->aecpCounters;
+		if (pTalkerData->avtpHandle) {
+			openavb_avtp_diag_counters_t liveCounters;
+			openavbAvtpGetDiagCounters(pTalkerData->avtpHandle, &liveCounters);
+			openavbAvtpDiagCountersAccumulate(pCounters, &liveCounters);
+		}
+		return true;
+	}
+
+	return false;
 }
 
 bool openavbAvdeccMsgClntRequestVersionFromServer(int avdeccMsgHandle)
@@ -207,9 +296,38 @@ bool openavbAvdeccMsgClntTalkerStreamID(int avdeccMsgHandle, U8 sr_class, const 
 	return ret;
 }
 
+bool openavbAvdeccMsgClntListenerSrpInfo(int avdeccMsgHandle, U8 talker_decl, U8 msrp_failure_code, const U8 msrp_failure_bridge_id[8])
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+	openavbAvdeccMessage_t msgBuf;
+
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	if (!pState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	memset(&msgBuf, 0, OPENAVB_AVDECC_MSG_LEN);
+	msgBuf.type = OPENAVB_AVDECC_MSG_C2S_LISTENER_SRP_INFO;
+	openavbAvdeccMsgParams_C2S_ListenerSrpInfo_t *pParams =
+		&(msgBuf.params.c2sListenerSrpInfo);
+	pParams->talker_decl = talker_decl;
+	pParams->msrp_failure_code = msrp_failure_code;
+	if (msrp_failure_bridge_id != NULL) {
+		memcpy(pParams->msrp_failure_bridge_id, msrp_failure_bridge_id, sizeof(pParams->msrp_failure_bridge_id));
+	}
+	bool ret = openavbAvdeccMsgClntSendToServer(avdeccMsgHandle, &msgBuf);
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+	return ret;
+}
+
 bool openavbAvdeccMsgClntHndlListenerStreamIDFromServer(int avdeccMsgHandle, U8 sr_class, const U8 stream_src_mac[6], U16 stream_uid, const U8 stream_dest_mac[6], U16 stream_vlan_id)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+	bool restartAfterConfigChange = FALSE;
+	bool pauseAfterRestart = FALSE;
 
 	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
 	if (!pState) {
@@ -224,28 +342,89 @@ bool openavbAvdeccMsgClntHndlListenerStreamIDFromServer(int avdeccMsgHandle, U8 
 		return false;
 	}
 
+	AVB_LOGF_INFO("Listener stream update from AVDECC: handle=%d class=%c stream=" ETH_FORMAT "/%u dest=" ETH_FORMAT " vlan=%u",
+		avdeccMsgHandle,
+		AVB_CLASS_LABEL(sr_class),
+		ETH_OCTETS(stream_src_mac),
+		stream_uid,
+		ETH_OCTETS(stream_dest_mac),
+		stream_vlan_id);
+
 	// Determine if the supplied information differs from the current settings.
+	// If AVDECC supplies an unspecified value, keep current listener configuration.
 	openavb_tl_cfg_t * pCfg = &(pState->pTLState->cfg);
+	const U8 zeroMac[6] = {0};
+	U8 effective_stream_src_mac[6];
+	U16 effective_stream_uid;
+	U8 effective_stream_dest_mac[6];
+	U16 effective_stream_vlan_id;
+
+	bool serverStreamIdUnspecified = (memcmp(stream_src_mac, zeroMac, 6) == 0 && stream_uid == 0);
+	bool serverDestUnspecified = (memcmp(stream_dest_mac, zeroMac, 6) == 0);
+	bool serverVlanUnspecified = (stream_vlan_id == 0);
+
+	if (serverStreamIdUnspecified &&
+		(memcmp(pCfg->stream_addr.buffer.ether_addr_octet, zeroMac, 6) != 0 || pCfg->stream_uid != 0)) {
+		memcpy(effective_stream_src_mac, pCfg->stream_addr.buffer.ether_addr_octet, 6);
+		effective_stream_uid = pCfg->stream_uid;
+		AVB_LOGF_DEBUG("Ignoring unspecified AVDECC listener stream_id; keeping configured stream_id " ETH_FORMAT "/%u",
+			ETH_OCTETS(effective_stream_src_mac), effective_stream_uid);
+	}
+	else {
+		memcpy(effective_stream_src_mac, stream_src_mac, 6);
+		effective_stream_uid = stream_uid;
+	}
+
+	if (serverDestUnspecified && memcmp(pCfg->dest_addr.buffer.ether_addr_octet, zeroMac, 6) != 0) {
+		memcpy(effective_stream_dest_mac, pCfg->dest_addr.buffer.ether_addr_octet, 6);
+	}
+	else {
+		memcpy(effective_stream_dest_mac, stream_dest_mac, 6);
+	}
+
+	if (serverVlanUnspecified && pCfg->vlan_id != 0) {
+		effective_stream_vlan_id = pCfg->vlan_id;
+	}
+	else {
+		effective_stream_vlan_id = stream_vlan_id;
+	}
+
 	if (pCfg->sr_class != sr_class ||
-			memcmp(pCfg->stream_addr.buffer.ether_addr_octet, stream_src_mac, 6) != 0 ||
-			pCfg->stream_uid != stream_uid ||
-			memcmp(pCfg->dest_addr.buffer.ether_addr_octet, stream_dest_mac, 6) != 0 ||
-			pCfg->vlan_id != stream_vlan_id) {
+			memcmp(pCfg->stream_addr.buffer.ether_addr_octet, effective_stream_src_mac, 6) != 0 ||
+			pCfg->stream_uid != effective_stream_uid ||
+			memcmp(pCfg->dest_addr.buffer.ether_addr_octet, effective_stream_dest_mac, 6) != 0 ||
+			pCfg->vlan_id != effective_stream_vlan_id) {
 		// If the Listener is running, stop the Listener before updating the information.
 		if (pState->pTLState->bRunning) {
 			AVB_LOG_DEBUG("Forcing Listener to Stop to change streaming settings");
+			restartAfterConfigChange = TRUE;
+			pauseAfterRestart = pState->pTLState->bPaused;
 			openavbAvdeccMsgClntHndlChangeRequestFromServer(avdeccMsgHandle, OPENAVB_AVDECC_MSG_STOPPED);
 		}
 
 		// Update the stream information supplied by the server.
 		pCfg->sr_class = sr_class;
-		memcpy(pCfg->stream_addr.buffer.ether_addr_octet, stream_src_mac, 6);
+		memcpy(pCfg->stream_addr.buffer.ether_addr_octet, effective_stream_src_mac, 6);
 		pCfg->stream_addr.mac = &(pCfg->stream_addr.buffer); // Indicate that the MAC Address is valid.
-		pCfg->stream_uid = stream_uid;
-		memcpy(pCfg->dest_addr.buffer.ether_addr_octet, stream_dest_mac, 6);
+		pCfg->stream_uid = effective_stream_uid;
+		memcpy(pCfg->dest_addr.buffer.ether_addr_octet, effective_stream_dest_mac, 6);
 		pCfg->dest_addr.mac = &(pCfg->dest_addr.buffer); // Indicate that the MAC Address is valid.
-		pCfg->vlan_id = stream_vlan_id;
-	 }
+		pCfg->vlan_id = effective_stream_vlan_id;
+		AVB_LOGF_INFO("Listener stream config updated from AVDECC: class=%c stream=" ETH_FORMAT "/%u dest=" ETH_FORMAT " vlan=%u",
+			AVB_CLASS_LABEL(pCfg->sr_class),
+			ETH_OCTETS(pCfg->stream_addr.buffer.ether_addr_octet),
+			pCfg->stream_uid,
+			ETH_OCTETS(pCfg->dest_addr.buffer.ether_addr_octet),
+			pCfg->vlan_id);
+	}
+
+	if (restartAfterConfigChange) {
+		AVB_LOG_INFO("Restarting listener after AVDECC stream configuration update");
+		openavbAvdeccMsgClntHndlChangeRequestFromServer(avdeccMsgHandle, OPENAVB_AVDECC_MSG_RUNNING);
+		if (pauseAfterRestart) {
+			openavbAvdeccMsgClntHndlChangeRequestFromServer(avdeccMsgHandle, OPENAVB_AVDECC_MSG_PAUSED);
+		}
+	}
 
 	AVB_LOGF_DEBUG("AVDECC-supplied (Listener) sr_class:  %u", pCfg->sr_class);
 	AVB_LOGF_DEBUG("AVDECC-supplied (Listener) stream_id:  " ETH_FORMAT "/%u",
@@ -492,6 +671,109 @@ bool openavbAvdeccMsgClntChangeNotification(int avdeccMsgHandle, openavbAvdeccMs
 	return ret;
 }
 
+bool openavbAvdeccMsgClntCountersUpdate(int avdeccMsgHandle, const openavb_avtp_diag_counters_t *pCounters)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+	openavbAvdeccMessage_t msgBuf;
+
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	if (!pState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+	if (!pCounters) {
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	memset(&msgBuf, 0, OPENAVB_AVDECC_MSG_LEN);
+	msgBuf.type = OPENAVB_AVDECC_MSG_C2S_COUNTERS_UPDATE;
+	msgBuf.params.c2sCountersUpdate.counters = *pCounters;
+
+	bool ret = openavbAvdeccMsgClntSendToServer(avdeccMsgHandle, &msgBuf);
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+	return ret;
+}
+
+bool openavbAvdeccMsgClntPublishCounters(tl_state_t *pTLState)
+{
+	openavb_avtp_diag_counters_t counters;
+	avdecc_msg_state_t *pState;
+
+	if (!pTLState || !pTLState->bAvdeccMsgRunning) {
+		return false;
+	}
+
+	pState = openavbAvdeccMsgClntGetStateForTL(pTLState);
+	if (!pState) {
+		return false;
+	}
+	if (!openavbAvdeccMsgClntGetCurrentCounters(pTLState, &counters)) {
+		return false;
+	}
+
+	return openavbAvdeccMsgClntCountersUpdate(pState->avdeccMsgHandle, &counters);
+}
+
+bool openavbAvdeccMsgClntHndlClockSourceUpdateFromServer(
+	int avdeccMsgHandle,
+	U16 clock_domain_index,
+	U16 clock_source_index,
+	U16 clock_source_flags,
+	U16 clock_source_type,
+	U16 clock_source_location_type,
+	U16 clock_source_location_index)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AVDECC_MSG);
+
+	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
+	if (!pState || !pState->pTLState) {
+		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+		return false;
+	}
+
+	tl_state_t *pTLState = pState->pTLState;
+	pTLState->clock_domain_index = clock_domain_index;
+	pTLState->clock_source_index = clock_source_index;
+	pTLState->clock_source_flags = clock_source_flags;
+	pTLState->clock_source_type = clock_source_type;
+	pTLState->clock_source_location_type = clock_source_location_type;
+	pTLState->clock_source_location_index = clock_source_location_index;
+	pTLState->clock_source_generation++;
+
+	openavbClockSourceRuntimeSetSelection(
+		clock_domain_index,
+		clock_source_index,
+		clock_source_flags,
+		clock_source_type,
+		clock_source_location_type,
+		clock_source_location_index);
+
+	// For talkers, request AVTP media-restart bit toggle on the next packets.
+	if (pTLState->cfg.role == AVB_ROLE_TALKER &&
+			pTLState->pPvtTalkerData) {
+		talker_data_t *pTalkerData = (talker_data_t *)pTLState->pPvtTalkerData;
+		if (pTalkerData->avtpHandle) {
+			openavbAvtpRequestMediaRestart(pTalkerData->avtpHandle);
+		}
+	}
+
+	AVB_LOGF_INFO("Clock source update received: domain=%u source=%u flags=0x%04x type=0x%04x location=0x%04x/%u generation=%u",
+		clock_domain_index,
+		clock_source_index,
+		clock_source_flags,
+		clock_source_type,
+		clock_source_location_type,
+		clock_source_location_index,
+		pTLState->clock_source_generation);
+
+	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
+	return true;
+}
+
 
 // Called from openavbAvdeccMsgThreadFn() which is started from openavbTLRun()
 void openavbAvdeccMsgRunTalker(avdecc_msg_state_t *pState)
@@ -534,11 +816,8 @@ void openavbAvdeccMsgRunTalker(avdecc_msg_state_t *pState)
 	}
 
 	// Let the AVDECC Msg server know our current state.
-	if (!openavbAvdeccMsgClntChangeNotification(pState->avdeccMsgHandle,
-		(pState->pTLState->bRunning ?
-			(pState->pTLState->bPaused ? OPENAVB_AVDECC_MSG_PAUSED : OPENAVB_AVDECC_MSG_RUNNING ) :
-			OPENAVB_AVDECC_MSG_STOPPED))) {
-		AVB_LOG_ERROR("Initial openavbAvdeccMsgClntChangeNotification() failed");
+	if (!openavbAvdeccMsgClntNotifyCurrentState(pState->pTLState)) {
+		AVB_LOG_ERROR("Initial openavbAvdeccMsgClntNotifyCurrentState() failed");
 		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
 		return;
 	}
@@ -589,11 +868,8 @@ void openavbAvdeccMsgRunListener(avdecc_msg_state_t *pState)
 	}
 
 	// Let the AVDECC Msg server know our current state.
-	if (!openavbAvdeccMsgClntChangeNotification(pState->avdeccMsgHandle,
-		(pState->pTLState->bRunning ?
-			(pState->pTLState->bPaused ? OPENAVB_AVDECC_MSG_PAUSED : OPENAVB_AVDECC_MSG_RUNNING ) :
-			OPENAVB_AVDECC_MSG_STOPPED))) {
-		AVB_LOG_ERROR("Initial openavbAvdeccMsgClntChangeNotification() failed");
+	if (!openavbAvdeccMsgClntNotifyCurrentState(pState->pTLState)) {
+		AVB_LOG_ERROR("Initial openavbAvdeccMsgClntNotifyCurrentState() failed");
 		AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);
 		return;
 	}
@@ -697,27 +973,31 @@ void* openavbAvdeccMsgThreadFn(void *pv)
 // Client-side helper function.
 bool openavbAvdeccMsgClntNotifyCurrentState(tl_state_t *pTLState)
 {
+	avdecc_msg_state_t *pAvdeccMsgState;
+	bool ret;
+
 	if (!pTLState) { return FALSE; }
 	if (!(pTLState->bAvdeccMsgRunning)) { return FALSE; }
 
-	// Find the AVDECC Msg for the supplied tl_state_t pointer.
-	int i;
-	for (i = 0; i < MAX_AVDECC_MSG_CLIENTS; ++i) {
-		avdecc_msg_state_t * pAvdeccMsgState = AvdeccMsgStateListGetIndex(i);
-		if (!pAvdeccMsgState) {
-			// Out of items.
-			break;
-		}
-		if (pAvdeccMsgState->pTLState == pTLState) {
-			// Notify the server regarding the current state.
-			if (pTLState->bRunning) {
-				openavbAvdeccMsgClntChangeNotification(pAvdeccMsgState->avdeccMsgHandle, (pTLState->bPaused ? OPENAVB_AVDECC_MSG_PAUSED : OPENAVB_AVDECC_MSG_RUNNING));
-			} else {
-				openavbAvdeccMsgClntChangeNotification(pAvdeccMsgState->avdeccMsgHandle, OPENAVB_AVDECC_MSG_STOPPED);
-			}
-			return TRUE;
-		}
+	pAvdeccMsgState = openavbAvdeccMsgClntGetStateForTL(pTLState);
+	if (!pAvdeccMsgState) {
+		return FALSE;
 	}
 
-	return FALSE;
+	if (pTLState->bRunning) {
+		ret = openavbAvdeccMsgClntChangeNotification(
+			pAvdeccMsgState->avdeccMsgHandle,
+			(pTLState->bPaused ? OPENAVB_AVDECC_MSG_PAUSED : OPENAVB_AVDECC_MSG_RUNNING));
+	}
+	else {
+		ret = openavbAvdeccMsgClntChangeNotification(
+			pAvdeccMsgState->avdeccMsgHandle,
+			OPENAVB_AVDECC_MSG_STOPPED);
+	}
+
+	if (!ret) {
+		return FALSE;
+	}
+
+	return openavbAvdeccMsgClntPublishCounters(pTLState);
 }

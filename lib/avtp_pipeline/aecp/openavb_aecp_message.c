@@ -52,6 +52,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_aecp.h"
 #include "openavb_aecp_sm_entity_model_entity.h"
 #include "openavb_time_osal_pub.h"
+#include "openavb_avdecc_pub.h"
 
 #define INVALID_SOCKET (-1)
 
@@ -62,6 +63,9 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 // number of buffers (arbitrary, and rounded up by rawsock)
 #define AECP_NUM_BUFFERS 3
+#define OPENAVB_AECP_AA_TLV_MODE_READ (0u)
+#define OPENAVB_AECP_AA_TLV_HEADER_LENGTH (10u)
+#define OPENAVB_AECP_AA_MAX_MEMORY_DATA_LENGTH (1400u)
 
 // do cast from ether_addr to U8*
 #define ADDR_PTR(A) (U8*)(&((A)->ether_addr_octet))
@@ -94,6 +98,320 @@ static bool openavbAecpShouldLogNonAvtp(void)
 	}
 
 	return false;
+}
+
+static U16 openavbAecpGetAemCommandSpecificLength(const openavb_aecp_AEMCommandResponse_t *pCommand)
+{
+	if (!pCommand || pCommand->headers.control_data_length <= 12) {
+		return 0;
+	}
+
+	return (U16)(pCommand->headers.control_data_length - 12);
+}
+
+static U16 openavbAecpGetMvuCommandSpecificLength(const openavb_aecp_AEMCommandResponse_t *pCommand)
+{
+	if (!pCommand || pCommand->headers.control_data_length <= 18) {
+		return 0;
+	}
+
+	return (U16)(pCommand->headers.control_data_length - 18);
+}
+
+static bool openavbAecpParseAudioMappingsPayload(
+	U8 *pSrc,
+	U16 command_specific_length,
+	openavb_aecp_commandresponse_data_audio_mappings_t *pDst)
+{
+	U16 i;
+	U16 mappingsBytes;
+
+	if (!pSrc || !pDst) {
+		return false;
+	}
+	if (command_specific_length < 8) {
+		return false;
+	}
+
+	OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
+	OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+	OCT_B2DNTOHS(pDst->number_of_mappings, pSrc);
+	OCT_B2DNTOHS(pDst->reserved, pSrc);
+
+	mappingsBytes = (U16)(pDst->number_of_mappings * sizeof(openavb_aecp_audio_mapping_t));
+	if (command_specific_length != (U16)(8 + mappingsBytes)) {
+		return false;
+	}
+	if (pDst->number_of_mappings > OPENAVB_AECP_AUDIO_MAP_MAX_MAPPINGS) {
+		return false;
+	}
+
+	pDst->mappingsCount = pDst->number_of_mappings;
+	for (i = 0; i < pDst->mappingsCount; i++) {
+		OCT_B2DNTOHS(pDst->mappings[i].mapping_stream_index, pSrc);
+		OCT_B2DNTOHS(pDst->mappings[i].mapping_stream_channel, pSrc);
+		OCT_B2DNTOHS(pDst->mappings[i].mapping_cluster_offset, pSrc);
+		OCT_B2DNTOHS(pDst->mappings[i].mapping_cluster_channel, pSrc);
+	}
+
+	return true;
+}
+
+static void openavbAecpSerializeAudioMappings(
+	U8 **ppDst,
+	const openavb_aecp_audio_mapping_t *pMappings,
+	U16 number_of_mappings)
+{
+	U16 i;
+	U8 *pDst;
+
+	if (!ppDst || !*ppDst || !pMappings) {
+		return;
+	}
+
+	pDst = *ppDst;
+	for (i = 0; i < number_of_mappings; i++) {
+		OCT_D2BHTONS(pDst, pMappings[i].mapping_stream_index);
+		OCT_D2BHTONS(pDst, pMappings[i].mapping_stream_channel);
+		OCT_D2BHTONS(pDst, pMappings[i].mapping_cluster_offset);
+		OCT_D2BHTONS(pDst, pMappings[i].mapping_cluster_channel);
+	}
+	*ppDst = pDst;
+}
+
+static void openavbAecpSerializeSetControlResponseValues(
+	U8 **ppDst,
+	const openavb_aecp_commandresponse_data_set_control_t *pSrc,
+	const openavb_aem_descriptor_control_t *pDescriptorControl)
+{
+	int i1;
+	U8 *pDst;
+
+	if (!ppDst || !*ppDst || !pSrc || !pDescriptorControl) {
+		return;
+	}
+
+	pDst = *ppDst;
+	for (i1 = 0; i1 < pSrc->valuesCount; i1++) {
+		switch (pDescriptorControl->control_value_type) {
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT8:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT8:
+				OCT_D2BHTONB(pDst, pSrc->values.linear_int8[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT16:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT16:
+				OCT_D2BHTONS(pDst, pSrc->values.linear_int16[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT32:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT32:
+				OCT_D2BHTONL(pDst, pSrc->values.linear_int32[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT64:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT64:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_int64[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_FLOAT:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_float[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_DOUBLE:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_double[i1]);
+				break;
+			default:
+				break;
+		}
+	}
+
+	*ppDst = pDst;
+}
+
+static void openavbAecpSerializeGetControlResponseValues(
+	U8 **ppDst,
+	const openavb_aecp_response_data_get_control_t *pSrc,
+	const openavb_aem_descriptor_control_t *pDescriptorControl)
+{
+	int i1;
+	U8 *pDst;
+
+	if (!ppDst || !*ppDst || !pSrc || !pDescriptorControl) {
+		return;
+	}
+
+	pDst = *ppDst;
+	for (i1 = 0; i1 < pSrc->valuesCount; i1++) {
+		switch (pDescriptorControl->control_value_type) {
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT8:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT8:
+				OCT_D2BHTONB(pDst, pSrc->values.linear_int8[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT16:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT16:
+				OCT_D2BHTONS(pDst, pSrc->values.linear_int16[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT32:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT32:
+				OCT_D2BHTONL(pDst, pSrc->values.linear_int32[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT64:
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT64:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_int64[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_FLOAT:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_float[i1]);
+				break;
+			case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_DOUBLE:
+				OCT_D2BMEMCP(pDst, &pSrc->values.linear_double[i1]);
+				break;
+			default:
+				break;
+		}
+	}
+
+	*ppDst = pDst;
+}
+
+static void openavbAecpMessageTxAddressAccessResponse(
+	const openavb_aecp_AEMCommandResponse_t *pCommand,
+	U16 status,
+	U64 address,
+	const U8 *pData,
+	U16 dataLength)
+{
+	U8 *pBuf;
+	U8 *pDst;
+	U8 *pControlDataLength;
+	U8 *pControlDataLengthStartMarker;
+	U32 size;
+	unsigned int hdrlen = 0;
+	U16 tlvCount = (status == OPENAVB_AECP_AA_STATUS_SUCCESS) ? 1 : 0;
+	U16 modeLength = (U16)(((OPENAVB_AECP_AA_TLV_MODE_READ & 0x0f) << 12) | (dataLength & 0x0fff));
+	U64 addressNetworkOrder = htonll(address);
+
+	if (!pCommand) {
+		return;
+	}
+
+	pBuf = openavbRawsockGetTxFrame(txSock, TRUE, &size);
+	if (!pBuf) {
+		AVB_LOG_ERROR("No TX buffer for ADDRESS_ACCESS response");
+		return;
+	}
+	if (size < AECP_FRAME_LEN) {
+		AVB_LOG_ERROR("TX buffer too small for ADDRESS_ACCESS response");
+		openavbRawsockRelTxFrame(txSock, pBuf);
+		return;
+	}
+
+	memset(pBuf, 0, AECP_FRAME_LEN);
+	openavbRawsockTxFillHdr(txSock, pBuf, &hdrlen);
+	memcpy(pBuf, pCommand->host, ETH_ALEN);
+
+	pDst = pBuf + hdrlen;
+	BIT_D2BHTONB(pDst, pCommand->headers.cd, 7, 0);
+	BIT_D2BHTONB(pDst, pCommand->headers.subtype, 0, 1);
+	BIT_D2BHTONB(pDst, pCommand->headers.sv, 7, 0);
+	BIT_D2BHTONB(pDst, pCommand->headers.version, 4, 0);
+	BIT_D2BHTONB(pDst, OPENAVB_AECP_MESSAGE_TYPE_ADDRESS_ACCESS_RESPONSE, 0, 1);
+	BIT_D2BHTONS(pDst, status, 11, 0);
+	pControlDataLength = pDst;
+	BIT_D2BHTONS(pDst, 0, 0, 2);
+	OCT_D2BMEMCP(pDst, pCommand->headers.target_entity_id);
+	pControlDataLengthStartMarker = pDst;
+
+	OCT_D2BMEMCP(pDst, pCommand->commonPdu.controller_entity_id);
+	OCT_D2BHTONS(pDst, pCommand->commonPdu.sequence_id);
+	OCT_D2BHTONS(pDst, tlvCount);
+	if (tlvCount != 0) {
+		OCT_D2BHTONS(pDst, modeLength);
+		OCT_D2BMEMCP(pDst, &addressNetworkOrder);
+		if (dataLength != 0 && pData) {
+			OCT_D2BBUFCP(pDst, pData, dataLength);
+		}
+	}
+
+	BIT_D2BHTONS(pControlDataLength, (pDst - pControlDataLengthStartMarker), 0, 2);
+	openavbRawsockTxFrameReady(txSock, pBuf, pDst - pBuf, 0);
+	openavbRawsockSend(txSock);
+}
+
+static void openavbAecpHandleAddressAccessCommand(
+	openavb_aecp_AEMCommandResponse_t *pCommand,
+	U8 *pSrc,
+	U16 commandSpecificLength)
+{
+	U16 tlvCount = 0;
+	U16 modeLength = 0;
+	U16 mode = 0;
+	U16 requestedLength = 0;
+	U16 status = OPENAVB_AECP_AA_STATUS_SUCCESS;
+	U16 bytesRead = 0;
+	U64 address = 0;
+	U64 addressNetworkOrder = 0;
+	U8 data[OPENAVB_AECP_AA_MAX_MEMORY_DATA_LENGTH];
+
+	if (!pCommand || !pSrc || commandSpecificLength < 2) {
+		if (pCommand) {
+			openavbAecpMessageTxAddressAccessResponse(
+				pCommand,
+				OPENAVB_AECP_AA_STATUS_TLV_INVALID,
+				0,
+				NULL,
+				0);
+		}
+		return;
+	}
+
+	OCT_B2DNTOHS(tlvCount, pSrc);
+	if (tlvCount != 1 || commandSpecificLength != (U16)(2 + OPENAVB_AECP_AA_TLV_HEADER_LENGTH)) {
+		openavbAecpMessageTxAddressAccessResponse(
+			pCommand,
+			OPENAVB_AECP_AA_STATUS_TLV_INVALID,
+			0,
+			NULL,
+			0);
+		return;
+	}
+
+	OCT_B2DNTOHS(modeLength, pSrc);
+	mode = (U16)((modeLength >> 12) & 0x0f);
+	requestedLength = (U16)(modeLength & 0x0fff);
+	OCT_B2DMEMCP(&addressNetworkOrder, pSrc);
+	address = ntohll(addressNetworkOrder);
+
+	if (mode != OPENAVB_AECP_AA_TLV_MODE_READ) {
+		openavbAecpMessageTxAddressAccessResponse(
+			pCommand,
+			OPENAVB_AECP_AA_STATUS_UNSUPPORTED,
+			address,
+			NULL,
+			0);
+		return;
+	}
+	if (requestedLength > OPENAVB_AECP_AA_MAX_MEMORY_DATA_LENGTH) {
+		openavbAecpMessageTxAddressAccessResponse(
+			pCommand,
+			OPENAVB_AECP_AA_STATUS_TLV_INVALID,
+			address,
+			NULL,
+			0);
+		return;
+	}
+
+	if (!openavbAvdeccReadEntityLogo(address, requestedLength, data, &bytesRead, &status)) {
+		openavbAecpMessageTxAddressAccessResponse(
+			pCommand,
+			status,
+			address,
+			NULL,
+			0);
+		return;
+	}
+
+	openavbAecpMessageTxAddressAccessResponse(
+		pCommand,
+		OPENAVB_AECP_AA_STATUS_SUCCESS,
+		address,
+		data,
+		bytesRead);
 }
 
 void openavbAecpCloseSocket()
@@ -204,6 +522,7 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 	if (openavbAecpCommandResponse->headers.message_type == OPENAVB_AECP_MESSAGE_TYPE_AEM_COMMAND) {
 		// Entity Model PDU Fields
 		openavb_aecp_entity_model_data_unit_t *pDst = &openavbAecpCommandResponse->entityModelPdu;
+		U16 command_specific_length = openavbAecpGetAemCommandSpecificLength(openavbAecpCommandResponse);
 		BIT_B2DNTOHS(pDst->u, pSrc, 0x8000, 15, 0);
 		BIT_B2DNTOHS(pDst->command_type, pSrc, 0x7fff, 0, 2);
 
@@ -218,7 +537,13 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_LOCK_ENTITY:
-				// No command specific data
+				{
+					openavb_aecp_commandresponse_data_lock_entity_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.lockEntityCmd;
+					OCT_B2DNTOHL(pDst->flags, pSrc);
+					OCT_B2DMEMCP(pDst->locked_id, pSrc);
+					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ENTITY_AVAILABLE:
 				// No command specific data
@@ -238,8 +563,26 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 			case OPENAVB_AEM_COMMAND_CODE_WRITE_DESCRIPTOR:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_CONFIGURATION:
+				{
+					openavb_aecp_commandresponse_data_set_configuration_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.setConfigurationCmd;
+					OCT_B2DNTOHS(pDst->reserved, pSrc);
+					OCT_B2DNTOHS(pDst->configuration_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_CONFIGURATION:
+				break;
+			case OPENAVB_AEM_COMMAND_CODE_GET_DYNAMIC_INFO:
+				{
+					openavb_aecp_commandresponse_data_get_dynamic_info_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getDynamicInfoCmd;
+					pDst->payload_length = command_specific_length;
+					if (pDst->payload_length > sizeof(pDst->payload)) {
+						pDst->payload_length = sizeof(pDst->payload);
+					}
+					if (pDst->payload_length > 0) {
+						memcpy(pDst->payload, pSrc, pDst->payload_length);
+						pSrc += pDst->payload_length;
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_STREAM_FORMAT:
 				{
@@ -329,7 +672,7 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_CONTROL:
 				{
-					U8 *pSrcEnd = pSrc + openavbAecpCommandResponse->headers.control_data_length;
+					U8 *pSrcEnd = pSrc + command_specific_length;
 					openavb_aecp_commandresponse_data_set_control_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.setControlCmd;
 					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
 					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
@@ -340,7 +683,7 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 						if (pDescriptorControl) {
 							bool bDone = FALSE;
 							pDst->valuesCount = 0;
-							while ((pSrc < pSrcEnd) || bDone) {
+							while ((pSrc < pSrcEnd) && !bDone) {
 								switch (pDescriptorControl->control_value_type) {
 									case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT8:
 									case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT8:
@@ -464,7 +807,6 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME:
-			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021:
 				{
 					openavb_aecp_command_data_get_max_transit_time_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getMaxTransitTimeCmd;
 					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
@@ -474,14 +816,37 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 			case OPENAVB_AEM_COMMAND_CODE_GET_AUDIO_MAP:
 				{
 					openavb_aecp_command_data_get_audio_map_t *pDst = &openavbAecpCommandResponse->entityModelPdu.command_data.getAudioMapCmd;
+					if (command_specific_length != 8) {
+						free(openavbAecpCommandResponse);
+						return;
+					}
 					OCT_B2DNTOHS(pDst->descriptor_type, pSrc);
 					OCT_B2DNTOHS(pDst->descriptor_index, pSrc);
 					OCT_B2DNTOHS(pDst->map_index, pSrc);
+					OCT_B2DNTOHS(pDst->reserved, pSrc);
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ADD_AUDIO_MAPPINGS:
+				{
+					if (!openavbAecpParseAudioMappingsPayload(
+							pSrc,
+							command_specific_length,
+							&openavbAecpCommandResponse->entityModelPdu.command_data.addAudioMappingsCmd)) {
+						free(openavbAecpCommandResponse);
+						return;
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_REMOVE_AUDIO_MAPPINGS:
+				{
+					if (!openavbAecpParseAudioMappingsPayload(
+							pSrc,
+							command_specific_length,
+							&openavbAecpCommandResponse->entityModelPdu.command_data.removeAudioMappingsCmd)) {
+						free(openavbAecpCommandResponse);
+						return;
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_VIDEO_MAP:
 				break;
@@ -536,6 +901,12 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 			case OPENAVB_AEM_COMMAND_CODE_SET_MEMORY_OBJECT_LENGTH:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_MEMORY_OBJECT_LENGTH:
+				{
+					openavb_aecp_command_data_get_memory_object_length_t *pDst =
+						&openavbAecpCommandResponse->entityModelPdu.command_data.getMemoryObjectLengthCmd;
+					OCT_B2DNTOHS(pDst->configuration_index, pSrc);
+					OCT_B2DNTOHS(pDst->memory_object_index, pSrc);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_STREAM_BACKUP:
 				break;
@@ -550,6 +921,116 @@ static void openavbAecpMessageRxFrameParse(U8* payload, int payload_len, hdr_inf
 		if (pSrc - payload <= payload_len) {
 			// Notify the state machine of the command request
 			// The buffer will be deleted once the request is handled.
+			openavbAecpSMEntityModelEntitySet_rcvdCommand(openavbAecpCommandResponse);
+		}
+		else {
+			AVB_LOGF_ERROR("Expected packet of size %d, but received one of size %d.  Discarding.", pSrc - payload, payload_len);
+			free(openavbAecpCommandResponse);
+		}
+	}
+	else if (openavbAecpCommandResponse->headers.message_type == OPENAVB_AECP_MESSAGE_TYPE_ADDRESS_ACCESS_COMMAND) {
+		U16 commandSpecificLength;
+
+		if (openavbAecpCommandResponse->headers.control_data_length < 10) {
+			free(openavbAecpCommandResponse);
+			return;
+		}
+
+		commandSpecificLength = (U16)(openavbAecpCommandResponse->headers.control_data_length - 10);
+		if ((pSrc - payload + commandSpecificLength) <= payload_len) {
+			openavbAecpHandleAddressAccessCommand(openavbAecpCommandResponse, pSrc, commandSpecificLength);
+		}
+		else {
+			AVB_LOGF_ERROR("Expected ADDRESS_ACCESS payload of size %d, but received one of size %d. Discarding.",
+				(int)(pSrc - payload + commandSpecificLength), payload_len);
+		}
+		free(openavbAecpCommandResponse);
+	}
+	else if (openavbAecpCommandResponse->headers.message_type == OPENAVB_AECP_MESSAGE_TYPE_VENDOR_UNIQUE_COMMAND) {
+		openavb_aecp_entity_model_data_unit_t *pDst = &openavbAecpCommandResponse->entityModelPdu;
+		U16 command_specific_length = openavbAecpGetMvuCommandSpecificLength(openavbAecpCommandResponse);
+
+		OCT_B2DMEMCP(openavbAecpCommandResponse->protocol_id, pSrc);
+		BIT_B2DNTOHS(pDst->u, pSrc, 0x8000, 15, 0);
+		BIT_B2DNTOHS(pDst->command_type, pSrc, 0x7fff, 0, 2);
+
+		switch (pDst->command_type) {
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MILAN_INFO:
+				{
+					openavb_aecp_mvu_commandresponse_data_get_milan_info_t *pCmd = &pDst->command_data.getMilanInfoCmd;
+					OCT_B2DNTOHS(pCmd->reserved_0, pSrc);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_SET_SYSTEM_UNIQUE_ID:
+				{
+					openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t *pCmd =
+						&pDst->command_data.setSystemUniqueIdCmd;
+					U32 systemUniqueIdHi = 0;
+					U32 systemUniqueIdLo = 0;
+
+					OCT_B2DNTOHS(pCmd->reserved_0, pSrc);
+					if (command_specific_length == 6) {
+						OCT_B2DNTOHL(systemUniqueIdLo, pSrc);
+						pCmd->system_unique_id = (U64)systemUniqueIdLo;
+						memset(pCmd->system_name, 0, sizeof(pCmd->system_name));
+					}
+					else if (command_specific_length >= 74) {
+						OCT_B2DNTOHL(systemUniqueIdHi, pSrc);
+						OCT_B2DNTOHL(systemUniqueIdLo, pSrc);
+						pCmd->system_unique_id = (((U64)systemUniqueIdHi) << 32) | (U64)systemUniqueIdLo;
+						OCT_B2DMEMCP(pCmd->system_name, pSrc);
+					}
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_SYSTEM_UNIQUE_ID:
+				{
+					openavb_aecp_mvu_commandresponse_data_get_system_unique_id_t *pCmd =
+						&pDst->command_data.getSystemUniqueIdCmd;
+					OCT_B2DNTOHS(pCmd->reserved_0, pSrc);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MEDIA_CLOCK_REFERENCE_INFO:
+				{
+					openavb_aecp_mvu_commandresponse_data_get_media_clock_reference_info_t *pCmd =
+						&pDst->command_data.getMediaClockReferenceInfoCmd;
+					OCT_B2DNTOHS(pCmd->clock_domain_index, pSrc);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_BIND_STREAM:
+				{
+					openavb_aecp_mvu_commandresponse_data_bind_stream_t *pCmd = &pDst->command_data.bindStreamCmd;
+					OCT_B2DNTOHS(pCmd->flags, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_index, pSrc);
+					OCT_B2DMEMCP(pCmd->talker_entity_id, pSrc);
+					OCT_B2DNTOHS(pCmd->talker_stream_index, pSrc);
+					OCT_B2DNTOHS(pCmd->reserved, pSrc);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_UNBIND_STREAM:
+				{
+					openavb_aecp_mvu_commandresponse_data_unbind_stream_t *pCmd = &pDst->command_data.unbindStreamCmd;
+					OCT_B2DNTOHS(pCmd->reserved_0, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_index, pSrc);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_STREAM_INPUT_INFO_EX:
+				{
+					openavb_aecp_mvu_commandresponse_data_unbind_stream_t *pCmd = &pDst->command_data.getStreamInputInfoExCmd;
+					OCT_B2DNTOHS(pCmd->reserved_0, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_type, pSrc);
+					OCT_B2DNTOHS(pCmd->descriptor_index, pSrc);
+				}
+				break;
+			default:
+				if (command_specific_length > 0) {
+					pSrc += command_specific_length;
+				}
+				break;
+		}
+
+		if (pSrc - payload <= payload_len) {
 			openavbAecpSMEntityModelEntitySet_rcvdCommand(openavbAecpCommandResponse);
 		}
 		else {
@@ -598,13 +1079,13 @@ static void openavbAecpMessageRxFrameReceive(U32 timeoutUsec)
 					openavbAecpMessageRxFrameParse(pFrame + offset, len - offset, &hdrInfo);
 				}
 			}
-			else {
-				if (openavbAecpShouldLogNonAvtp()) {
-					AVB_LOG_WARNING("Received non-AVTP frame!");
-					AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
-					AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+				else {
+					if (openavbAecpShouldLogNonAvtp()) {
+						AVB_LOG_DEBUG("Received non-AVTP frame.");
+						AVB_LOGF_DEBUG("Unexpected packet data (length %d):", len);
+						AVB_LOG_BUFFER(AVB_LOG_LEVEL_DEBUG, pFrame, len, 16);
+					}
 				}
-			}
 		}
 
 		// Release the frame
@@ -700,7 +1181,13 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_LOCK_ENTITY:
-				// No command specific data
+				{
+					openavb_aecp_commandresponse_data_lock_entity_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.lockEntityRsp;
+					OCT_D2BHTONL(pDst, pSrc->flags);
+					OCT_D2BMEMCP(pDst, pSrc->locked_id);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ENTITY_AVAILABLE:
 				// No command specific data
@@ -719,8 +1206,29 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 			case OPENAVB_AEM_COMMAND_CODE_WRITE_DESCRIPTOR:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_CONFIGURATION:
+				{
+					openavb_aecp_commandresponse_data_set_configuration_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.setConfigurationRsp;
+					OCT_D2BHTONS(pDst, pSrc->reserved);
+					OCT_D2BHTONS(pDst, pSrc->configuration_index);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_CONFIGURATION:
+				{
+					openavb_aecp_response_data_get_configuration_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getConfigurationRsp;
+					OCT_D2BHTONS(pDst, pSrc->reserved);
+					OCT_D2BHTONS(pDst, pSrc->configuration_index);
+				}
+				break;
+			case OPENAVB_AEM_COMMAND_CODE_GET_DYNAMIC_INFO:
+				{
+					openavb_aecp_commandresponse_data_get_dynamic_info_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getDynamicInfoRsp;
+					if (pSrc->payload_length > sizeof(pSrc->payload)) {
+						pSrc->payload_length = sizeof(pSrc->payload);
+					}
+					if (pSrc->payload_length > 0) {
+						OCT_D2BBUFCP(pDst, pSrc->payload, pSrc->payload_length);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_STREAM_FORMAT:
 				{
@@ -766,6 +1274,12 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 			case OPENAVB_AEM_COMMAND_CODE_GET_STREAM_INFO:
 				{
 					openavb_aecp_response_data_get_stream_info_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getStreamInfoRsp;
+					bool emitMilanExtension = TRUE;
+					U32 streamInfoFlagsEx = pSrc->flags_ex;
+					U8 probingAcmpStatus = 0;
+					U8 reserved3 = 0;
+					U16 reserved4 = 0;
+
 					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
 					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
 					OCT_D2BHTONL(pDst, pSrc->flags);
@@ -778,6 +1292,18 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 					OCT_D2BMEMCP(pDst, pSrc->msrp_failure_bridge_id);
 					OCT_D2BHTONS(pDst, pSrc->stream_vlan_id);
 					OCT_D2BHTONS(pDst, pSrc->reserved_2);
+
+					if (emitMilanExtension) {
+						// Probing status "Completed" (0x03) in upper 3 bits when stream is connected.
+						if (pSrc->flags & OPENAVB_AEM_SET_STREAM_INFO_COMMAND_FLAG_CONNECTED) {
+							probingAcmpStatus = (U8)(0x03 << 5);
+						}
+						// ACMP status "Success" is encoded as 0 in lower 5 bits.
+						OCT_D2BHTONL(pDst, streamInfoFlagsEx);
+						OCT_D2BHTONB(pDst, probingAcmpStatus);
+						OCT_D2BHTONB(pDst, reserved3);
+						OCT_D2BHTONS(pDst, reserved4);
+					}
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_NAME:
@@ -787,6 +1313,10 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 			case OPENAVB_AEM_COMMAND_CODE_SET_ASSOCIATION_ID:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_ASSOCIATION_ID:
+				{
+					openavb_aecp_response_data_get_association_id_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getAssociationIDRsp;
+					OCT_D2BMEMCP(pDst, pSrc->association_id);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_SAMPLING_RATE:
 				{
@@ -830,66 +1360,21 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 
 					openavb_aem_descriptor_control_t *pDescriptorControl = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pSrc->descriptor_type, pSrc->descriptor_index);
 					if (pDescriptorControl) {
-						pSrc->valuesCount = 0;
-						int i1;
-						for (i1 = 0; i1 < pSrc->valuesCount; i1++) {
-							switch (pDescriptorControl->control_value_type) {
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT8:
-									OCT_D2BHTONB(pDst, pSrc->values.linear_int8[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT16:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT16:
-									OCT_D2BHTONS(pDst, pSrc->values.linear_int16[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT32:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT32:
-									OCT_D2BHTONL(pDst, pSrc->values.linear_int32[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_INT64:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_UINT64:
-									OCT_D2BMEMCP(pDst, &pSrc->values.linear_int64[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_FLOAT:
-									OCT_D2BMEMCP(pDst, &pSrc->values.linear_float[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_LINEAR_DOUBLE:
-									OCT_D2BMEMCP(pDst, &pSrc->values.linear_double[i1]);
-									break;
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_INT8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_UINT8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_INT16:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_UINT16:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_INT32:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_UINT32:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_INT64:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_UINT64:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_FLOAT:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_DOUBLE:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SELECTOR_STRING:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_INT8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_UINT8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_INT16:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_UINT16:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_INT32:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_UINT32:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_INT64:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_UINT64:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_FLOAT:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_ARRAY_DOUBLE:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_UTF8:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_BODE_PLOT:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SMPTE_TIME:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_SAMPLE_RATE:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_GPTP_TIME:
-								case OPENAVB_AEM_CONTROL_VALUE_TYPE_CONTROL_VENDOR:
-									break;
-							}
-						}
+						openavbAecpSerializeSetControlResponseValues(&pDst, pSrc, pDescriptorControl);
 					}
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_CONTROL:
+				{
+					openavb_aecp_response_data_get_control_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getControlRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+
+					openavb_aem_descriptor_control_t *pDescriptorControl = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pSrc->descriptor_type, pSrc->descriptor_index);
+					if (pDescriptorControl) {
+						openavbAecpSerializeGetControlResponseValues(&pDst, pSrc, pDescriptorControl);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_INCREMENT_CONTROL:
 				break;
@@ -963,7 +1448,6 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME:
-			case OPENAVB_AEM_COMMAND_CODE_GET_MAX_TRANSIT_TIME_2021:
 				{
 					openavb_aecp_response_data_get_max_transit_time_t *pSrc = &AEMCommandResponse->entityModelPdu.command_data.getMaxTransitTimeRsp;
 					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
@@ -988,13 +1472,35 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 					OCT_D2BHTONS(pDst, pSrc->number_of_mappings);
 					OCT_D2BHTONS(pDst, pSrc->reserved);
 					if (pSrc->number_of_mappings > 0) {
-						OCT_D2BBUFCP(pDst, pSrc->mappings, pSrc->number_of_mappings * sizeof(openavb_aecp_audio_mapping_t));
+						openavbAecpSerializeAudioMappings(&pDst, pSrc->mappings, pSrc->number_of_mappings);
 					}
 				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_ADD_AUDIO_MAPPINGS:
+				{
+					openavb_aecp_commandresponse_data_audio_mappings_t *pSrc =
+						&AEMCommandResponse->entityModelPdu.command_data.addAudioMappingsRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					OCT_D2BHTONS(pDst, pSrc->number_of_mappings);
+					OCT_D2BHTONS(pDst, pSrc->reserved);
+					if (pSrc->number_of_mappings > 0) {
+						openavbAecpSerializeAudioMappings(&pDst, pSrc->mappings, pSrc->number_of_mappings);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_REMOVE_AUDIO_MAPPINGS:
+				{
+					openavb_aecp_commandresponse_data_audio_mappings_t *pSrc =
+						&AEMCommandResponse->entityModelPdu.command_data.removeAudioMappingsRsp;
+					OCT_D2BHTONS(pDst, pSrc->descriptor_type);
+					OCT_D2BHTONS(pDst, pSrc->descriptor_index);
+					OCT_D2BHTONS(pDst, pSrc->number_of_mappings);
+					OCT_D2BHTONS(pDst, pSrc->reserved);
+					if (pSrc->number_of_mappings > 0) {
+						openavbAecpSerializeAudioMappings(&pDst, pSrc->mappings, pSrc->number_of_mappings);
+					}
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_VIDEO_MAP:
 				break;
@@ -1049,12 +1555,105 @@ void openavbAecpMessageTxFrame(openavb_aecp_AEMCommandResponse_t *AEMCommandResp
 			case OPENAVB_AEM_COMMAND_CODE_SET_MEMORY_OBJECT_LENGTH:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_MEMORY_OBJECT_LENGTH:
+				{
+					openavb_aecp_response_data_get_memory_object_length_t *pSrc =
+						&AEMCommandResponse->entityModelPdu.command_data.getMemoryObjectLengthRsp;
+					U64 lengthNetworkOrder = htonll(pSrc->length);
+					OCT_D2BHTONS(pDst, pSrc->configuration_index);
+					OCT_D2BHTONS(pDst, pSrc->memory_object_index);
+					OCT_D2BMEMCP(pDst, &lengthNetworkOrder);
+				}
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_SET_STREAM_BACKUP:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_GET_STREAM_BACKUP:
 				break;
 			case OPENAVB_AEM_COMMAND_CODE_EXPANSION:
+				break;
+			default:
+				break;
+		}
+	}
+	else if (AEMCommandResponse->headers.message_type == OPENAVB_AECP_MESSAGE_TYPE_VENDOR_UNIQUE_RESPONSE) {
+		openavb_aecp_entity_model_data_unit_t *pSrc = &AEMCommandResponse->entityModelPdu;
+		OCT_D2BBUFCP(pDst, AEMCommandResponse->protocol_id, OPENAVB_AECP_MVU_PROTOCOL_ID_LENGTH);
+		BIT_D2BHTONS(pDst, pSrc->u, 15, 0);
+		BIT_D2BHTONS(pDst, pSrc->command_type, 0, 2);
+
+		switch (pSrc->command_type) {
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MILAN_INFO:
+				{
+					openavb_aecp_mvu_response_data_get_milan_info_t *pMvu = &pSrc->command_data.getMilanInfoRsp;
+					OCT_D2BHTONS(pDst, pMvu->reserved_0);
+					OCT_D2BHTONL(pDst, pMvu->protocol_version);
+					OCT_D2BHTONL(pDst, pMvu->features_flags);
+					OCT_D2BHTONL(pDst, pMvu->certification_version);
+					OCT_D2BHTONL(pDst, pMvu->specification_version);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_SET_SYSTEM_UNIQUE_ID:
+				{
+					openavb_aecp_mvu_commandresponse_data_set_system_unique_id_t *pMvu =
+						&pSrc->command_data.setSystemUniqueIdRsp;
+					OCT_D2BHTONS(pDst, pMvu->reserved_0);
+					OCT_D2BHTONL(pDst, (U32)(pMvu->system_unique_id >> 32));
+					OCT_D2BHTONL(pDst, (U32)(pMvu->system_unique_id & 0xffffffffULL));
+					OCT_D2BBUFCP(pDst, pMvu->system_name, OPENAVB_AEM_STRLEN_MAX);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_SYSTEM_UNIQUE_ID:
+				{
+					openavb_aecp_mvu_response_data_get_system_unique_id_t *pMvu =
+						&pSrc->command_data.getSystemUniqueIdRsp;
+					OCT_D2BHTONS(pDst, pMvu->reserved_0);
+					OCT_D2BHTONL(pDst, (U32)(pMvu->system_unique_id >> 32));
+					OCT_D2BHTONL(pDst, (U32)(pMvu->system_unique_id & 0xffffffffULL));
+					OCT_D2BBUFCP(pDst, pMvu->system_name, OPENAVB_AEM_STRLEN_MAX);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_MEDIA_CLOCK_REFERENCE_INFO:
+				{
+					openavb_aecp_mvu_response_data_get_media_clock_reference_info_t *pMvu =
+						&pSrc->command_data.getMediaClockReferenceInfoRsp;
+					OCT_D2BHTONS(pDst, pMvu->clock_domain_index);
+					OCT_D2BHTONB(pDst, pMvu->flags);
+					OCT_D2BHTONB(pDst, pMvu->reserved_0);
+					OCT_D2BHTONB(pDst, pMvu->default_media_clock_priority);
+					OCT_D2BHTONB(pDst, pMvu->user_media_clock_priority);
+					OCT_D2BHTONL(pDst, pMvu->reserved_1);
+					OCT_D2BBUFCP(pDst, pMvu->media_clock_domain_name, OPENAVB_AEM_STRLEN_MAX);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_BIND_STREAM:
+				{
+					openavb_aecp_mvu_commandresponse_data_bind_stream_t *pMvu = &pSrc->command_data.bindStreamRsp;
+					OCT_D2BHTONS(pDst, pMvu->flags);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_type);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_index);
+					OCT_D2BMEMCP(pDst, pMvu->talker_entity_id);
+					OCT_D2BHTONS(pDst, pMvu->talker_stream_index);
+					OCT_D2BHTONS(pDst, pMvu->reserved);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_UNBIND_STREAM:
+				{
+					openavb_aecp_mvu_commandresponse_data_unbind_stream_t *pMvu = &pSrc->command_data.unbindStreamRsp;
+					OCT_D2BHTONS(pDst, pMvu->reserved_0);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_type);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_index);
+				}
+				break;
+			case OPENAVB_AECP_MVU_COMMAND_TYPE_GET_STREAM_INPUT_INFO_EX:
+				{
+					openavb_aecp_mvu_response_data_get_stream_input_info_ex_t *pMvu = &pSrc->command_data.getStreamInputInfoExRsp;
+					OCT_D2BHTONS(pDst, pMvu->reserved_0);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_type);
+					OCT_D2BHTONS(pDst, pMvu->descriptor_index);
+					OCT_D2BMEMCP(pDst, pMvu->talker_entity_id);
+					OCT_D2BHTONS(pDst, pMvu->talker_unique_id);
+					OCT_D2BHTONB(pDst, pMvu->probing_acmp_status);
+					OCT_D2BHTONB(pDst, pMvu->reserved_1);
+				}
 				break;
 			default:
 				break;

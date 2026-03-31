@@ -56,5 +56,6 @@ struct _avdecc_msg_state {
 
 // Client-side helper function.
 bool openavbAvdeccMsgClntNotifyCurrentState(tl_state_t *pTLState);
+bool openavbAvdeccMsgClntPublishCounters(tl_state_t *pTLState);
 
 #endif // OPENAVB_AVDECC_MSG_CLIENT_H

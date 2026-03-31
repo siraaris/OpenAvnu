@@ -77,7 +77,8 @@ openavbRC openavbAemDescriptorControlToBuf(void *pVoidDescriptor, U16 bufLength,
 	OCT_D2BHTONL(pDst, pSrc->control_latency);
 	OCT_D2BHTONS(pDst, pSrc->control_domain);
 	OCT_D2BHTONS(pDst, pSrc->control_value_type);
-	OCT_D2BMEMCP(pDst, &pSrc->control_type);
+	OCT_D2BHTONL(pDst, (U32)(pSrc->control_type >> 32));
+	OCT_D2BHTONL(pDst, (U32)(pSrc->control_type & 0xffffffffULL));
 	OCT_D2BHTONL(pDst, pSrc->reset_time);
 	OCT_D2BHTONS(pDst, pSrc->values_offset);
 	OCT_D2BHTONS(pDst, pSrc->number_of_values);
@@ -267,7 +268,13 @@ openavbRC openavbAemDescriptorControlFromBuf(void *pVoidDescriptor, U16 bufLengt
 	OCT_B2DNTOHL(pDst->control_latency, pSrc);
 	OCT_B2DNTOHS(pDst->control_domain, pSrc);
 	OCT_B2DNTOHS(pDst->control_value_type, pSrc);
-	OCT_B2DMEMCP(&pDst->control_type, pSrc);
+	{
+		U32 controlTypeHi = 0;
+		U32 controlTypeLo = 0;
+		OCT_B2DNTOHL(controlTypeHi, pSrc);
+		OCT_B2DNTOHL(controlTypeLo, pSrc);
+		pDst->control_type = (((U64)controlTypeHi) << 32) | (U64)controlTypeLo;
+	}
 	OCT_B2DNTOHL(pDst->reset_time, pSrc);
 	OCT_B2DNTOHS(pDst->values_offset, pSrc);
 	OCT_B2DNTOHS(pDst->number_of_values, pSrc);

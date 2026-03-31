@@ -87,6 +87,21 @@ void openavbAcmpSMListenerSet_doFastConnect(
 	const U8 talker_entity_id[8],
 	const U8 controller_entity_id[8]);
 
+// Special command to initiate a regular ACMP listener connect through the
+// local listener state machine.
+bool openavbAcmpSMListenerSet_doConnect(
+	const openavb_tl_data_cfg_t *pListener,
+	U16 flags,
+	U16 talker_unique_id,
+	const U8 talker_entity_id[8],
+	const U8 controller_entity_id[8]);
+
+// Special command to initiate a local listener disconnect through the ACMP
+// state machine so the Talker receives DISCONNECT_TX_COMMAND.
+bool openavbAcmpSMListenerSet_doDisconnect(
+	const openavb_tl_data_cfg_t *pListener,
+	const U8 controller_entity_id[8]);
+
 // Assist function to detect if Talker available for fast connect
 void openavbAcmpSMListenerSet_talkerTestFastConnect(
 	const U8 entity_id[8]);

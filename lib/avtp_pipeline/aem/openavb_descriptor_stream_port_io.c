@@ -163,6 +163,10 @@ extern DLL_EXPORT openavb_aem_descriptor_stream_port_io_t *openavbAemDescriptorS
 	pDescriptor->descriptorPvtPtr->update = openavbAemDescriptorStreamPortIOUpdate;
 
 	pDescriptor->descriptor_type = OPENAVB_AEM_DESCRIPTOR_STREAM_PORT_INPUT;
+	pDescriptor->clock_domain_index = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_control = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_cluster = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_map = OPENAVB_AEM_DESCRIPTOR_INVALID;
 
 	AVB_TRACE_EXIT(AVB_TRACE_AEM);
 	return pDescriptor;
@@ -199,6 +203,10 @@ extern DLL_EXPORT openavb_aem_descriptor_stream_port_io_t *openavbAemDescriptorS
 	pDescriptor->descriptorPvtPtr->update = openavbAemDescriptorStreamPortIOUpdate;
 
 	pDescriptor->descriptor_type = OPENAVB_AEM_DESCRIPTOR_STREAM_PORT_OUTPUT;
+	pDescriptor->clock_domain_index = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_control = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_cluster = OPENAVB_AEM_DESCRIPTOR_INVALID;
+	pDescriptor->base_map = OPENAVB_AEM_DESCRIPTOR_INVALID;
 
 	AVB_TRACE_EXIT(AVB_TRACE_AEM);
 	return pDescriptor;

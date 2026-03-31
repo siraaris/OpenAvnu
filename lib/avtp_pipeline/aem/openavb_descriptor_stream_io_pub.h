@@ -46,6 +46,15 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_avdecc_read_ini_pub.h"
 
 #define OPENAVB_DESCRIPTOR_STREAM_IO_MAX_FORMATS (47)
+#define OPENAVB_STREAM_INFO_FLAGS_EX_REGISTERING (0x00000001u)
+#define OPENAVB_MVU_BIND_STREAM_FLAG_STREAMING_WAIT (0x00000001u)
+
+typedef enum {
+	OPENAVB_MVU_PROBING_STATUS_DISABLED = 0,
+	OPENAVB_MVU_PROBING_STATUS_PASSIVE = 1,
+	OPENAVB_MVU_PROBING_STATUS_ACTIVE = 2,
+	OPENAVB_MVU_PROBING_STATUS_COMPLETED = 3,
+} openavb_mvu_probing_status_t;
 
 // Possible statuses of the fast connect support for the Listener
 typedef enum {
@@ -94,6 +103,20 @@ typedef struct {
 	U8 acmp_stream_id[8];
 	U8 acmp_dest_addr[6];
 	U16 acmp_stream_vlan_id;
+
+	// Listener MSRP failure data from SRP TalkerFailed declarations.
+	U8 msrp_failure_code;
+	U8 msrp_failure_bridge_id[8];
+
+	// Extension flags for GET_STREAM_INFO (Milan/IEEE 1722.1-2021).
+	U32 stream_info_flags_ex;
+
+	// Milan MVU bind state for GET_STREAM_INPUT_INFO_EX / BIND_STREAM.
+	bool mvu_bound;
+	U32 mvu_bind_flags;
+	U8 mvu_talker_entity_id[8];
+	U16 mvu_talker_stream_index;
+	U8 mvu_acmp_status;
 
 	// Also save a pointer to the supplied stream information.
 	const openavb_tl_data_cfg_t *stream;

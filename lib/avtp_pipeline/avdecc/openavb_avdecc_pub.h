@@ -55,7 +55,11 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_descriptor_external_port_io_pub.h"
 #include "openavb_descriptor_audio_cluster_pub.h"
 #include "openavb_descriptor_audio_map_pub.h"
+#include "openavb_descriptor_memory_object_pub.h"
 #include "openavb_descriptor_clock_domain_pub.h"
+#include "openavb_descriptor_timing_pub.h"
+#include "openavb_descriptor_ptp_instance_pub.h"
+#include "openavb_descriptor_ptp_port_pub.h"
 #include "openavb_descriptor_locale_strings_handler_pub.h"
 
 // Discovery protocol public includes
@@ -98,6 +102,7 @@ typedef struct {
 	bool bFastConnectSupported; // FAST_CONNECT and SAVED_STATE supported
 
 	U8 valid_time; // Number of 2-second units
+	U16 identify_control_timeout_sec; // Auto-clear timeout for IDENTIFY control logging/action
 
 	// Information to add to the descriptor.
 	unsigned avdeccId;
@@ -122,6 +127,12 @@ typedef struct openavb_avdecc_configuration_cfg {
 	// Pointer to the endpoint information.
 	openavb_tl_data_cfg_t *stream;
 
+	// Top-level stream descriptor associated with this configuration.
+	// Populated during AVDECC model construction.
+	U16 stream_descriptor_type;
+	U16 stream_descriptor_index;
+	bool stream_is_crf;
+
 	// Friendly name
 	char friendly_name[OPENAVB_AEM_STRLEN_MAX];
 
@@ -141,6 +152,14 @@ void openavbAvdeccStop(void);
 
 // Returns the stream configuration for the given stream index, or NULL if not found.
 openavb_tl_data_cfg_t *openavbAvdeccGetStreamCfg(U16 streamIndex);
+
+// Returns the descriptor index of the primary IDENTIFY control, or
+// OPENAVB_AEM_DESCRIPTOR_INVALID if one is not exposed.
+U16 openavbAvdeccGetIdentifyControlIndex(void);
+bool openavbAvdeccHasEntityLogo(void);
+U64 openavbAvdeccGetEntityLogoStartAddress(void);
+U64 openavbAvdeccGetEntityLogoLength(void);
+bool openavbAvdeccReadEntityLogo(U64 address, U16 requestedLength, U8 *pBuf, U16 *pReadLength, U16 *pStatus);
 
 // General Cleanup for AVDECC.
 bool openavbAvdeccCleanup(void);

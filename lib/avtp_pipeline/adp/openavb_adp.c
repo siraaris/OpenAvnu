@@ -120,14 +120,27 @@ openavbRC openavbAdpStart()
 		pPdu->entity_capabilities = pAem->pDescriptorEntity->entity_capabilities;
 		pPdu->talker_stream_sources = pAem->pDescriptorEntity->talker_stream_sources;
 		pPdu->talker_capabilities = pAem->pDescriptorEntity->talker_capabilities;
-		pPdu->listener_stream_sinks = pAem->pDescriptorEntity->listener_stream_sinks;
-		pPdu->listener_capabilities = pAem->pDescriptorEntity->listener_capabilities;
-		pPdu->controller_capabilities = pAem->pDescriptorEntity->controller_capabilities;
-		pPdu->available_index = pAem->pDescriptorEntity->available_index;
+			pPdu->listener_stream_sinks = pAem->pDescriptorEntity->listener_stream_sinks;
+			pPdu->listener_capabilities = pAem->pDescriptorEntity->listener_capabilities;
+			pPdu->controller_capabilities = pAem->pDescriptorEntity->controller_capabilities;
+			/*
+			 * Use descriptor-configured available_index when provided.
+			 * Otherwise seed from realtime milliseconds so a process restart
+			 * does not restart from 0 and appear incoherent to some controllers.
+			 */
+			if (pAem->pDescriptorEntity->available_index != 0) {
+				pPdu->available_index = pAem->pDescriptorEntity->available_index;
+			}
+			else {
+				struct timespec now;
+				CLOCK_GETTIME(OPENAVB_CLOCK_REALTIME, &now);
+				pPdu->available_index = (U32)(((U64)now.tv_sec * 1000ULL) + ((U64)now.tv_nsec / 1000000ULL));
+			}
 		// The pPdu->gptp_grandmaster_id and pPdu->gptp_domain_number will be filled in when the ADPDU is transmitted.
 		// pPdu->reserved0;
-		// pPdu->identify_control_index = ???;											// AVDECC_TODO	
-		// pPdu->interface_index = ???;													// AVDECC_TODO	
+		pPdu->identify_control_index = openavbAvdeccGetIdentifyControlIndex();
+		// OpenAvnu currently exposes a single AVB_INTERFACE descriptor at index 0.
+		pPdu->interface_index = 0;
 		memcpy(pPdu->association_id, pAem->pDescriptorEntity->association_id, sizeof(pPdu->association_id));
 		// pPdu->reserved1;
 	}

@@ -401,7 +401,7 @@ void openavbAcmpSMControllerStop()
 	SEM_DESTROY(openavbAcmpSMControllerSemaphore, err);
 	SEM_LOG_ERR(err);
 
-	openavbListDeleteList(openavbAcmpSMControllerVars.inflight);
+	openavbListDeleteListShallow(openavbAcmpSMControllerVars.inflight);
 
 	AVB_TRACE_EXIT(AVB_TRACE_ACMP);
 }

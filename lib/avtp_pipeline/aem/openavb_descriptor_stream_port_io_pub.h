@@ -42,6 +42,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_types_pub.h"
 #include "openavb_aem_types_pub.h"
 #include "openavb_aem_pub.h"
+#include "openavb_descriptor_audio_map_pub.h"
 
 // STREAM PORT IO Descriptor IEEE Std 1722.1-2013 clause 7.2.13
 typedef struct {
@@ -57,6 +58,14 @@ typedef struct {
 	U16 base_cluster;
 	U16 number_of_maps;
 	U16 base_map;
+
+	// Milan / AECP dynamic audio mappings for ports that do not expose static AUDIO_MAP descriptors.
+	bool dynamic_mappings_supported;
+	U16 dynamic_number_of_maps;
+	U16 dynamic_number_of_mappings;
+	U16 dynamic_stream_channels;
+	U16 dynamic_cluster_channels;
+	openavb_aem_descriptor_audio_map_audio_mapping_format_t dynamic_mappings[OPENAVB_DESCRIPTOR_AUDIO_MAP_MAX_MAPPINGS];
 } openavb_aem_descriptor_stream_port_io_t;
 
 openavb_aem_descriptor_stream_port_io_t *openavbAemDescriptorStreamPortInputNew(void);

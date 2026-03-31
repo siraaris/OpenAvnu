@@ -41,7 +41,18 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_aecp_message.h"
 #include "openavb_aecp_cmd_get_counters.h"
 #include "openavb_avdecc_pipeline_interaction_pub.h"
+#include "openavb_avdecc_msg_server.h"
 
+
+static void SetCounterValue(openavb_aecp_response_data_get_counters_t *pRsp, U32 counterFlag, U16 offset, U32 value)
+{
+	if (!pRsp) {
+		return;
+	}
+
+	pRsp->counters_valid |= counterFlag;
+	*(U32 *)&(pRsp->counters_block[offset]) = htonl(value);
+}
 
 static void GetEntitySpecificCounters(void * pDescriptor, U16 descriptorType, openavb_aecp_response_data_get_counters_t *pRsp)
 {
@@ -49,37 +60,83 @@ static void GetEntitySpecificCounters(void * pDescriptor, U16 descriptorType, op
 
 	// Code assumes that ENTITY_SPECIFIC flags and offsets are the same regardless of the Descriptor Type.
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_1, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_1;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_1]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_1, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_1, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_2, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_2;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_2]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_2, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_2, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_3, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_3;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_3]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_3, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_3, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_4, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_4;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_4]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_4, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_4, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_5, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_5;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_5]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_5, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_5, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_6, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_6;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_6]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_6, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_6, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_7, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_7;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_7]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_7, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_7, retValue);
 	}
 	if (openavbAVDECCGetCounterValue(pDescriptor, descriptorType, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_8, &retValue)) {
-		pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_8;
-		*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_8]) = htonl(retValue);
+		SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_COUNTER_ENTITY_SPECIFIC_8, OPENAVB_AEM_GET_COUNTERS_COMMAND_ENTITY_OFFSET_ENTITY_SPECIFIC_8, retValue);
 	}
+}
+
+static void GetStreamInputCounters(openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput, openavb_aecp_response_data_get_counters_t *pRsp)
+{
+	const avdecc_msg_state_t *pClient = NULL;
+	const openavb_avtp_diag_counters_t *pCounters = NULL;
+
+	if (!pDescriptorStreamInput || !pRsp) {
+		return;
+	}
+	if (pDescriptorStreamInput->stream) {
+		pClient = pDescriptorStreamInput->stream->client;
+	}
+	if (pClient) {
+		pCounters = &pClient->counters;
+	}
+
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_LOCKED, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_LOCKED, pCounters ? pCounters->media_locked : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_UNLOCKED, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_UNLOCKED, pCounters ? pCounters->media_unlocked : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_STREAM_RESET, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_STREAM_RESET, pCounters ? pCounters->stream_interrupted : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_SEQ_NUM_MISMATCH, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_SEQ_NUM_MISMATCH, pCounters ? pCounters->seq_num_mismatch : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_RESET, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_RESET, pCounters ? pCounters->media_reset : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_TIMESTAMP_UNCERTAIN, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_TIMESTAMP_UNCERTAIN, pCounters ? pCounters->timestamp_uncertain : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_TIMESTAMP_VALID, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_TIMESTAMP_VALID, pCounters ? pCounters->timestamp_valid : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_TIMESTAMP_NOT_VALID, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_TIMESTAMP_NOT_VALID, pCounters ? pCounters->timestamp_not_valid : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_UNSUPPORTED_FORMAT, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_UNSUPPORTED_FORMAT, pCounters ? pCounters->unsupported_format : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_LATE_TIMESTAMP, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_LATE_TIMESTAMP, pCounters ? pCounters->late_timestamp : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_EARLY_TIMESTAMP, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_EARLY_TIMESTAMP, pCounters ? pCounters->early_timestamp : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_FRAMES_RX, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_FRAMES_RX, pCounters ? pCounters->frames_rx : 0);
+}
+
+static void GetStreamOutputCounters(openavb_aem_descriptor_stream_io_t *pDescriptorStreamOutput, openavb_aecp_response_data_get_counters_t *pRsp)
+{
+	const avdecc_msg_state_t *pClient = NULL;
+	const openavb_avtp_diag_counters_t *pCounters = NULL;
+
+	if (!pDescriptorStreamOutput || !pRsp) {
+		return;
+	}
+	if (pDescriptorStreamOutput->stream) {
+		pClient = pDescriptorStreamOutput->stream->client;
+	}
+	if (pClient) {
+		pCounters = &pClient->counters;
+	}
+
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_START, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_START, pCounters ? pCounters->stream_start : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_STOP, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_STOP, pCounters ? pCounters->stream_stop : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_INTERRUPTED, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_INTERRUPTED, pCounters ? pCounters->stream_interrupted : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_MEDIA_RESET, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_MEDIA_RESET, pCounters ? pCounters->media_reset : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_TIMESTAMP_UNCERTAIN, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_TIMESTAMP_UNCERTAIN, pCounters ? pCounters->timestamp_uncertain : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_TIMESTAMP_VALID, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_TIMESTAMP_VALID, pCounters ? pCounters->timestamp_valid : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_TIMESTAMP_NOT_VALID, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_TIMESTAMP_NOT_VALID, pCounters ? pCounters->timestamp_not_valid : 0);
+	SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_FRAMES_TX, OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_FRAMES_TX, pCounters ? pCounters->frames_tx : 0);
 }
 
 U8 openavbAecpCommandGetCountersHandler(
@@ -114,28 +171,22 @@ U8 openavbAecpCommandGetCountersHandler(
 		if (pDescriptorAvbInterface) {
 			// Get the supported counter values.
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_UP, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_UP;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_LINK_UP]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_UP, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_LINK_UP, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_DOWN, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_DOWN;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_LINK_DOWN]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_LINK_DOWN, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_LINK_DOWN, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_TX, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_TX;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_FRAMES_TX]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_TX, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_FRAMES_TX, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_RX, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_RX;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_FRAMES_RX]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_FRAMES_RX, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_FRAMES_RX, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_RX_CRC_ERROR, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_RX_CRC_ERROR;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_RX_CRC_ERROR]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_RX_CRC_ERROR, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_RX_CRC_ERROR, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_GPTP_GM_CHANGED, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_GPTP_GM_CHANGED;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_GPTP_GM_CHANGED]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_COUNTER_GPTP_GM_CHANGED, OPENAVB_AEM_GET_COUNTERS_COMMAND_AVB_INTERFACE_OFFSET_GPTP_GM_CHANGED, value);
 			}
 			GetEntitySpecificCounters(pDescriptorAvbInterface, OPENAVB_AEM_DESCRIPTOR_AVB_INTERFACE, pRsp);
 
@@ -147,12 +198,10 @@ U8 openavbAecpCommandGetCountersHandler(
 		if (pDescriptorClockDomain) {
 			// Get the supported counter values.
 			if (openavbAVDECCGetCounterValue(pDescriptorClockDomain, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_LOCKED, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_LOCKED;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_OFFSET_LOCKED]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_LOCKED, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_OFFSET_LOCKED, value);
 			}
 			if (openavbAVDECCGetCounterValue(pDescriptorClockDomain, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_UNLOCKED, &value)) {
-				pRsp->counters_valid |= OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_UNLOCKED;
-				*(U32 *)&(pRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_OFFSET_UNLOCKED]) = htonl(value);
+				SetCounterValue(pRsp, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_COUNTER_UNLOCKED, OPENAVB_AEM_GET_COUNTERS_COMMAND_CLOCK_DOMAIN_OFFSET_UNLOCKED, value);
 			}
 			GetEntitySpecificCounters(pDescriptorClockDomain, OPENAVB_AEM_DESCRIPTOR_CLOCK_DOMAIN, pRsp);
 
@@ -162,16 +211,15 @@ U8 openavbAecpCommandGetCountersHandler(
 	else if (pCmd->descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT) {
 		openavb_aem_descriptor_stream_io_t *pDescriptorStreamInput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pCmd->descriptor_type, pCmd->descriptor_index);
 		if (pDescriptorStreamInput) {
-			// No reliable stream input counters are currently available.
-			// Report success with no valid counters to avoid spurious error flags in controllers.
-
+			GetStreamInputCounters(pDescriptorStreamInput, pRsp);
+			GetEntitySpecificCounters(pDescriptorStreamInput, OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT, pRsp);
 			result = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
 		}
 	}
 	else if (pCmd->descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
 		openavb_aem_descriptor_stream_io_t *pDescriptorStreamOutput = openavbAemGetDescriptor(openavbAemGetConfigIdx(), pCmd->descriptor_type, pCmd->descriptor_index);
 		if (pDescriptorStreamOutput) {
-			// No stream output counters available yet. Return success with empty counter block.
+			GetStreamOutputCounters(pDescriptorStreamOutput, pRsp);
 			GetEntitySpecificCounters(pDescriptorStreamOutput, OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT, pRsp);
 
 			result = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;

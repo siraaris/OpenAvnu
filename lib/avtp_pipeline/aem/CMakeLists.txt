@@ -14,7 +14,11 @@ SET (SRC_FILES ${SRC_FILES}
 	${AVB_SRC_DIR}/aem/openavb_descriptor_audio_cluster.c
 	${AVB_SRC_DIR}/aem/openavb_descriptor_audio_map.c
 	${AVB_SRC_DIR}/aem/openavb_descriptor_control.c
+	${AVB_SRC_DIR}/aem/openavb_descriptor_memory_object.c
 	${AVB_SRC_DIR}/aem/openavb_descriptor_clock_domain.c
+	${AVB_SRC_DIR}/aem/openavb_descriptor_timing.c
+	${AVB_SRC_DIR}/aem/openavb_descriptor_ptp_instance.c
+	${AVB_SRC_DIR}/aem/openavb_descriptor_ptp_port.c
 	${AVB_SRC_DIR}/aem/openavb_descriptor_locale_strings_handler.c
 	PARENT_SCOPE
 )

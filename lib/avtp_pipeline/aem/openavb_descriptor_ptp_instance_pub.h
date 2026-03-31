@@ -29,30 +29,38 @@ Complete license and copyright information can be found at
 https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 *************************************************************************************************************/
 
-#ifndef OPENAVB_AVDECC_MSG_SERVER_H
-#define OPENAVB_AVDECC_MSG_SERVER_H
+/*
+ ******************************************************************
+ * MODULE : AEM - AVDECC PTP Instance Descriptor Public Interface
+ * MODULE SUMMARY : Public Interface for the PTP Instance Descriptor
+ ******************************************************************
+ */
 
-#include "openavb_types.h"
-#include "openavb_avdecc_msg.h"
+#ifndef OPENAVB_DESCRIPTOR_PTP_INSTANCE_PUB_H
+#define OPENAVB_DESCRIPTOR_PTP_INSTANCE_PUB_H 1
 
-typedef struct openavb_tl_data_cfg openavb_tl_data_cfg_t;
+#include "openavb_types_pub.h"
+#include "openavb_aem_types_pub.h"
+#include "openavb_aem_pub.h"
 
-struct _avdecc_msg_state {
+// PTP_INSTANCE Descriptor IEEE Std 1722.1-2021 clause 7.2.35
+typedef struct {
+	openavb_descriptor_pvt_ptr_t descriptorPvtPtr;
 
-	// Handle to the AVDECC Msg handle for the connection to the server.
-	int avdeccMsgHandle;
+	U16 descriptor_type;
+	U16 descriptor_index;
+	U8 object_name[OPENAVB_AEM_STRLEN_MAX];
+	openavb_aem_string_ref_t localized_description;
+	U8 clock_identity[8];
+	U32 flags;
+	U16 number_of_controls;
+	U16 base_control;
+	U16 number_of_ptp_ports;
+	U16 base_ptp_port;
+} openavb_aem_descriptor_ptp_instance_t;
 
-	// TRUE if a Talker, FALSE if a Listener.
-	bool bTalker;
+openavb_aem_descriptor_ptp_instance_t *openavbAemDescriptorPtpInstanceNew(void);
 
-	// Local stream that matches the client's Talker/Listener.
-	// Do not free this pointer; it is for reference only.
-	openavb_tl_data_cfg_t * stream;
+bool openavbAemDescriptorPtpInstanceInitialize(openavb_aem_descriptor_ptp_instance_t *pDescriptor, U16 ptpPortIdx);
 
-	// Talker/Listener state information.
-	openavbAvdeccMsgStateType_t lastRequestedState;
-	openavbAvdeccMsgStateType_t lastReportedState;
-	openavb_avtp_diag_counters_t counters;
-};
-
-#endif // OPENAVB_AVDECC_MSG_SERVER_H
+#endif // OPENAVB_DESCRIPTOR_PTP_INSTANCE_PUB_H
