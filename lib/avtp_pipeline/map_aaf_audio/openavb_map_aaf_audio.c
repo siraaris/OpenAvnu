@@ -157,6 +157,7 @@ typedef struct {
 	U32 txLeadLogEveryPackets;
 	U32 txLeadLogCounter;
 	U32 txMinLeadUsec;
+	bool txDisableNetworkSwap;
 	S32 txLaunchSkewUsec;
 	S32 selectedClockTrimUsec;
 	U32 selectedClockWarmupUsec;
@@ -232,6 +233,73 @@ static void mapAafResetTxPhaseDiag(pvt_data_t *pPvtData)
 	pPvtData->txPhaseDiagLogCount = 0;
 	pPvtData->txPhaseDiagSourceGeneration = 0;
 	pPvtData->txPhaseDiagUsingLocalMediaClock = FALSE;
+}
+
+static bool mapAafPayloadNeedsNetworkSwap(const media_q_pub_map_aaf_audio_info_t *pPubMapInfo,
+					      const pvt_data_t *pPvtData)
+{
+	if (!pPubMapInfo) {
+		return FALSE;
+	}
+
+	if (pPvtData && pPvtData->txDisableNetworkSwap) {
+		return FALSE;
+	}
+
+	if (pPubMapInfo->itemSampleSizeBytes <= 1) {
+		return FALSE;
+	}
+
+	return (pPubMapInfo->audioEndian == AVB_AUDIO_ENDIAN_LITTLE);
+}
+
+static void mapAafCopyPayloadToNetworkOrder(U8 *pDst,
+							const U8 *pSrc,
+							U32 payloadSize,
+							const media_q_pub_map_aaf_audio_info_t *pPubMapInfo,
+							const pvt_data_t *pPvtData)
+{
+	U32 sampleSize;
+	U32 idx;
+
+	if (!pDst || !pSrc || payloadSize == 0 || !pPubMapInfo) {
+		return;
+	}
+
+	sampleSize = pPubMapInfo->itemSampleSizeBytes;
+	if (!mapAafPayloadNeedsNetworkSwap(pPubMapInfo, pPvtData)
+			|| sampleSize <= 1
+			|| (payloadSize % sampleSize) != 0) {
+		memcpy(pDst, pSrc, payloadSize);
+		return;
+	}
+
+	switch (sampleSize) {
+		case 2:
+			for (idx = 0; idx < payloadSize; idx += 2) {
+				pDst[idx + 0] = pSrc[idx + 1];
+				pDst[idx + 1] = pSrc[idx + 0];
+			}
+			break;
+		case 3:
+			for (idx = 0; idx < payloadSize; idx += 3) {
+				pDst[idx + 0] = pSrc[idx + 2];
+				pDst[idx + 1] = pSrc[idx + 1];
+				pDst[idx + 2] = pSrc[idx + 0];
+			}
+			break;
+		case 4:
+			for (idx = 0; idx < payloadSize; idx += 4) {
+				pDst[idx + 0] = pSrc[idx + 3];
+				pDst[idx + 1] = pSrc[idx + 2];
+				pDst[idx + 2] = pSrc[idx + 1];
+				pDst[idx + 3] = pSrc[idx + 0];
+			}
+			break;
+		default:
+			memcpy(pDst, pSrc, payloadSize);
+			break;
+	}
 }
 
 static void mapAafUpdateTxPhaseDiag(
@@ -551,6 +619,14 @@ void openavbMapAVTPAudioCfgCB(media_q_t *pMediaQ, const char *name, const char *
 			char *pEnd;
 			pPvtData->txMinLeadUsec = strtol(value, &pEnd, 10);
 		}
+		else if (strcmp(name, "map_nv_disable_network_swap") == 0 ||
+				strcmp(name, "map_nv_tx_disable_network_swap") == 0) {
+			char *pEnd;
+			long tmp = strtol(value, &pEnd, 10);
+			if (*pEnd == '\0') {
+				pPvtData->txDisableNetworkSwap = (tmp != 0);
+			}
+		}
 		else if (strcmp(name, "map_nv_tx_launch_skew_usec") == 0 ||
 				strcmp(name, "map_nv_launch_skew_usec") == 0) {
 			char *pEnd;
@@ -669,8 +745,16 @@ void openavbMapAVTPAudioTxInitCB(media_q_t *pMediaQ)
 	AVB_TRACE_ENTRY(AVB_TRACE_MAP);
 	if (pMediaQ) {
 		pvt_data_t *pPvtData = pMediaQ->pPvtMapInfo;
+		media_q_pub_map_aaf_audio_info_t *pPubMapInfo = pMediaQ->pPubMapInfo;
 		if (pPvtData) {
 			pPvtData->isTalker = TRUE;
+			if (pPubMapInfo) {
+				AVB_LOGF_INFO(
+					"AAF TX payload byte order: mediaQ_endian=%s sample_bytes=%u network_swap=%s",
+					(pPubMapInfo->audioEndian == AVB_AUDIO_ENDIAN_BIG) ? "big" : "little",
+					pPubMapInfo->itemSampleSizeBytes,
+					mapAafPayloadNeedsNetworkSwap(pPubMapInfo, pPvtData) ? "enabled" : "bypassed");
+			}
 			pPvtData->selectedClockPendingGeneration = 0;
 			pPvtData->selectedClockPendingLogged = FALSE;
 			pPvtData->selectedClockCadenceValid = FALSE;
@@ -1522,7 +1606,17 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 					memset(pPayload, 0, pPvtData->payloadSize);
 				}
 				else {
-					memcpy(pPayload, (uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx, pPvtData->payloadSize);
+					/*
+					 * AAF audio samples are serialized on the wire in network byte
+					 * order. The MediaQ item keeps the interface's native sample
+					 * order, so little-endian ALSA capture must be swapped here.
+					 */
+					mapAafCopyPayloadToNetworkOrder(
+						pPayload,
+						(uint8_t *)pMediaQItem->pPubData + pMediaQItem->readIdx,
+						pPvtData->payloadSize,
+						pPubMapInfo,
+						pPvtData);
 				}
 				pPayload += pPvtData->payloadSize;
 			}
@@ -1930,6 +2024,7 @@ extern DLL_EXPORT bool openavbMapAVTPAudioInitialize(media_q_t *pMediaQ, openavb
 		pPvtData->txLeadLogCounter = 0;
 		pPvtData->txPhaseDiagEveryPackets = 0;
 		pPvtData->txMinLeadUsec = 1000;
+		pPvtData->txDisableNetworkSwap = FALSE;
 		pPvtData->selectedClockWarmupUsec = 0;
 		pPvtData->selectedClockMuteUsec = 0;
 		pPvtData->selectedClockFollowUpdates = TRUE;
