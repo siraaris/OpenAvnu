@@ -82,7 +82,7 @@ static void simpleRawsockForceQdiscPath(simple_rawsock_t *rawsock)
 #ifdef PACKET_QDISC_BYPASS
 	int bypass = 0;
 	if (setsockopt(rawsock->sock, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass)) < 0) {
-		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass taprio/CBS",
+		AVB_LOGF_WARNING("PACKET_QDISC_BYPASS=0 failed (%d: %s); TX queue steering may bypass mqprio/CBS/ETF",
 			errno, strerror(errno));
 	}
 	else {

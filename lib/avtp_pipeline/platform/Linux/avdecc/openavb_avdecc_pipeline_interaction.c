@@ -399,6 +399,18 @@ bool openavbAVDECCRunTalker(openavb_aem_descriptor_stream_io_t *pDescriptorStrea
 		return FALSE;
 	}
 
+	if (pDescriptorStreamOutput->stream->defer_start_until_selected_clock &&
+			pDescriptorStreamOutput->stream->client->lastRequestedState == OPENAVB_AVDECC_MSG_UNKNOWN &&
+			pDescriptorStreamOutput->stream->client->lastReportedState != OPENAVB_AVDECC_MSG_RUNNING) {
+		AVB_LOGF_INFO("Deferring talker run request until selected clock is stable: handle=%d wait=%uus name=%s uid=%u",
+			pDescriptorStreamOutput->stream->client->avdeccMsgHandle,
+			pDescriptorStreamOutput->stream->defer_start_stable_usec,
+			pDescriptorStreamOutput->stream->friendly_name,
+			pDescriptorStreamOutput->stream->stream_uid);
+		AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+		return TRUE;
+	}
+
 	// Tell the client to start running.
 	// Note that that Talker may already be running; this call ensures that it really is.
 	if (!openavbAvdeccMsgSrvrChangeRequest(pDescriptorStreamOutput->stream->client->avdeccMsgHandle, OPENAVB_AVDECC_MSG_RUNNING)) {

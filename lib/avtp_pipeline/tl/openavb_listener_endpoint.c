@@ -43,12 +43,15 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_avtp.h"
 #include "openavb_listener.h"
 #include "openavb_avdecc_msg.h"
+#include "openavb_time_osal_pub.h"
 
 // DEBUG Uncomment to turn on logging for just this module.
 //#define AVB_LOG_ON	1
 
 #define	AVB_LOG_COMPONENT	"Listener"
 #include "openavb_log.h"
+
+#define LISTENER_SRP_TRANSIENT_GRACE_NS (1000ULL * 1000ULL * 1000ULL)
 
 /* Listener callback comes from endpoint, to indicate when talkers
  * come and go. We may need to start or stop the listener thread.
@@ -98,6 +101,9 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 		tSpec ? tSpec->maxFrameSize : 0,
 		latency);
 
+	U64 nowNS = 0;
+	CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &nowNS);
+
 	// Publish SRP declaration/failure details to AVDECC only when the value changes.
 	// This keeps MSRP flags information current without continuously pushing duplicates.
 	U8 failureBridgeId[8] = {0};
@@ -131,6 +137,15 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 
 	if (!pTLState->bStreaming
 		&& tlkrDecl == openavbSrp_AtTyp_TalkerAdvertise) {
+		MUTEX_CREATE_ERR();
+		MUTEX_LOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex lock failure");
+		pListenerData->lastTalkerAdvertiseNS = nowNS;
+		pListenerData->srpStopPending = FALSE;
+		pListenerData->srpStopDeadlineNS = 0;
+		MUTEX_UNLOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex unlock failure");
+
 		// 	if(x_cfg.noSrp) this is sort of a recursive call into openavbEptClntAttachStream()
 		// but we are OK due to the intervening IPC.
 		bool rc = openavbEptClntAttachStream(pTLState->endpointHandle, streamID, openavbSrp_LDSt_Ready);
@@ -180,18 +195,35 @@ void openavbEptClntNotifyLstnrOfSrpCb(int endpointHandle,
 		}
 	}
 	else if (pTLState->bStreaming
+		&& tlkrDecl == openavbSrp_AtTyp_TalkerAdvertise) {
+		MUTEX_CREATE_ERR();
+		MUTEX_LOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex lock failure");
+		pListenerData->lastTalkerAdvertiseNS = nowNS;
+		pListenerData->srpStopPending = FALSE;
+		pListenerData->srpStopDeadlineNS = 0;
+		MUTEX_UNLOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex unlock failure");
+	}
+	else if (pTLState->bStreaming
 		&& tlkrDecl != openavbSrp_AtTyp_TalkerAdvertise) {
-		AVB_LOGF_INFO("Stopping stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
-		pListenerData->aecpCounters.stream_interrupted++;
-		listenerStopStream(pTLState);
-
-		// We're still interested in the stream
-		openavbEptClntAttachStream(pTLState->endpointHandle, streamID, openavbSrp_LDSt_Interest);
-
-		// Notify AVDECC that fast connect is desired.
-		if (pTLState->bAvdeccMsgRunning) {
-			openavbAvdeccMsgClntChangeNotification(pTLState->avdeccMsgHandle, OPENAVB_AVDECC_MSG_STOPPED_UNEXPECTEDLY);
+		U64 graceRemainingNS = 0;
+		MUTEX_CREATE_ERR();
+		MUTEX_LOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex lock failure");
+		if (!pListenerData->srpStopPending) {
+			pListenerData->srpStopPending = TRUE;
+			pListenerData->srpStopDeadlineNS = nowNS + LISTENER_SRP_TRANSIENT_GRACE_NS;
 		}
+		if (pListenerData->srpStopDeadlineNS > nowNS) {
+			graceRemainingNS = pListenerData->srpStopDeadlineNS - nowNS;
+		}
+		MUTEX_UNLOCK(pListenerData->streamMutex);
+		MUTEX_LOG_ERR("Mutex unlock failure");
+		AVB_LOGF_INFO("Suppress transient listener SRP loss for stream " STREAMID_FORMAT " tlkrDecl=0x%02x grace_remaining=%lluns",
+			STREAMID_ARGS(streamID),
+			(U8)tlkrDecl,
+			(unsigned long long)graceRemainingNS);
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);

@@ -40,6 +40,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_tl_pub.h"
 #include "openavb_plugin.h"
 #include "openavb_trace_pub.h"
+#include "openavb_clock_source_runtime_pub.h"
+#include "openavb_aem_types_pub.h"
 #ifdef AVB_FEATURE_GSTREAMER
 #include <gst/gst.h>
 #endif
@@ -48,6 +50,50 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_log_pub.h"
 
 bool bRunning = TRUE;
+
+typedef struct {
+	bool pending;
+	U32 selectionGeneration;
+	U32 sourceGeneration;
+	U64 stableSinceNs;
+} deferred_start_state_t;
+
+static bool deferredStartSelectedClockReady(U32 *pSelectionGeneration, U32 *pSourceGeneration)
+{
+	openavb_clock_source_runtime_t selection;
+	U64 mediaClockNs = 0;
+	bool uncertain = FALSE;
+	U32 sourceGeneration = 0;
+
+	if (!openavbClockSourceRuntimeGetSelection(&selection)) {
+		return FALSE;
+	}
+
+	if (!(selection.clock_source_flags & OPENAVB_AEM_CLOCK_SOURCE_FLAG_STREAM_ID)) {
+		return FALSE;
+	}
+
+	if (!openavbClockSourceRuntimeGetMediaClockForLocation(
+			selection.clock_source_location_type,
+			selection.clock_source_location_index,
+			&mediaClockNs,
+			&uncertain,
+			&sourceGeneration)) {
+		return FALSE;
+	}
+
+	if (uncertain) {
+		return FALSE;
+	}
+
+	if (pSelectionGeneration) {
+		*pSelectionGeneration = selection.generation;
+	}
+	if (pSourceGeneration) {
+		*pSourceGeneration = sourceGeneration;
+	}
+	return TRUE;
+}
 
 // Platform independent mapping modules
 extern bool openavbMapPipeInitialize(media_q_t *pMediaQ, openavb_map_cb_t *pMapCB, U32 inMaxTransitUsec);
@@ -243,6 +289,13 @@ int main(int argc, char *argv[])
 	registerStaticIntfModule(openavbIntfH264RtpGstInitialize);
 #endif
 	tlHandleList = calloc(1, sizeof(tl_handle_t) * tlCount);
+	openavb_tl_cfg_t *tlCfgList = calloc(1, sizeof(openavb_tl_cfg_t) * tlCount);
+	deferred_start_state_t *deferredStartList = calloc(1, sizeof(deferred_start_state_t) * tlCount);
+	if (!tlHandleList || !tlCfgList || !deferredStartList) {
+		AVB_LOG_ERROR("Unable to allocate talker/listener startup state.");
+		osalAVBFinalize();
+		exit(-1);
+	}
 
 	// Open all streams
 	for (i1 = 0; i1 < tlCount; i1++) {
@@ -274,6 +327,9 @@ int main(int argc, char *argv[])
 				osalAVBFinalize();
 				exit(-1);
 			}
+			tlCfgList[i1] = cfg;
+			deferredStartList[i1].pending =
+				(cfg.role == AVB_ROLE_TALKER && cfg.defer_start_until_selected_clock);
 
 		int i2;
 		for (i2 = 0; i2 < NVCfg.nLibCfgItems; i2++) {
@@ -290,12 +346,64 @@ int main(int argc, char *argv[])
 
 	// Run any streams where the stop initial state was not requested.
 	for (i1 = 0; i1 < tlCount; i1++) {
+		if (deferredStartList[i1].pending) {
+			AVB_LOGF_INFO("Deferring stream start until selected clock is stable: %s uid=%u wait=%uus",
+				tlCfgList[i1].friendly_name,
+				tlCfgList[i1].stream_uid,
+				tlCfgList[i1].defer_start_stable_usec);
+			continue;
+		}
 		if (openavbTLGetInitialState(tlHandleList[i1]) != TL_INIT_STATE_STOPPED) {
 			openavbTLRun(tlHandleList[i1]);
 		}
 	}
 
 	while (bRunning) {
+		for (i1 = 0; i1 < tlCount; i1++) {
+			if (!deferredStartList[i1].pending || openavbTLIsRunning(tlHandleList[i1])) {
+				continue;
+			}
+
+			U32 selectionGeneration = 0;
+			U32 sourceGeneration = 0;
+			U64 nowNs = 0;
+			bool haveNow = CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNs);
+
+			if (!haveNow ||
+					!deferredStartSelectedClockReady(&selectionGeneration, &sourceGeneration)) {
+				deferredStartList[i1].stableSinceNs = 0;
+				deferredStartList[i1].selectionGeneration = 0;
+				deferredStartList[i1].sourceGeneration = 0;
+				continue;
+			}
+
+			// The selected media clock sample generation advances continuously while the
+			// source is healthy. Treat selection changes as instability, but do not keep
+			// restarting the timer just because fresh clock samples are arriving.
+			if (deferredStartList[i1].stableSinceNs == 0 ||
+					deferredStartList[i1].selectionGeneration != selectionGeneration) {
+				deferredStartList[i1].stableSinceNs = nowNs;
+				deferredStartList[i1].selectionGeneration = selectionGeneration;
+				deferredStartList[i1].sourceGeneration = sourceGeneration;
+				continue;
+			}
+
+			deferredStartList[i1].sourceGeneration = sourceGeneration;
+
+			if ((nowNs - deferredStartList[i1].stableSinceNs) <
+					((U64)tlCfgList[i1].defer_start_stable_usec * 1000ULL)) {
+				continue;
+			}
+
+			AVB_LOGF_INFO("Deferred stream start released: %s uid=%u stable_for=%lluus selection_gen=%u source_gen=%u",
+				tlCfgList[i1].friendly_name,
+				tlCfgList[i1].stream_uid,
+				(unsigned long long)((nowNs - deferredStartList[i1].stableSinceNs) / 1000ULL),
+				selectionGeneration,
+				sourceGeneration);
+			openavbTLRun(tlHandleList[i1]);
+			deferredStartList[i1].pending = FALSE;
+		}
 		SLEEP_MSEC(1);
 	}
 
@@ -308,6 +416,9 @@ int main(int argc, char *argv[])
 	}
 
 	openavbTLCleanup();
+	free(deferredStartList);
+	free(tlCfgList);
+	free(tlHandleList);
 
 	if (optLogFileName) {
 		free(optLogFileName);

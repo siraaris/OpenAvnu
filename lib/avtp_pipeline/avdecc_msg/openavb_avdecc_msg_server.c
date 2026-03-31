@@ -653,11 +653,17 @@ bool openavbAvdeccMsgSrvrHndlChangeNotificationFromClient(int avdeccMsgHandle, o
 
 		// If AVDECC did not yet set the client state, set the client state to the desired state.
 		if (pState->lastRequestedState == OPENAVB_AVDECC_MSG_UNKNOWN) {
-			if (pState->stream->initial_state == TL_INIT_STATE_RUNNING && pState->lastReportedState != OPENAVB_AVDECC_MSG_RUNNING) {
+			bool deferSelectedClockStart =
+				(pState->stream && pState->stream->defer_start_until_selected_clock);
+			if (!deferSelectedClockStart &&
+					pState->stream->initial_state == TL_INIT_STATE_RUNNING &&
+					pState->lastReportedState != OPENAVB_AVDECC_MSG_RUNNING) {
 				// Have the client be running if the user explicitly requested it to be running.
 				openavbAvdeccMsgSrvrChangeRequest(avdeccMsgHandle, OPENAVB_AVDECC_MSG_RUNNING);
 			}
-			else if (pState->stream->initial_state != TL_INIT_STATE_RUNNING && pState->lastReportedState == OPENAVB_AVDECC_MSG_RUNNING) {
+			else if (!deferSelectedClockStart &&
+					pState->stream->initial_state != TL_INIT_STATE_RUNNING &&
+					pState->lastReportedState == OPENAVB_AVDECC_MSG_RUNNING) {
 				// Have the client not be running if the user didn't explicitly request it to be running.
 				openavbAvdeccMsgSrvrChangeRequest(avdeccMsgHandle, OPENAVB_AVDECC_MSG_STOPPED);
 			}

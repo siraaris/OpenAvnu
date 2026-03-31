@@ -344,6 +344,7 @@ static void openavbAecpHandleAddressAccessCommand(
 	U16 requestedLength = 0;
 	U16 status = OPENAVB_AECP_AA_STATUS_SUCCESS;
 	U16 bytesRead = 0;
+	U16 expectedCommandSpecificLength = 0;
 	U64 address = 0;
 	U64 addressNetworkOrder = 0;
 	U8 data[OPENAVB_AECP_AA_MAX_MEMORY_DATA_LENGTH];
@@ -361,7 +362,7 @@ static void openavbAecpHandleAddressAccessCommand(
 	}
 
 	OCT_B2DNTOHS(tlvCount, pSrc);
-	if (tlvCount != 1 || commandSpecificLength != (U16)(2 + OPENAVB_AECP_AA_TLV_HEADER_LENGTH)) {
+	if (tlvCount != 1 || commandSpecificLength < (U16)(2 + OPENAVB_AECP_AA_TLV_HEADER_LENGTH)) {
 		openavbAecpMessageTxAddressAccessResponse(
 			pCommand,
 			OPENAVB_AECP_AA_STATUS_TLV_INVALID,
@@ -376,11 +377,22 @@ static void openavbAecpHandleAddressAccessCommand(
 	requestedLength = (U16)(modeLength & 0x0fff);
 	OCT_B2DMEMCP(&addressNetworkOrder, pSrc);
 	address = ntohll(addressNetworkOrder);
+	expectedCommandSpecificLength = (U16)(2 + OPENAVB_AECP_AA_TLV_HEADER_LENGTH + requestedLength);
 
 	if (mode != OPENAVB_AECP_AA_TLV_MODE_READ) {
 		openavbAecpMessageTxAddressAccessResponse(
 			pCommand,
 			OPENAVB_AECP_AA_STATUS_UNSUPPORTED,
+			address,
+			NULL,
+			0);
+		return;
+	}
+	if (commandSpecificLength != expectedCommandSpecificLength &&
+			commandSpecificLength != (U16)(2 + OPENAVB_AECP_AA_TLV_HEADER_LENGTH)) {
+		openavbAecpMessageTxAddressAccessResponse(
+			pCommand,
+			OPENAVB_AECP_AA_STATUS_TLV_INVALID,
 			address,
 			NULL,
 			0);
