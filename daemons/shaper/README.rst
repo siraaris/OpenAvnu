@@ -53,8 +53,8 @@ Example:
 When integrating with a non-default root qdisc, you can override the CBS
 attach points and handles via:
 
-- `SHAPER_CLASSA_PARENT` (default `1:5`)
-- `SHAPER_CLASSB_PARENT` (default `1:6`)
+- `SHAPER_CLASSA_PARENT` (default `1:1`)
+- `SHAPER_CLASSB_PARENT` (default `1:2`)
 - `SHAPER_CLASSA_HANDLE` (default `2`)
 - `SHAPER_CLASSB_HANDLE` (default `3`)
 

@@ -37,6 +37,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <fcntl.h>
 #include <signal.h>
 #include <limits.h>
+#include <sys/wait.h>
 
 #define SHAPER_LOG_COMPONENT "Main"
 #include "shaper_log.h"
@@ -81,8 +82,10 @@ int daemonize=0,c=0;
 char interface[IFNAMSIZ] = {0};
 int bandwidth_bps = 0;
 int classa_parent = 2, classb_parent=3;
-char classa_parent_str[8] = "1:5";
-char classb_parent_str[8] = "1:6";
+// mqprio creates classids 1:1..1:4 for num_tc=4. Default Class A/B parents
+// map to traffic classes 0 and 1 (priorities 3 and 2 in the default map).
+char classa_parent_str[8] = "1:1";
+char classb_parent_str[8] = "1:2";
 int classa_bw = 0, classb_bw = 0;
 int classa_max_frame_size = 0, classb_max_frame_size = 0;
 int link_speed_mbps = 0;
@@ -90,6 +93,10 @@ int skip_root_qdisc = 0;
 char taprio_cmd[512] = {0};
 int interface_cleaned = 0;
 char tc_path[128] = "tc";
+int tc_cbs_checked = 0;
+int log_tc_commands = 0;
+char modprobe_path[128] = "modprobe";
+int root_qdisc_installed = 0;
 int exit_received = 0;
 
 static int process_command(int sockfd, char command[]);
@@ -533,37 +540,124 @@ static void cleanup_qdisc(const char *ifname)
 	}
 
 	// Delete CBS qdiscs if present (ignore failures)
-	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: 2>/dev/null", tc_path, ifname, classa_parent_str, classa_parent);
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: >/dev/null 2>&1", tc_path, ifname, classa_parent_str, classa_parent);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 	log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 	system(tc_command);
-	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: 2>/dev/null", tc_path, ifname, classb_parent_str, classb_parent);
+	snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d: >/dev/null 2>&1", tc_path, ifname, classb_parent_str, classb_parent);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 	log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 	system(tc_command);
 
 	// Delete root qdisc if we manage it
 	if (!skip_root_qdisc || taprio_cmd[0] != '\0')
 	{
-		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root 2>/dev/null", tc_path, ifname);
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1: >/dev/null 2>&1", tc_path, ifname);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		log_client_debug_message(-1, "tc command:  \"%s\"", tc_command);
 		system(tc_command);
 	}
 }
 
-void tc_cbs_command(int sockfd, const char *command, char interface[], const char *parent, int handle,
+static int run_cmd(const char *cmd, int log_failure)
+{
+	int rc = system(cmd);
+	if (rc == -1)
+	{
+		if (log_failure)
+		{
+			log_client_error_message(-1, "command(\"%s\") failed to execute", cmd);
+		}
+		return -1;
+	}
+	if (WIFEXITED(rc))
+	{
+		int status = WEXITSTATUS(rc);
+		if (status != 0 && log_failure)
+		{
+			log_client_error_message(-1, "command(\"%s\") exited with status %d", cmd, status);
+		}
+		return status;
+	}
+	if (WIFSIGNALED(rc))
+	{
+		if (log_failure)
+		{
+			log_client_error_message(-1, "command(\"%s\") terminated by signal %d", cmd, WTERMSIG(rc));
+		}
+		return -1;
+	}
+	return 0;
+}
+
+static int has_mqprio_root(const char *ifname)
+{
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "%s qdisc show dev %s | grep -q \"mqprio 1:\"",
+		tc_path, ifname);
+	return run_cmd(cmd, 0) == 0;
+}
+
+static int has_parent_qdisc(const char *ifname, const char *parent)
+{
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "%s qdisc show dev %s | grep -q \"parent %s\"",
+		tc_path, ifname, parent);
+	return run_cmd(cmd, 0) == 0;
+}
+
+static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
 	int idleslope_bps, int sendslope_bps, int hicredit, int locredit)
 {
 	char tc_command[1000]={0};
-	const char *cmd = command;
-	if (command && strcmp(command, "add") == 0)
+	const char *verbs_replace_first[] = { "replace", "change", "add" };
+	const char *verbs_add_first[] = { "add", "change", "replace" };
+	const char **verbs = verbs_add_first;
+	int i;
+	if (has_parent_qdisc(interface, parent))
 	{
-		cmd = "replace";
+		verbs = verbs_replace_first;
 	}
-	snprintf(tc_command, sizeof(tc_command), "%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d",
-		tc_path, cmd, interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
-	log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-	if (system(tc_command) < 0)
+	for (i = 0; i < 3; ++i)
 	{
-		log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
+		snprintf(tc_command, sizeof(tc_command),
+			"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d >/dev/null 2>&1",
+			tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+		if (run_cmd(tc_command, 1) == 0)
+		{
+			return;
+		}
+	}
+
+	// If CBS qdisc isn't available, try loading the module once and retry.
+	if (!tc_cbs_checked)
+	{
+		tc_cbs_checked = 1;
+		const char *auto_modprobe = getenv("SHAPER_AUTO_MODPROBE");
+		if (auto_modprobe && atoi(auto_modprobe) > 0)
+		{
+			char modprobe_cmd[256];
+			snprintf(modprobe_cmd, sizeof(modprobe_cmd), "%s sch_cbs", modprobe_path);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", modprobe_cmd); }
+			log_client_debug_message(sockfd, "tc command:  \"%s\"", modprobe_cmd);
+			run_cmd(modprobe_cmd, 0);
+
+			// Retry once
+			for (i = 0; i < 3; ++i)
+			{
+				snprintf(tc_command, sizeof(tc_command),
+					"%s qdisc %s dev %s parent %s handle %d: cbs idleslope %d sendslope %d hicredit %d locredit %d >/dev/null 2>&1",
+					tc_path, verbs[i], interface, parent, handle, idleslope_bps, sendslope_bps, hicredit, locredit);
+				if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+				log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+				if (run_cmd(tc_command, 1) == 0)
+				{
+					return;
+				}
+			}
+		}
 	}
 }
 
@@ -627,9 +721,10 @@ int process_command(int sockfd, char command[])
 				if (!skip_root_qdisc)
 				{
 					//delete qdisc
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1:", tc_path, interface);
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root handle 1: >/dev/null 2>&1", tc_path, interface);
+					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-					if (system(tc_command) < 0)
+					if (run_cmd(tc_command, 1) != 0)
 					{
 						log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
 					}
@@ -666,30 +761,64 @@ int process_command(int sockfd, char command[])
 		}
 		if (taprio_cmd[0] != '\0')
 		{
-			snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root %s", tc_path, input.interface, taprio_cmd);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root %s >/dev/null 2>&1", tc_path, input.interface, taprio_cmd);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-			if (system(tc_command) < 0)
+			if (run_cmd(tc_command, 0) != 0)
 			{
-				log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
-				return -1;
+				snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root %s >/dev/null 2>&1", tc_path, input.interface, taprio_cmd);
+				if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+				log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+				if (run_cmd(tc_command, 1) != 0)
+				{
+					log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
+					return -1;
+				}
 			}
 			skip_root_qdisc = 1;
 		}
 
 		if (!skip_root_qdisc)
 		{
+			if (root_qdisc_installed || has_mqprio_root(input.interface))
+			{
+				root_qdisc_installed = 1;
+			}
+			else
+			{
 			const char *mqprio_hw = getenv("SHAPER_MQPRIO_HW");
 			int hw = 0;
 			if (mqprio_hw && atoi(mqprio_hw) > 0)
 			{
 				hw = 1;
 			}
-			snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d", tc_path, input.interface, hw);
+			snprintf(tc_command, sizeof(tc_command), "%s qdisc add dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, hw);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 			log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
-			if (system(tc_command) < 0)
+			if (run_cmd(tc_command, 0) != 0)
 			{
-				log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
-				return -1;
+				// If add failed but mqprio is present, proceed without replace.
+				if (has_mqprio_root(input.interface))
+				{
+					root_qdisc_installed = 1;
+				}
+				else
+				{
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map 3 3 1 0 2 2 2 2 2 2 2 2 2 2 2 2 queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, input.interface, hw);
+					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+					if (run_cmd(tc_command, 1) != 0)
+					{
+						log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
+						return -1;
+					}
+					root_qdisc_installed = 1;
+				}
+			}
+			else
+			{
+				root_qdisc_installed = 1;
+			}
 			}
 		}
 		strcpy(interface,input.interface);
@@ -744,7 +873,7 @@ int process_command(int sockfd, char command[])
 				log_client_error_message(sockfd, "Invalid CBS parameters for Class A. Check link speed and bandwidth");
 				return -1;
 			}
-			tc_cbs_command(sockfd, sr_classa == 0 ? "add" : "change", interface, classa_parent_str, classa_parent,
+			tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
 				classa_bw, sendslope_bps, hicredit, locredit);
 			sr_classa = 1;
 		}
@@ -780,7 +909,7 @@ int process_command(int sockfd, char command[])
 				log_client_error_message(sockfd, "Invalid CBS parameters for Class B. Check link speed and bandwidth");
 				return -1;
 			}
-			tc_cbs_command(sockfd, sr_classb == 0 ? "add" : "change", interface, classb_parent_str, classb_parent,
+			tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
 				classb_bw, sendslope_bps, hicredit, locredit);
 			sr_classb = 1;
 		}
@@ -801,7 +930,9 @@ int process_command(int sockfd, char command[])
 
 				if (classa_bw == 0)
 				{
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d:", tc_path, interface, classa_parent_str, classa_parent);
+					// Replace with a simple fifo qdisc to avoid delete errors on some kernels
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s parent %s handle %d: pfifo >/dev/null 2>&1", tc_path, interface, classa_parent_str, classa_parent);
+					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					system(tc_command);
 					sr_classa = 0;
@@ -814,7 +945,7 @@ int process_command(int sockfd, char command[])
 						log_client_error_message(sockfd, "Invalid CBS parameters for Class A after unreserve");
 						return -1;
 					}
-					tc_cbs_command(sockfd, "change", interface, classa_parent_str, classa_parent,
+					tc_cbs_command(sockfd, interface, classa_parent_str, classa_parent,
 						classa_bw, sendslope_bps, hicredit, locredit);
 				}
 			}
@@ -826,7 +957,9 @@ int process_command(int sockfd, char command[])
 
 				if (classb_bw == 0)
 				{
-					snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s parent %s handle %d:", tc_path, interface, classb_parent_str, classb_parent);
+					// Replace with a simple fifo qdisc to avoid delete errors on some kernels
+					snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s parent %s handle %d: pfifo >/dev/null 2>&1", tc_path, interface, classb_parent_str, classb_parent);
+					if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 					log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 					system(tc_command);
 					sr_classb = 0;
@@ -839,7 +972,7 @@ int process_command(int sockfd, char command[])
 						log_client_error_message(sockfd, "Invalid CBS parameters for Class B after unreserve");
 						return -1;
 					}
-					tc_cbs_command(sockfd, "change", interface, classb_parent_str, classb_parent,
+					tc_cbs_command(sockfd, interface, classb_parent_str, classb_parent,
 						classb_bw, sendslope_bps, hicredit, locredit);
 				}
 			}
@@ -918,9 +1051,32 @@ int main (int argc, char *argv[])
 			strncpy(tc_path, "/usr/sbin/tc", sizeof(tc_path) - 1);
 			tc_path[sizeof(tc_path) - 1] = '\0';
 		}
+		if (access("/sbin/modprobe", X_OK) == 0)
+		{
+			strncpy(modprobe_path, "/sbin/modprobe", sizeof(modprobe_path) - 1);
+			modprobe_path[sizeof(modprobe_path) - 1] = '\0';
+		}
+		else if (access("/usr/sbin/modprobe", X_OK) == 0)
+		{
+			strncpy(modprobe_path, "/usr/sbin/modprobe", sizeof(modprobe_path) - 1);
+			modprobe_path[sizeof(modprobe_path) - 1] = '\0';
+		}
 
 		// Ensure PATH contains sbin for system() commands.
 		setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin", 1);
+		{
+			const char *env_log_tc = getenv("SHAPER_TC_LOG");
+			if (env_log_tc && atoi(env_log_tc) > 0)
+			{
+				log_tc_commands = 1;
+			}
+		}
+		SHAPER_LOGF_INFO("Using tc at: %s", tc_path);
+		{
+			char tc_version[256];
+			snprintf(tc_version, sizeof(tc_version), "%s -V", tc_path);
+			system(tc_version);
+		}
 
 		const char *skip_root = getenv("SHAPER_SKIP_ROOT_QDISC");
 		if (skip_root && atoi(skip_root) > 0)
@@ -957,8 +1113,16 @@ int main (int argc, char *argv[])
 		}
 		if (env_taprio_cmd)
 		{
-			strncpy(taprio_cmd, env_taprio_cmd, sizeof(taprio_cmd) - 1);
-			taprio_cmd[sizeof(taprio_cmd) - 1] = '\0';
+			// Only accept a full taprio argument string (must include "taprio")
+			if (strstr(env_taprio_cmd, "taprio") != NULL)
+			{
+				strncpy(taprio_cmd, env_taprio_cmd, sizeof(taprio_cmd) - 1);
+				taprio_cmd[sizeof(taprio_cmd) - 1] = '\0';
+			}
+			else
+			{
+				SHAPER_LOGF_WARNING("Ignoring SHAPER_TAPRIO_CMD without taprio: \"%s\"", env_taprio_cmd);
+			}
 		}
 	}
 
