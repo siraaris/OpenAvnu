@@ -520,15 +520,25 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				*pHdr++ = 0; // Clear the timestamp field
 			}
 			else if (!openavbAvtpTimeTimestampIsValid(pMediaQItem->pAvtpTime)) {
-				// Error getting the timestamp.  Clear timestamp valid flag.
+				// Timestamp not available; clear timestamp valid flag.
 				AVB_LOG_ERROR("Unable to get the timestamp value");
 				pHdrV0[HIDX_AVTP_HIDE7_TV1] &= ~0x01;
 				pHdrV0[HIDX_AVTP_HIDE7_TU1] &= ~0x01;
 				*pHdr++ = 0; // Clear the timestamp field
 			}
 			else {
-				// Add the max transit time.
-				openavbAvtpTimeAddUSec(pMediaQItem->pAvtpTime, pPvtData->maxTransitUsec);
+				// Compute per-packet timestamp from the media queue item's base time.
+				U64 baseNs = openavbAvtpTimeGetAvtpTimeNS(pMediaQItem->pAvtpTime);
+				U64 intervalNs = 0;
+				U32 packetIndex = 0;
+
+				baseNs += (U64)pPvtData->maxTransitUsec * NANOSECONDS_PER_USEC;
+				if (pPvtData->txInterval > 0) {
+					intervalNs = NANOSECONDS_PER_SECOND / pPvtData->txInterval;
+				}
+				if (pPvtData->payloadSize > 0) {
+					packetIndex = pMediaQItem->readIdx / pPvtData->payloadSize;
+				}
 
 				// Set timestamp valid flag
 				pHdrV0[HIDX_AVTP_HIDE7_TV1] |= 0x01;
@@ -539,9 +549,7 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 				else pHdrV0[HIDX_AVTP_HIDE7_TU1] &= ~0x01;
 
 				// - 4 bytes	avtp_timestamp
-				*pHdr++ = htonl(openavbAvtpTimeGetAvtpTimestamp(pMediaQItem->pAvtpTime));
-
-				openavbAvtpTimeSetTimestampValid(pMediaQItem->pAvtpTime, FALSE);
+				*pHdr++ = htonl((U32)((baseNs + (intervalNs * packetIndex)) & 0xFFFFFFFF));
 			}
 
 			// - 4 bytes	format info (format, sample rate, channels per frame, bit depth)
@@ -577,6 +585,7 @@ tx_cb_ret_t openavbMapAVTPAudioTxCB(media_q_t *pMediaQ, U8 *pData, U32 *dataLen)
 			pMediaQItem->readIdx += pPvtData->payloadSize;
 			if (pMediaQItem->readIdx >= pMediaQItem->dataLen) {
 				// Finished reading the entire item
+				openavbAvtpTimeSetTimestampValid(pMediaQItem->pAvtpTime, FALSE);
 				openavbMediaQTailPull(pMediaQ);
 			}
 			else {
