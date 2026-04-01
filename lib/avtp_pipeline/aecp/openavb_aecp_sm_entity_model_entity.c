@@ -39,6 +39,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "openavb_platform.h"
 
+#include <stdlib.h>
 #include <errno.h>
 
 #define	AVB_LOG_COMPONENT	"AECP"
@@ -92,6 +93,7 @@ THREAD_DEFINITON(openavbAecpSMEntityModelEntityThread);
 
 static openavb_list_t s_commandQueue = NULL;
 static openavb_list_t s_unsolicitedQueue = NULL;
+static openavb_list_t s_unsolicitedStateCache = NULL;
 static bool s_identifyLogActive = FALSE;
 static bool s_identifyLogTimeoutArmed = FALSE;
 static struct timespec s_identifyLogTimeout;
@@ -118,6 +120,14 @@ static const U8 s_openavbAecpMvuProtocolId[OPENAVB_AECP_MVU_PROTOCOL_ID_LENGTH] 
 static bool s_openavbSystemUniqueIdValid = FALSE;
 static U64 s_openavbSystemUniqueId = 0;
 static U8 s_openavbSystemName[OPENAVB_AEM_STRLEN_MAX];
+
+typedef struct {
+	U8 message_type;
+	U16 command_type;
+	U16 descriptor_type;
+	U16 descriptor_index;
+	openavb_aecp_AEMCommandResponse_t response;
+} openavb_aecp_unsolicited_state_cache_entry_t;
 
 static U16 openavbAecpGetIdentifyTimeoutSec(void)
 {
@@ -281,12 +291,180 @@ static bool hasQueuedUnsolicited(void)
 
 static bool openavbAecpQueueUnsolicitedResponseLocked(const openavb_aecp_AEMCommandResponse_t *pResponse)
 {
-	int result = addUnsolicitedToQueue(pResponse);
+	int result;
+	openavb_aecp_AEMCommandResponse_t queuedResponse;
+
+	if (!pResponse) {
+		return FALSE;
+	}
+
+	queuedResponse = *pResponse;
+	queuedResponse.commonPdu.sequence_id =
+		openavbAecpNextUnsolicitedSequenceIdLocked(queuedResponse.headers.message_type);
+
+	result = addUnsolicitedToQueue(&queuedResponse);
 
 	if (result >= 0) {
 		openavbAecpSMEntityModelEntityVars.doUnsolicited = TRUE;
 		return TRUE;
 	}
+	return FALSE;
+}
+
+static void openavbAecpNormalizeUnsolicitedCounters(
+	U16 descriptor_type,
+	openavb_aecp_AEMCommandResponse_t *pResponse)
+{
+	openavb_aecp_response_data_get_counters_t *pCountersRsp;
+	U32 keepMask = 0;
+	U8 normalizedBlock[sizeof(((openavb_aecp_response_data_get_counters_t *)0)->counters_block)] = {0};
+
+	if (!pResponse ||
+			pResponse->entityModelPdu.command_type != OPENAVB_AEM_COMMAND_CODE_GET_COUNTERS) {
+		return;
+	}
+
+	pCountersRsp = &pResponse->entityModelPdu.command_data.getCountersRsp;
+	switch (descriptor_type) {
+		case OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT:
+			keepMask =
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_LOCKED |
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_UNLOCKED |
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_STREAM_RESET;
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_LOCKED) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_LOCKED],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_LOCKED],
+					sizeof(U32));
+			}
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_MEDIA_UNLOCKED) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_UNLOCKED],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_MEDIA_UNLOCKED],
+					sizeof(U32));
+			}
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_COUNTER_STREAM_RESET) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_STREAM_RESET],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_INPUT_OFFSET_STREAM_RESET],
+					sizeof(U32));
+			}
+			break;
+
+		case OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT:
+			keepMask =
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_START |
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_STOP |
+				OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_INTERRUPTED;
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_START) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_START],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_START],
+					sizeof(U32));
+			}
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_STOP) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_STOP],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_STOP],
+					sizeof(U32));
+			}
+			if ((pCountersRsp->counters_valid & OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_COUNTER_STREAM_INTERRUPTED) != 0) {
+				memcpy(&normalizedBlock[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_INTERRUPTED],
+					&pCountersRsp->counters_block[OPENAVB_AEM_GET_COUNTERS_COMMAND_STREAM_OUTPUT_OFFSET_STREAM_INTERRUPTED],
+					sizeof(U32));
+			}
+			break;
+
+		default:
+			return;
+	}
+
+	pCountersRsp->counters_valid &= keepMask;
+	memcpy(pCountersRsp->counters_block, normalizedBlock, sizeof(pCountersRsp->counters_block));
+}
+
+static void openavbAecpNormalizeUnsolicitedResponse(
+	U16 descriptor_type,
+	bool normalizeCounters,
+	openavb_aecp_AEMCommandResponse_t *pResponse)
+{
+	if (!pResponse) {
+		return;
+	}
+
+	memset(pResponse->host, 0, sizeof(pResponse->host));
+	memset(pResponse->headers.target_entity_id, 0, sizeof(pResponse->headers.target_entity_id));
+	memset(pResponse->commonPdu.controller_entity_id, 0, sizeof(pResponse->commonPdu.controller_entity_id));
+	pResponse->commonPdu.sequence_id = 0;
+	if (normalizeCounters) {
+		openavbAecpNormalizeUnsolicitedCounters(descriptor_type, pResponse);
+	}
+}
+
+static void openavbAecpResetUnsolicitedStateCacheLocked(void)
+{
+	if (s_unsolicitedStateCache) {
+		openavbListDeleteList(s_unsolicitedStateCache);
+	}
+	s_unsolicitedStateCache = openavbListNewList();
+}
+
+static bool openavbAecpQueueChangedUnsolicitedResponseLocked(
+	U16 descriptor_type,
+	U16 descriptor_index,
+	bool normalizeCounters,
+	const openavb_aecp_AEMCommandResponse_t *pResponse)
+{
+	openavb_aecp_AEMCommandResponse_t normalized;
+	openavb_list_node_t node;
+
+	if (!pResponse) {
+		return FALSE;
+	}
+
+	if (!s_unsolicitedStateCache) {
+		s_unsolicitedStateCache = openavbListNewList();
+		if (!s_unsolicitedStateCache) {
+			return FALSE;
+		}
+	}
+
+	normalized = *pResponse;
+	openavbAecpNormalizeUnsolicitedResponse(descriptor_type, normalizeCounters, &normalized);
+
+	node = openavbListIterFirst(s_unsolicitedStateCache);
+	while (node) {
+		openavb_aecp_unsolicited_state_cache_entry_t *pEntry = openavbListData(node);
+		if (pEntry &&
+				pEntry->message_type == normalized.headers.message_type &&
+				pEntry->command_type == normalized.entityModelPdu.command_type &&
+				pEntry->descriptor_type == descriptor_type &&
+				pEntry->descriptor_index == descriptor_index) {
+			if (memcmp(&pEntry->response, &normalized, sizeof(normalized)) == 0) {
+				return FALSE;
+			}
+
+			pEntry->response = normalized;
+			return openavbAecpQueueUnsolicitedResponseLocked(pResponse);
+		}
+		node = openavbListIterNext(s_unsolicitedStateCache);
+	}
+
+	node = openavbListNew(s_unsolicitedStateCache, sizeof(openavb_aecp_unsolicited_state_cache_entry_t));
+	if (!node) {
+		return FALSE;
+	}
+
+	openavb_aecp_unsolicited_state_cache_entry_t *pEntry = openavbListData(node);
+	if (!pEntry) {
+		openavbListDelete(s_unsolicitedStateCache, node);
+		return FALSE;
+	}
+
+	memset(pEntry, 0, sizeof(*pEntry));
+	pEntry->message_type = normalized.headers.message_type;
+	pEntry->command_type = normalized.entityModelPdu.command_type;
+	pEntry->descriptor_type = descriptor_type;
+	pEntry->descriptor_index = descriptor_index;
+	pEntry->response = normalized;
+
+	// Prime the cache on first observation after registration/reset, but do not
+	// emit an unsolicited notification for that initial snapshot.
 	return FALSE;
 }
 
@@ -480,9 +658,20 @@ static bool openavbAecpSetDescriptorControlValues(
 
 static void openavbAecpRegisterUnsolicitedController(const openavb_aecp_AEMCommandResponse_t *pCommand)
 {
+	bool sameController = FALSE;
+
 	if (!pCommand) {
 		return;
 	}
+
+	sameController =
+		openavbAecpSMEntityModelEntityVars.unsolicitedControllerRegistered &&
+		memcmp(openavbAecpSMEntityModelEntityVars.unsolicitedControllerEntityId,
+			pCommand->commonPdu.controller_entity_id,
+			sizeof(openavbAecpSMEntityModelEntityVars.unsolicitedControllerEntityId)) == 0 &&
+		memcmp(openavbAecpSMEntityModelEntityVars.unsolicitedControllerMac,
+			pCommand->host,
+			sizeof(openavbAecpSMEntityModelEntityVars.unsolicitedControllerMac)) == 0;
 
 	openavbAecpSMEntityModelEntityVars.unsolicitedControllerRegistered = TRUE;
 	memcpy(openavbAecpSMEntityModelEntityVars.unsolicitedControllerEntityId,
@@ -493,6 +682,9 @@ static void openavbAecpRegisterUnsolicitedController(const openavb_aecp_AEMComma
 		sizeof(openavbAecpSMEntityModelEntityVars.unsolicitedControllerMac));
 	CLOCK_GETTIME(OPENAVB_CLOCK_REALTIME, &s_unsolicitedControllerActivity);
 	s_unsolicitedControllerActivityValid = TRUE;
+	if (!sameController) {
+		openavbAecpResetUnsolicitedStateCacheLocked();
+	}
 }
 
 static bool openavbAecpIsRegisteredUnsolicitedController(const openavb_aecp_AEMCommandResponse_t *pCommand)
@@ -515,6 +707,7 @@ static void openavbAecpClearUnsolicitedController(void)
 		sizeof(openavbAecpSMEntityModelEntityVars.unsolicitedControllerMac));
 	s_unsolicitedControllerActivityValid = FALSE;
 	memset(&s_unsolicitedControllerActivity, 0, sizeof(s_unsolicitedControllerActivity));
+	openavbAecpResetUnsolicitedStateCacheLocked();
 }
 
 static void openavbAecpQueueIdentifyNotificationLocked(void)
@@ -876,8 +1069,7 @@ static void openavbAecpPrepareUnsolicitedBaseLocked(
 	memcpy(pCommand->commonPdu.controller_entity_id,
 		openavbAecpSMEntityModelEntityVars.unsolicitedControllerEntityId,
 		sizeof(pCommand->commonPdu.controller_entity_id));
-	pCommand->commonPdu.sequence_id =
-		openavbAecpNextUnsolicitedSequenceIdLocked(messageType);
+	pCommand->commonPdu.sequence_id = 0;
 	pCommand->entityModelPdu.command_type = commandType;
 	pCommand->entityModelPdu.u = 1;
 }
@@ -967,25 +1159,57 @@ static bool openavbAecpNotifyStreamStateChangedLocked(U16 descriptor_type, U16 d
 	bool queued = FALSE;
 	openavb_aecp_AEMCommandResponse_t unsolicited;
 
-	openavbAecpBumpAvailableIndexLocked();
-
 	if (!openavbAecpSMEntityModelEntityVars.unsolicitedControllerRegistered) {
 		return FALSE;
 	}
 
 	if (openavbAecpBuildUnsolicitedStreamInfoLocked(descriptor_type, descriptor_index, &unsolicited)) {
-		queued = openavbAecpQueueUnsolicitedResponseLocked(&unsolicited) || queued;
+		bool queuedThis = openavbAecpQueueChangedUnsolicitedResponseLocked(
+			descriptor_type, descriptor_index, TRUE, &unsolicited);
+		queued = queuedThis || queued;
 	}
 
 	if (descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT &&
 			openavbAecpBuildUnsolicitedStreamInputInfoExLocked(descriptor_index, &unsolicited)) {
-		queued = openavbAecpQueueUnsolicitedResponseLocked(&unsolicited) || queued;
+		bool queuedThis = openavbAecpQueueChangedUnsolicitedResponseLocked(
+			descriptor_type, descriptor_index, TRUE, &unsolicited);
+		queued = queuedThis || queued;
 	}
 
 	if ((descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT ||
 			descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) &&
 			openavbAecpBuildUnsolicitedGetCountersLocked(descriptor_type, descriptor_index, &unsolicited)) {
-		queued = openavbAecpQueueUnsolicitedResponseLocked(&unsolicited) || queued;
+		bool queuedThis = openavbAecpQueueChangedUnsolicitedResponseLocked(
+			descriptor_type, descriptor_index, TRUE, &unsolicited);
+		queued = queuedThis || queued;
+	}
+
+	if (queued) {
+		openavbAecpBumpAvailableIndexLocked();
+	}
+
+	return queued;
+}
+
+static bool openavbAecpNotifyCountersChangedLocked(U16 descriptor_type, U16 descriptor_index)
+{
+	bool queued = FALSE;
+	openavb_aecp_AEMCommandResponse_t unsolicited;
+
+	if (!openavbAecpSMEntityModelEntityVars.unsolicitedControllerRegistered) {
+		return FALSE;
+	}
+
+	if ((descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT ||
+			descriptor_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) &&
+			openavbAecpBuildUnsolicitedGetCountersLocked(descriptor_type, descriptor_index, &unsolicited)) {
+		bool queuedThis = openavbAecpQueueChangedUnsolicitedResponseLocked(
+			descriptor_type, descriptor_index, FALSE, &unsolicited);
+		queued = queuedThis || queued;
+	}
+
+	if (queued) {
+		openavbAecpBumpAvailableIndexLocked();
 	}
 
 	return queued;
@@ -1287,6 +1511,7 @@ void acquireEntity()
 	}
 
 	pCommand->headers.message_type = OPENAVB_AECP_MESSAGE_TYPE_AEM_RESPONSE;
+	pCommand->entityModelPdu.u = 0;
 	pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
 	pCommand->entityModelPdu.command_data.acquireEntityRsp.flags =
 		pCommand->entityModelPdu.command_data.acquireEntityCmd.flags;
@@ -1315,6 +1540,7 @@ void lockEntity()
 	}
 
 	pCommand->headers.message_type = OPENAVB_AECP_MESSAGE_TYPE_AEM_RESPONSE;
+	pCommand->entityModelPdu.u = 0;
 	pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_SUCCESS;
 	pCommand->entityModelPdu.command_data.lockEntityRsp.flags =
 		pCommand->entityModelPdu.command_data.lockEntityCmd.flags;
@@ -2236,6 +2462,7 @@ void processCommand()
 
 	// Set message type as response
 	pCommand->headers.message_type = OPENAVB_AECP_MESSAGE_TYPE_AEM_RESPONSE;
+	pCommand->entityModelPdu.u = 0;
 
 	// Set to Not Implemented. Will be overridden by commands that are implemented.
 	pCommand->headers.status = OPENAVB_AEM_COMMAND_STATUS_NOT_IMPLEMENTED;
@@ -3612,6 +3839,7 @@ void openavbAecpSMEntityModelEntityStart()
 	// Initialize the linked list (queue).
 	s_commandQueue = openavbListNewList();
 	s_unsolicitedQueue = openavbListNewList();
+	s_unsolicitedStateCache = openavbListNewList();
 
 	// Start the Advertise Entity State Machine
 	bool errResult;
@@ -3640,6 +3868,7 @@ void openavbAecpSMEntityModelEntityStop()
 		free(item);
 	}
 	openavbListDeleteListShallow(s_unsolicitedQueue);
+	openavbListDeleteList(s_unsolicitedStateCache);
 
 	SEM_ERR_T(err);
 	SEM_DESTROY(openavbAecpSMEntityModelEntityWaitingSemaphore, err);
@@ -3711,6 +3940,19 @@ void openavbAecpSMEntityModelEntityNotifyStreamState(U16 descriptor_type, U16 de
 	AVB_TRACE_ENTRY(AVB_TRACE_AECP);
 	AECP_SM_LOCK();
 	if (openavbAecpNotifyStreamStateChangedLocked(descriptor_type, descriptor_index)) {
+		SEM_ERR_T(err);
+		SEM_POST(openavbAecpSMEntityModelEntityWaitingSemaphore, err);
+		SEM_LOG_ERR(err);
+	}
+	AECP_SM_UNLOCK();
+	AVB_TRACE_EXIT(AVB_TRACE_AECP);
+}
+
+void openavbAecpSMEntityModelEntityNotifyCounters(U16 descriptor_type, U16 descriptor_index)
+{
+	AVB_TRACE_ENTRY(AVB_TRACE_AECP);
+	AECP_SM_LOCK();
+	if (openavbAecpNotifyCountersChangedLocked(descriptor_type, descriptor_index)) {
 		SEM_ERR_T(err);
 		SEM_POST(openavbAecpSMEntityModelEntityWaitingSemaphore, err);
 		SEM_LOG_ERR(err);

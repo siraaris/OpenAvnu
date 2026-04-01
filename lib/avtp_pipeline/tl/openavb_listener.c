@@ -55,6 +55,43 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define LISTENER_EMPTY_RX_BACKOFF_THRESHOLD 64U
 #define LISTENER_EMPTY_RX_BACKOFF_MAX_MSEC 5U
 #define LISTENER_SRP_TRANSIENT_GRACE_NS (1000ULL * 1000ULL * 1000ULL)
+#define LISTENER_UNRESOLVED_RECHECK_MSEC 100U
+
+static bool listenerStreamIdIsUnresolved(const AVBStreamID_t *streamID)
+{
+	static const U8 emptyMAC[ETH_ALEN] = {0};
+
+	if (!streamID) {
+		return TRUE;
+	}
+
+	// A listener with an all-zero source MAC is waiting for controller/AVDECC
+	// to supply the remote talker stream ID. Keep it unattached until then.
+	if (memcmp(streamID->addr, emptyMAC, ETH_ALEN) == 0) {
+		return TRUE;
+	}
+
+	if (streamID->uniqueID == 0 || streamID->uniqueID == 0xFFFF) {
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+static void listenerLoadConfiguredStreamID(const openavb_tl_cfg_t *pCfg, AVBStreamID_t *streamID)
+{
+	if (!streamID) {
+		return;
+	}
+
+	memset(streamID, 0, sizeof(*streamID));
+	if (pCfg && pCfg->stream_addr.mac) {
+		memcpy(streamID->addr, pCfg->stream_addr.mac, ETH_ALEN);
+	}
+	if (pCfg) {
+		streamID->uniqueID = pCfg->stream_uid;
+	}
+}
 
 static void listenerLockStream(listener_data_t *pListenerData)
 {
@@ -362,6 +399,12 @@ void openavbTLRunListener(tl_state_t *pTLState)
 	}
 
 	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
+	bool statsMutexCreated = FALSE;
+	bool attachIssued = FALSE;
+	bool waitingForStreamId = FALSE;
+	bool bServiceIPC;
+	AVBStreamID_t streamID;
+	AVBStreamID_t attachedStreamID;
 
 	pTLState->pPvtListenerData = calloc(1, sizeof(listener_data_t));
 	if (!pTLState->pPvtListenerData) {
@@ -380,80 +423,93 @@ void openavbTLRunListener(tl_state_t *pTLState)
 		MUTEX_LOG_ERR("Could not create/initialize 'TLListenerStreamMutex' mutex");
 	}
 
-	AVBStreamID_t streamID;
-	U8 emptyMAC[ETH_ALEN] = {0};
 	memset(&streamID, 0, sizeof(streamID));
-	memcpy(streamID.addr, pCfg->stream_addr.mac, ETH_ALEN);
-	streamID.uniqueID = pCfg->stream_uid;
+	memset(&attachedStreamID, 0, sizeof(attachedStreamID));
 
-	AVB_LOGF_INFO("Attach "STREAMID_FORMAT, STREAMID_ARGS(&streamID));
+	// Notify AVDECC Msg of the state change as soon as the listener thread is alive.
+	openavbAvdeccMsgClntNotifyCurrentState(pTLState);
 
-	if ((memcmp(streamID.addr, emptyMAC, ETH_ALEN) == 0 && streamID.uniqueID == 0) ||
-		streamID.uniqueID == 0xFFFF) {
-		AVB_LOGF_WARNING("Listener stream ID is unresolved (" STREAMID_FORMAT "); deferring attach",
-			STREAMID_ARGS(&streamID));
-		SLEEP_MSEC(100);
-		goto avb_listener_cleanup;
-	}
-
-	// Create Stats Mutex
-	{
-		MUTEX_ATTR_HANDLE(mta);
-		MUTEX_ATTR_INIT(mta);
-		MUTEX_ATTR_SET_TYPE(mta, MUTEX_ATTR_TYPE_DEFAULT);
-		MUTEX_ATTR_SET_NAME(mta, "TLStatsMutex");
-		MUTEX_CREATE_ERR();
-		MUTEX_CREATE(pTLState->statsMutex, mta);
-		MUTEX_LOG_ERR("Could not create/initialize 'TLStatsMutex' mutex");
-	}
-
-	// Tell endpoint to listen for our stream.
-	// If there is a talker, we'll get callback (above.)
-	pTLState->bConnected = openavbTLRunListenerInit(pTLState->endpointHandle, &streamID);
-
-	if (pTLState->bConnected) {
-		bool bServiceIPC;
-
-		// Notify AVDECC Msg of the state change.
-		openavbAvdeccMsgClntNotifyCurrentState(pTLState);
-
-		// Do until we are stopped or lose connection to endpoint
-		while (pTLState->bRunning && pTLState->bConnected) {
-
-			// Listen for an RX frame (or just sleep if not streaming)
-			bServiceIPC = listenerDoStream(pTLState);
-
-			if (bServiceIPC) {
-				// Look for messages from endpoint.  Don't block (timeout=0)
+	// Do until we are stopped or lose connection to endpoint.
+	while (pTLState->bRunning && pTLState->bConnected) {
+		if (!attachIssued) {
+			listenerLoadConfiguredStreamID(pCfg, &streamID);
+			if (listenerStreamIdIsUnresolved(&streamID)) {
+				if (!waitingForStreamId) {
+					AVB_LOGF_WARNING("Listener stream ID is unresolved (" STREAMID_FORMAT "); waiting for AVDECC/controller bind",
+						STREAMID_ARGS(&streamID));
+					waitingForStreamId = TRUE;
+				}
 				if (!openavbEptClntService(pTLState->endpointHandle, 0)) {
-					AVB_LOGF_WARNING("Lost connection to endpoint "STREAMID_FORMAT, STREAMID_ARGS(&streamID));
+					AVB_LOGF_WARNING("Lost connection to endpoint while waiting for listener stream ID " STREAMID_FORMAT,
+						STREAMID_ARGS(&streamID));
 					pTLState->bConnected = FALSE;
 					pTLState->endpointHandle = 0;
+					break;
 				}
+				SLEEP_MSEC(LISTENER_UNRESOLVED_RECHECK_MSEC);
+				continue;
+			}
+
+			waitingForStreamId = FALSE;
+			AVB_LOGF_INFO("Attach " STREAMID_FORMAT, STREAMID_ARGS(&streamID));
+
+			if (!statsMutexCreated) {
+				MUTEX_ATTR_HANDLE(mta);
+				MUTEX_ATTR_INIT(mta);
+				MUTEX_ATTR_SET_TYPE(mta, MUTEX_ATTR_TYPE_DEFAULT);
+				MUTEX_ATTR_SET_NAME(mta, "TLStatsMutex");
+				MUTEX_CREATE_ERR();
+				MUTEX_CREATE(pTLState->statsMutex, mta);
+				MUTEX_LOG_ERR("Could not create/initialize 'TLStatsMutex' mutex");
+				statsMutexCreated = TRUE;
+			}
+
+			// Tell endpoint to listen for our stream.
+			// If there is a talker, we'll get callback (above.)
+			pTLState->bConnected = openavbTLRunListenerInit(pTLState->endpointHandle, &streamID);
+			if (!pTLState->bConnected) {
+				AVB_LOGF_WARNING("Failed to attach listener to endpoint " STREAMID_FORMAT, STREAMID_ARGS(&streamID));
+				if (pTLState->endpointHandle != AVB_ENDPOINT_HANDLE_INVALID) {
+					openavbEptClntCloseSrvrConnection(pTLState->endpointHandle);
+					pTLState->endpointHandle = AVB_ENDPOINT_HANDLE_INVALID;
+				}
+				break;
+			}
+
+			memcpy(&attachedStreamID, &streamID, sizeof(attachedStreamID));
+			attachIssued = TRUE;
+		}
+
+		// Listen for an RX frame (or just sleep if not streaming).
+		bServiceIPC = listenerDoStream(pTLState);
+
+		if (bServiceIPC) {
+			// Look for messages from endpoint. Don't block (timeout=0).
+			if (!openavbEptClntService(pTLState->endpointHandle, 0)) {
+				AVB_LOGF_WARNING("Lost connection to endpoint " STREAMID_FORMAT, STREAMID_ARGS(&attachedStreamID));
+				pTLState->bConnected = FALSE;
+				pTLState->endpointHandle = 0;
 			}
 		}
-
-		// Stop streaming
-		listenerStopStream(pTLState);
-
-		{
-			MUTEX_CREATE_ERR();
-			MUTEX_DESTROY(pTLState->statsMutex); // Destroy Stats Mutex
-			MUTEX_LOG_ERR("Error destroying mutex");
-		}
-
-		// withdraw our listener attach
-		if (pTLState->bConnected)
-			openavbEptClntStopStream(pTLState->endpointHandle, &streamID);
-
-		// Notify AVDECC Msg of the state change.
-		openavbAvdeccMsgClntNotifyCurrentState(pTLState);
-	}
-	else {
-		AVB_LOGF_WARNING("Failed to connect to endpoint "STREAMID_FORMAT, STREAMID_ARGS(&streamID));
 	}
 
-avb_listener_cleanup:
+	// Stop streaming.
+	listenerStopStream(pTLState);
+
+	if (statsMutexCreated) {
+		MUTEX_CREATE_ERR();
+		MUTEX_DESTROY(pTLState->statsMutex); // Destroy Stats Mutex
+		MUTEX_LOG_ERR("Error destroying mutex");
+	}
+
+	// Withdraw our listener attach only if we issued one and still have an endpoint connection.
+	if (attachIssued && pTLState->bConnected) {
+		openavbEptClntStopStream(pTLState->endpointHandle, &attachedStreamID);
+	}
+
+	// Notify AVDECC Msg of the state change.
+	openavbAvdeccMsgClntNotifyCurrentState(pTLState);
+
 	if (pTLState->pPvtListenerData) {
 		MUTEX_CREATE_ERR();
 		MUTEX_DESTROY(((listener_data_t *)pTLState->pPvtListenerData)->streamMutex);

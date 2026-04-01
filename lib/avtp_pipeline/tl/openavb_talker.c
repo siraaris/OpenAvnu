@@ -141,6 +141,7 @@ bool talkerStartStream(tl_state_t *pTLState)
 
 	// setup the initial times
 	U64 nowNS;
+	U64 housekeepingNowNS = 0;
 	pTalkerData->useWallTimePacing = FALSE;
 #if IGB_LAUNCHTIME_ENABLED || ATL_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
 	if (!pCfg->tx_blocking_in_intf) {
@@ -170,9 +171,12 @@ bool talkerStartStream(tl_state_t *pTLState)
 	// Align clock : allows for some performance gain
 	nowNS = ((nowNS + (pTalkerData->intervalNS)) / pTalkerData->intervalNS) * pTalkerData->intervalNS;
 
-	pTalkerData->nextReportNS = nowNS + (pCfg->report_seconds * NANOSECONDS_PER_SECOND);
+	// Keep reporting/housekeeping on monotonic time so counter publication
+	// is not stranded if gPTP walltime steps during startup or GM changes.
+	CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+	pTalkerData->nextReportNS = housekeepingNowNS + (pCfg->report_seconds * NANOSECONDS_PER_SECOND);
 	pTalkerData->lastReportFrames = 0;
-	pTalkerData->nextSecondNS = nowNS + NANOSECONDS_PER_SECOND;
+	pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
 	pTalkerData->nextCycleNS = nowNS + pTalkerData->intervalNS;
 
 	// Clear stats
@@ -274,6 +278,7 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 
 	if (pTLState->bStreaming) {
 		U64 nowNS;
+		U64 housekeepingNowNS = 0;
 		bool usedBusySpin = FALSE;
 
 		if (!pCfg->tx_blocking_in_intf) {
@@ -323,16 +328,18 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
 		}
 
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+
 		if (pTalkerData->cntWakes++ % pTalkerData->wakeRate == 0) {
 			// time to service the endpoint IPC
 			bRet = TRUE;
 
 			// Don't need to check again for another second.
-			pTalkerData->nextSecondNS = nowNS + NANOSECONDS_PER_SECOND;
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
 		}
 
 		if (pCfg->report_seconds > 0) {
-			if (nowNS > pTalkerData->nextReportNS) {
+			if (housekeepingNowNS > pTalkerData->nextReportNS) {
 				talkerShowStats(pTalkerData, pTLState);
 			  
 				openavbTalkerAddStat(pTLState, TL_STAT_TX_CALLS, pTalkerData->cntWakes);
@@ -340,7 +347,7 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 
 				pTalkerData->cntFrames = 0;
 				pTalkerData->cntWakes = 0;
-				pTalkerData->nextReportNS = nowNS + (pCfg->report_seconds * NANOSECONDS_PER_SECOND);
+				pTalkerData->nextReportNS = housekeepingNowNS + (pCfg->report_seconds * NANOSECONDS_PER_SECOND);
 			}
 		} else if (pCfg->report_frames > 0 && pTalkerData->cntFrames != pTalkerData->lastReportFrames) {
 			if (pTalkerData->cntFrames % pCfg->report_frames == 1) {
@@ -349,8 +356,8 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 			}
 		}
 
-		if (nowNS > pTalkerData->nextSecondNS) {
-			pTalkerData->nextSecondNS = nowNS + NANOSECONDS_PER_SECOND;
+		if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
 			bRet = TRUE;
 		}
 

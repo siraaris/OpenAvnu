@@ -567,7 +567,7 @@ void* openavbMaapAllocate(int count, /* out */ struct ether_addr *addr)
 	if (i < MAX_AVB_STREAMS) {
 		maapAllocList[i].taken = true;
 		memcpy(addr, maapAllocList[i].destAddr.ether_addr_octet, sizeof(struct ether_addr));
-		AVB_LOGF_INFO("Allocated MAAP address " ETH_FORMAT, ETH_OCTETS(addr->ether_addr_octet));
+		AVB_LOGF_WARNING("Allocated MAAP address " ETH_FORMAT, ETH_OCTETS(addr->ether_addr_octet));
 
 		MAAP_UNLOCK();
 

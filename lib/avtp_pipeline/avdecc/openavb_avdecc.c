@@ -805,21 +805,28 @@ bool openavbAvdeccAddConfiguration(openavb_tl_data_cfg_t *stream)
 			return FALSE;
 		}
 	}
-	else
-	{
-		openavb_aem_descriptor_audio_unit_t *pAudioUnitDescriptor =
-		(openavb_aem_descriptor_audio_unit_t *) openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_AUDIO_UNIT, 0);
-		if (pAudioUnitDescriptor != NULL)
-		{
-			if (!openavbAemDescriptorAudioUnitInitialize(pAudioUnitDescriptor, nConfigIdx, pCfg)) {
-				AVB_LOG_ERROR("Error updating AVDECC Audio Unit to configuration");
-				AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
-				return FALSE;
-			}
-		}
 		else
 		{
-			AVB_LOG_ERROR("Error getting AVDECC Audio Unit descriptor");
+			openavb_aem_descriptor_audio_unit_t *pAudioUnitDescriptor =
+			(openavb_aem_descriptor_audio_unit_t *) openavbAemGetDescriptor(nConfigIdx, OPENAVB_AEM_DESCRIPTOR_AUDIO_UNIT, 0);
+			if (pAudioUnitDescriptor != NULL)
+			{
+				/*
+				 * Keep the shared Audio Unit aligned to the audio stream model.
+				 * CRF streams advertise their own rate in the stream descriptors,
+				 * but should not overwrite the Audio Unit sampling rate.
+				 */
+				if (!pCfg->stream_is_crf) {
+					if (!openavbAemDescriptorAudioUnitInitialize(pAudioUnitDescriptor, nConfigIdx, pCfg)) {
+						AVB_LOG_ERROR("Error updating AVDECC Audio Unit to configuration");
+						AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
+						return FALSE;
+					}
+				}
+			}
+			else
+			{
+				AVB_LOG_ERROR("Error getting AVDECC Audio Unit descriptor");
 			AVB_TRACE_EXIT(AVB_TRACE_AVDECC);
 			return FALSE;
 		}

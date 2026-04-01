@@ -122,6 +122,8 @@ struct openavb_tl_data_cfg {
 	U32 sampling_rates[MAX_SAMPLING_RATES_COUNT];
 	/// intf_nv_audio_rate
 	U32 audioRate;
+	/// CRF base frequency from map_nv_crf_base_freq/crf_base_freq
+	U32 crfBaseFreq;
 	/// intf_nv_audio_bit_depth
 	U8 audioBitDepth;
 	/// intf_nv_channels

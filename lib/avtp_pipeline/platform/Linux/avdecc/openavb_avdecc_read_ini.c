@@ -370,22 +370,33 @@ static int openavbIniCfgCallback(void *user, const char *tlSection, const char *
 			pCfg->sampling_rates_count = i;
 		}
 	}
-	else if (strcmp(name, "intf_nv_audio_rate") == 0) {
-		long int val = strtol(value, &pEnd, 10);
-		if (val >= AVB_AUDIO_RATE_8KHZ && val <= AVB_AUDIO_RATE_192KHZ) {
-			pCfg->audioRate = val;
-			valOK = TRUE;
+		else if (strcmp(name, "intf_nv_audio_rate") == 0) {
+			long int val = strtol(value, &pEnd, 10);
+			if (val >= AVB_AUDIO_RATE_8KHZ && val <= AVB_AUDIO_RATE_192KHZ) {
+				pCfg->audioRate = val;
+				valOK = TRUE;
 		}
 		else {
-			AVB_LOG_ERROR("Invalid audio rate configured for intf_nv_audio_rate.");
-			pCfg->audioRate = AVB_AUDIO_RATE_44_1KHZ;
+				AVB_LOG_ERROR("Invalid audio rate configured for intf_nv_audio_rate.");
+				pCfg->audioRate = AVB_AUDIO_RATE_44_1KHZ;
+			}
 		}
-	}
-	else if (strcmp(name, "intf_nv_audio_bit_depth") == 0) {
-		long int val = strtol(value, &pEnd, 10);
-		if (val >= AVB_AUDIO_BIT_DEPTH_1BIT && val <= AVB_AUDIO_BIT_DEPTH_64BIT) {
-			pCfg->audioBitDepth = val;
-			valOK = TRUE;
+		else if (strcmp(name, "map_nv_crf_base_freq") == 0 || strcmp(name, "crf_base_freq") == 0) {
+			long int val = strtol(value, &pEnd, 10);
+			if (val >= AVB_AUDIO_RATE_8KHZ && val <= AVB_AUDIO_RATE_192KHZ) {
+				pCfg->crfBaseFreq = val;
+				valOK = TRUE;
+			}
+			else {
+				AVB_LOG_ERROR("Invalid CRF base frequency configured for map_nv_crf_base_freq.");
+				pCfg->crfBaseFreq = AVB_AUDIO_RATE_48KHZ;
+			}
+		}
+		else if (strcmp(name, "intf_nv_audio_bit_depth") == 0) {
+			long int val = strtol(value, &pEnd, 10);
+			if (val >= AVB_AUDIO_BIT_DEPTH_1BIT && val <= AVB_AUDIO_BIT_DEPTH_64BIT) {
+				pCfg->audioBitDepth = val;
+				valOK = TRUE;
 		}
 		else {
 			AVB_LOG_ERROR("Invalid audio type configured for intf_nv_audio_bits.");
@@ -484,22 +495,6 @@ bool openavbReadTlDataIniFile(const char *fileName, openavb_tl_data_cfg_t *pCfg)
 		}
 		AVB_LOGF_INFO("No stream_addr specified; defaulting to " ETH_FORMAT,
 			ETH_OCTETS(pCfg->stream_addr.buffer.ether_addr_octet));
-	}
-
-	// For talkers, ensure we always expose a non-zero destination multicast
-	// address to controllers even when the INI omits dest_addr.
-	if (pCfg->role == AVB_ROLE_TALKER &&
-		(!pCfg->dest_addr.mac ||
-		 memcmp(pCfg->dest_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
-	{
-		U8 defaultDest[ETH_ALEN] = {0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x80};
-		if (pCfg->stream_uid != 0xFFFF) {
-			defaultDest[5] = (U8)(0x80 + (pCfg->stream_uid & 0x7f));
-		}
-		memcpy(pCfg->dest_addr.buffer.ether_addr_octet, defaultDest, ETH_ALEN);
-		pCfg->dest_addr.mac = &(pCfg->dest_addr.buffer);
-		AVB_LOGF_INFO("No dest_addr specified; defaulting to " ETH_FORMAT,
-			ETH_OCTETS(pCfg->dest_addr.buffer.ether_addr_octet));
 	}
 
 	if (pCfg->current_sampling_rate != 0 && pCfg->audioRate != 0 &&
