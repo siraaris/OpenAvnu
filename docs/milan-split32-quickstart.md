@@ -29,6 +29,19 @@ It assumes:
 - a Milan-capable listener device or DAC on the same network
 - Hive or another Milan-capable controller on the same network
 
+The current launcher is split into two layers:
+
+- `INFRA`: NIC tuning, `gPTP`, `phc2sys`, `MRPD`, `MAAP`, `shaper`, and the seeded `tc`/queueing setup
+- `STREAM`: `openavb_host` and `openavb_avdecc`
+
+In normal use:
+
+- `start` brings up `STREAM`, and seeds `INFRA` first if needed
+- `stop` stops `STREAM` only and leaves `INFRA` running
+- `infra-stop` tears down both `STREAM` and `INFRA`
+
+For remaining gaps and follow-up work, see [milan-roadmap.md](./milan-roadmap.md).
+
 ## 1. Install host packages
 
 Install the common build and runtime packages first:
@@ -36,12 +49,10 @@ Install the common build and runtime packages first:
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential cmake git tmux alsa-utils dkms \
+  build-essential cmake git tmux alsa-utils \
   libpcap-dev libpci-dev libsndfile1-dev libjack-dev \
   libglib2.0-dev libasound2-dev linuxptp ethtool
 ```
-
-If your distro splits headers/packages differently, also install the matching kernel headers.
 
 ## 2. Set up ALSA loopback and `/etc/asound.conf`
 
@@ -98,22 +109,11 @@ With this setup:
 
 You can sanity-check it with any tool or DAW that can open a 32-channel ALSA PCM.
 
-## 3. Install the Milan NIC driver for the Intel I210-T1
+## 3. Use the stock Intel I210-T1 driver
 
-This setup assumes the Milan-facing NIC is an Intel `I210-T1` PCIe adapter and that it uses the `igb_milan` DKMS module from the `siraaris` GitHub repo.
+This setup assumes the Milan-facing NIC is an Intel `I210-T1` PCIe adapter using the stock kernel `igb` driver. A custom DKMS driver is not required.
 
-Clone and install it:
-
-```bash
-cd ..
-git clone git@github.com:siraaris/igb_milan.git
-cd igb_milan
-sudo ./scripts/install-dkms.sh --activate
-sudo update-initramfs -u
-sudo reboot
-```
-
-After reboot, verify the interface is bound to the Milan driver:
+Verify the interface is bound to the stock driver:
 
 ```bash
 ethtool -i enp2s0
@@ -122,10 +122,8 @@ ethtool -i enp2s0
 You want to see:
 
 ```text
-driver: igb_milan
+driver: igb
 ```
-
-If Secure Boot is enabled on the host, you may need to enroll the DKMS signing key or disable Secure Boot before the module will load.
 
 ## 4. Prepare the network interface
 
@@ -202,8 +200,16 @@ From the OpenAvnu repo:
 
 ```bash
 cd ~/path/to/OpenAvnu
+sudo ./run_milan_stack_tmux.sh infra-stop
 sudo STACK_PROFILE=split32 ./run_milan_stack_tmux.sh start
 ```
+
+Using `infra-stop` first is recommended for:
+
+- the first bring-up after boot
+- switching NIC/clock/shaper settings
+- changing the active Milan profile
+- recovering from a bad or partial previous run
 
 Useful follow-up commands:
 
@@ -211,15 +217,21 @@ Useful follow-up commands:
 sudo ./run_milan_stack_tmux.sh status
 sudo ./run_milan_stack_tmux.sh logs
 sudo ./run_milan_stack_tmux.sh stop
+sudo ./run_milan_stack_tmux.sh infra-stop
 ```
 
-The launcher starts:
+On a clean bring-up, the launcher seeds `INFRA` and then starts `STREAM`.
+
+`INFRA` contains:
 
 - gPTP
 - phc2sys
 - MRPD
 - MAAP
 - shaper
+
+`STREAM` contains:
+
 - `openavb_host`
 - `openavb_avdecc`
 
@@ -228,6 +240,12 @@ For `split32`, it also starts:
 - four 8-channel AAF Milan talkers
 - one CRF talker
 - one CRF listener
+
+After that initial bring-up:
+
+- `sudo ./run_milan_stack_tmux.sh stop` stops only `openavb_host` and `openavb_avdecc`
+- `sudo ./run_milan_stack_tmux.sh start` starts them again on top of the existing infrastructure
+- `sudo ./run_milan_stack_tmux.sh infra-stop` is the full teardown
 
 ## 8. Feed 32-channel audio into the stack
 
