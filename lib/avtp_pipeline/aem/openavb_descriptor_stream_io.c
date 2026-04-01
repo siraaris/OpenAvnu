@@ -379,7 +379,10 @@ static void fillInStreamFormat(openavb_aem_descriptor_stream_io_t *pDescriptor, 
 	U8 nominalSampleRate = 0x05;
 
 	if (pConfig && pConfig->stream) {
-		crfBaseFreq = pConfig->stream->audioRate;
+		crfBaseFreq = pConfig->stream->crfBaseFreq;
+		if (crfBaseFreq == 0) {
+			crfBaseFreq = pConfig->stream->audioRate;
+		}
 		if (pConfig->stream->audioChannels > 0) {
 			audioChannels = pConfig->stream->audioChannels;
 		}

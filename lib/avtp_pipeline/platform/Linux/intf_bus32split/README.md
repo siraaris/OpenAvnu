@@ -36,7 +36,8 @@ Example Milan AAF profiles are provided in this folder:
 - `bus32split_milan_1.ini`
 - `bus32split_milan_2.ini`
 - `bus32split_milan_3.ini`
-- `bus32split_milan_crf.ini`
+- `bus32split_milan_crf_talker.ini`
+- `bus32split_milan_crf_listener.ini`
 
 The four AAF talkers plus CRF are intended to be started together in one
 `openavb_host` process.

@@ -535,25 +535,9 @@ bool openavbAVDECCGetTalkerStreamInfo(openavb_aem_descriptor_stream_io_t *pDescr
 		return FALSE;
 	}
 
-	// Get the destination MAC Address.
+	// Get the destination MAC Address. A zero MAC is a valid "pending MAAP"
+	// state for talkers whose multicast destination has not been allocated yet.
 	const U8 *destMac = pDescriptorStreamOutput->stream->dest_addr.buffer.ether_addr_octet;
-	U8 defaultDest[ETH_ALEN] = {0};
-	if (!pDescriptorStreamOutput->stream->dest_addr.mac ||
-			memcmp(destMac, "\x00\x00\x00\x00\x00\x00", ETH_ALEN) == 0)
-	{
-		defaultDest[0] = 0x91;
-		defaultDest[1] = 0xe0;
-		defaultDest[2] = 0xf0;
-		defaultDest[3] = 0x00;
-		defaultDest[4] = 0xfe;
-		defaultDest[5] = 0x80;
-		if (pDescriptorStreamOutput->stream->stream_uid != 0xFFFF) {
-			defaultDest[5] = (U8)(0x80 + (pDescriptorStreamOutput->stream->stream_uid & 0x7f));
-		}
-		destMac = defaultDest;
-		AVB_LOGF_WARNING("Talker stream dest_addr unset; defaulting to " ETH_FORMAT,
-			ETH_OCTETS(destMac));
-	}
 	memcpy(pTalkerStreamInfo->stream_dest_mac, destMac, ETH_ALEN);
 	AVB_LOGF_DEBUG("Talker stream_dest_mac:  " ETH_FORMAT,
 		ETH_OCTETS(pTalkerStreamInfo->stream_dest_mac));
@@ -582,7 +566,7 @@ bool openavbAVDECCGetTalkerStreamInfo(openavb_aem_descriptor_stream_io_t *pDescr
 	// Get the VLAN ID.
 	pTalkerStreamInfo->stream_vlan_id = pDescriptorStreamOutput->stream->vlan_id;
 
-	AVB_LOGF_INFO("Talker stream info resolved: uid=%u stream_id=" ETH_FORMAT "/%u dest=" ETH_FORMAT " vlan=%u",
+	AVB_LOGF_INFO("Talker stream info: uid=%u stream_id=" ETH_FORMAT "/%u dest=" ETH_FORMAT " vlan=%u",
 		pDescriptorStreamOutput->stream->stream_uid,
 		ETH_OCTETS(pTalkerStreamInfo->stream_id),
 		(((U16) pTalkerStreamInfo->stream_id[6]) << 8) | (U16) pTalkerStreamInfo->stream_id[7],

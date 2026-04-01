@@ -73,5 +73,6 @@ void openavbAecpSMEntityModelEntitySet_unsolicited(openavb_aecp_AEMCommandRespon
 	// Note:  doUnsolicited is set during the call to openavbAecpSMEntityModelEntitySet_unsolicited()
 void openavbAecpSMEntityModelEntitySet_doTerminate(bool value);
 void openavbAecpSMEntityModelEntityNotifyStreamState(U16 descriptor_type, U16 descriptor_index);
+void openavbAecpSMEntityModelEntityNotifyCounters(U16 descriptor_type, U16 descriptor_index);
 
 #endif // OPENAVB_AECP_SM_ENTITY_MODEL_ENTITY_H

@@ -554,22 +554,6 @@ EXTERN_DLL_EXPORT bool openavbTLReadIniFileOsal(tl_handle_t TLhandle, const char
 			ETH_OCTETS(parseIniData.pCfg->stream_addr.buffer.ether_addr_octet));
 	}
 
-	// For a Talker, ensure a non-zero default destination multicast address is
-	// always present so controller-facing stream metadata is never all-zero.
-	if (parseIniData.pCfg->role == AVB_ROLE_TALKER &&
-		(!parseIniData.pCfg->dest_addr.mac ||
-		 memcmp(parseIniData.pCfg->dest_addr.mac, "\x00\x00\x00\x00\x00\x00", 6) == 0))
-	{
-		U8 defaultDest[ETH_ALEN] = {0x91, 0xe0, 0xf0, 0x00, 0xfe, 0x80};
-		if (parseIniData.pCfg->stream_uid != 0xFFFF) {
-			defaultDest[5] = (U8)(0x80 + (parseIniData.pCfg->stream_uid & 0x7f));
-		}
-		memcpy(parseIniData.pCfg->dest_addr.buffer.ether_addr_octet, defaultDest, ETH_ALEN);
-		parseIniData.pCfg->dest_addr.mac = &(parseIniData.pCfg->dest_addr.buffer);
-		AVB_LOGF_INFO("No dest_addr specified; defaulting to " ETH_FORMAT,
-			ETH_OCTETS(parseIniData.pCfg->dest_addr.buffer.ether_addr_octet));
-	}
-
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 	return TRUE;
 }

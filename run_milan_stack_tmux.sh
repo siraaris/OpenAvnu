@@ -7,7 +7,6 @@ REPO_PARENT="$(cd "$REPO_ROOT/.." && pwd)"
 MILAN_BUS32SPLIT_DIR="$REPO_ROOT/lib/avtp_pipeline/platform/Linux/intf_bus32split"
 MILAN_TEST_CONFIG_DIR="$REPO_ROOT/test_configs/milan"
 MILAN_ENDPOINT_INI="$MILAN_TEST_CONFIG_DIR/endpoint.ini"
-MILAN_ENDPOINT_SAVE_INI="$MILAN_TEST_CONFIG_DIR/endpoint_save.ini"
 MILAN_AVDECC_INI="$MILAN_TEST_CONFIG_DIR/avdecc.ini"
 MILAN_GPTP_CFG_INI="$MILAN_TEST_CONFIG_DIR/gptp_cfg.ini"
 GPTP_REPO_ROOT="${GPTP_REPO_ROOT:-$REPO_PARENT/gptp}"
@@ -32,7 +31,8 @@ AUDIO_INI_0="${AUDIO_INI_0:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_0.ini}"
 AUDIO_INI_1="${AUDIO_INI_1:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_1.ini}"
 AUDIO_INI_2="${AUDIO_INI_2:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_2.ini}"
 AUDIO_INI_3="${AUDIO_INI_3:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_3.ini}"
-CRF_INI="${CRF_INI:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_crf.ini}"
+SPLIT32_CRF_TALKER_INI="${SPLIT32_CRF_TALKER_INI:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_crf_talker.ini}"
+SPLIT32_CRF_LISTENER_INI="${SPLIT32_CRF_LISTENER_INI:-$MILAN_BUS32SPLIT_DIR/bus32split_milan_crf_listener.ini}"
 CRF_TONEGEN_INI="${CRF_TONEGEN_INI:-$MILAN_TEST_CONFIG_DIR/crf_talker_milan.ini}"
 CRF_LISTENER_INI="${CRF_LISTENER_INI:-$MILAN_TEST_CONFIG_DIR/crf_listener_milan.ini}"
 TONEGEN_INI_0="${TONEGEN_INI_0:-$MILAN_TEST_CONFIG_DIR/tonegen_milan_0.ini}"
@@ -63,6 +63,8 @@ STOCK_IGB_CLASSA_ETF_OFFLOAD="${STOCK_IGB_CLASSA_ETF_OFFLOAD:-1}"
 STOCK_IGB_CLASSB_CBS_OFFLOAD="${STOCK_IGB_CLASSB_CBS_OFFLOAD:-0}"
 STOCK_IGB_CLASSB_ETF_OFFLOAD="${STOCK_IGB_CLASSB_ETF_OFFLOAD:-0}"
 STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC="${STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC:-12}"
+BUS32_AAF_DEFERRED_START_BASE_USEC="${BUS32_AAF_DEFERRED_START_BASE_USEC:-500000}"
+BUS32_AAF_DEFERRED_START_STEP_USEC="${BUS32_AAF_DEFERRED_START_STEP_USEC:-250000}"
 BUS32_CRF_DIAG_ENABLE="${BUS32_CRF_DIAG_ENABLE:-1}"
 BUS32_CRF_DIAG_LOG_EVERY_PACKETS="${BUS32_CRF_DIAG_LOG_EVERY_PACKETS:-500}"
 BUS32_CRF_DIAG_JITTER_THRESH_NS="${BUS32_CRF_DIAG_JITTER_THRESH_NS:-250000}"
@@ -83,7 +85,7 @@ INI_FILES="${INI_FILES:-}"
 STACK_PROFILE="${STACK_PROFILE:-split32}"
 
 AVDECC_BIN="${AVDECC_BIN:-$REPO_ROOT/lib/avtp_pipeline/build_avdecc/platform/Linux/avb_avdecc/openavb_avdecc}"
-HOST_BIN="${HOST_BIN:-$REPO_ROOT/lib/avtp_pipeline/build/bin/openavb_host}"
+HOST_BIN="${HOST_BIN:-$REPO_ROOT/lib/avtp_pipeline/build/platform/Linux/avb_host/openavb_host}"
 GPTP_BIN="${GPTP_BIN:-$GPTP_REPO_ROOT/linux/build/obj/daemon_cl}"
 PHC2SYS_BIN="${PHC2SYS_BIN:-$(command -v phc2sys 2>/dev/null || true)}"
 MRPD_BIN="${MRPD_BIN:-$REPO_ROOT/daemons/mrpd/mrpd}"
@@ -93,6 +95,7 @@ MRPD_MAKE_DIR="${MRPD_MAKE_DIR:-$REPO_ROOT/daemons/mrpd}"
 MRPQ_BIN="${MRPQ_BIN:-$REPO_ROOT/examples/mrp_client/mrpq}"
 MRPD_QUERY_BIN="${MRPD_QUERY_BIN:-}"
 ETHTOOL_BIN="${ETHTOOL_BIN:-$(command -v ethtool 2>/dev/null || true)}"
+TC_BIN="${TC_BIN:-$(command -v tc 2>/dev/null || true)}"
 
 IFACE_AVDECC="${IFACE_AVDECC:-enp2s0}"
 IFACE_HOST="${IFACE_HOST:-sendmmsg:enp2s0}"
@@ -112,6 +115,7 @@ RUN_MRPD="${RUN_MRPD:-1}"
 RUN_MRPD_WATCH="${RUN_MRPD_WATCH:-1}"
 RUN_MAAP="${RUN_MAAP:-1}"
 RUN_SHAPER="${RUN_SHAPER:-1}"
+PERSIST_MILAN_INFRA="${PERSIST_MILAN_INFRA:-1}"
 NIC_TUNE="${NIC_TUNE:-${RING_CHECK:-1}}"
 RING_IFACE="${RING_IFACE:-$IFACE_DAEMONS}"
 RING_RX_TARGET="${RING_RX_TARGET:-512}"
@@ -139,6 +143,7 @@ SHAPER_CLASSB_PARENT="${SHAPER_CLASSB_PARENT:-}"
 SHAPER_CLASSA_HANDLE="${SHAPER_CLASSA_HANDLE:-}"
 SHAPER_CLASSB_HANDLE="${SHAPER_CLASSB_HANDLE:-}"
 SHAPER_EGRESS_QMAP="${SHAPER_EGRESS_QMAP:-}"
+SHAPER_INIT_IFACE="${SHAPER_INIT_IFACE:-$IFACE_DAEMONS}"
 SHAPER_CLASSA_QMAP="${SHAPER_CLASSA_QMAP:-}"
 SHAPER_CLASSB_QMAP="${SHAPER_CLASSB_QMAP:-}"
 SHAPER_DEFAULT_QMAP="${SHAPER_DEFAULT_QMAP:-}"
@@ -179,6 +184,9 @@ IPC_ENDPOINT_SOCK="${IPC_ENDPOINT_SOCK:-/tmp/avb_endpoint}"
 IPC_AVDECC_SOCK="${IPC_AVDECC_SOCK:-/tmp/avdecc_msg}"
 STREAM_READY_WAIT_SEC="${STREAM_READY_WAIT_SEC:-20}"
 PROCESS_STOP_WAIT_SEC="${PROCESS_STOP_WAIT_SEC:-2}"
+TMUX_STOP_GRACE_SEC="${TMUX_STOP_GRACE_SEC:-3}"
+HOST_STOP_SETTLE_SEC="${HOST_STOP_SETTLE_SEC:-1}"
+POST_STOP_SETTLE_SEC="${POST_STOP_SETTLE_SEC:-2}"
 
 LOG_DIR="${LOG_DIR:-/tmp/openavnu-avb-logs}"
 SYSTEM_LOG="${SYSTEM_LOG:-$LOG_DIR/system_current.log}"
@@ -190,6 +198,7 @@ MAAP_LOG="${MAAP_LOG:-$LOG_DIR/maap_current.log}"
 SHAPER_LOG="${SHAPER_LOG:-$LOG_DIR/shaper_current.log}"
 AVDECC_LOG="${AVDECC_LOG:-$LOG_DIR/openavb_avdecc_current.log}"
 HOST_LOG="${HOST_LOG:-$LOG_DIR/openavb_host_current.log}"
+INFRA_STATE_FILE="${INFRA_STATE_FILE:-$LOG_DIR/infra_current.state}"
 HOST_LOG_LEVEL="${HOST_LOG_LEVEL:-warning}"
 HOST_LOG_TRIM_EVERY="${HOST_LOG_TRIM_EVERY:-250}"
 HOST_LOG_MAX_LINES="${HOST_LOG_MAX_LINES:-12000}"
@@ -199,11 +208,16 @@ INI_ARGS=""
 EXPECTED_UIDS=()
 EXPECTED_MAAP_UIDS=()
 STARTUP_PROGRESS_ACTIVE=0
+SHAPER_PRESET_CLASSA_BW=""
+SHAPER_PRESET_CLASSA_MAX_FRAME=""
+SHAPER_PRESET_CLASSB_BW=""
+SHAPER_PRESET_CLASSB_MAX_FRAME=""
+SHAPER_PRESET_SUMMARY=""
 
 usage() {
     cat <<'EOF'
 Usage:
-  run_milan_stack_tmux.sh <start|stop|restart|status|logs|help>
+  run_milan_stack_tmux.sh <start|stop|restart|infra-stop|status|logs|help>
 
 Profiles:
   split32  32-channel bus32split source -> 4 x 8-channel AAF Milan talkers
@@ -216,7 +230,8 @@ Profiles:
 Defaults:
   STACK_PROFILE=split32
   CFG_DIR=<repo root>
-  CRF_INI=<repo>/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_crf.ini
+  SPLIT32_CRF_TALKER_INI=<repo>/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_crf_talker.ini
+  SPLIT32_CRF_LISTENER_INI=<repo>/lib/avtp_pipeline/platform/Linux/intf_bus32split/bus32split_milan_crf_listener.ini
   CRF_TONEGEN_INI=<repo>/test_configs/milan/crf_talker_milan.ini
   CRF_LISTENER_INI=<repo>/test_configs/milan/crf_listener_milan.ini
   ENDPOINT_INI=<repo>/test_configs/milan/endpoint.ini
@@ -224,6 +239,7 @@ Defaults:
   ENDPOINT_SAVE_INI=<user config>/openavnu/state.ini
   GPTP_ARGS="-F <repo>/test_configs/milan/gptp_cfg.ini"
   RUN_PHC2SYS=1 (-s /dev/ptp0 -c CLOCK_REALTIME -R 8 -N 5 -O 0 -m)
+  PERSIST_MILAN_INFRA=1 (keep gPTP/phc2sys/shaper/tc seeded across stop/start)
   NIC_TUNE=1 (--set-eee off, -C rx/tx-usecs 0, -G rx/tx 512, -K offloads off,
               -A pause off, -L combined 4)
   PHC2SYS_LOG_WINDOW_MIN=15 (retain roughly the last 15 minutes of phc2sys logs)
@@ -241,6 +257,11 @@ Notes:
   - Invoking with no command or with help prints this summary.
   - CRF INIs are automatically moved to the end of INI_FILES so clock streams
     enumerate after audio streams in controllers.
+  - `start`/`stop`/`restart` act on STREAM only: `openavb_host` and `openavb_avdecc`.
+  - INFRA is `gPTP`, `phc2sys`, `MRPD`, `MRPD watch`, `MAAP`, `shaper`, NIC tuning,
+    and resident `tc`. Use `infra-stop` to pull that down explicitly.
+  - With PERSIST_MILAN_INFRA=1, `start` reuses INFRA only if the requested run
+    config matches the currently seeded infra state.
 EOF
 }
 
@@ -321,6 +342,101 @@ phc2sys_enabled() {
     esac
 }
 
+persistent_infra_enabled() {
+    case "${PERSIST_MILAN_INFRA,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+persistent_infra_running() {
+    session_up "$SESS_SHAPER" || session_up "$SESS_GPTP" || session_up "$SESS_PHC2SYS" || \
+        session_up "$SESS_MRPD" || session_up "$SESS_MRPD_WATCH" || session_up "$SESS_MAAP"
+}
+
+clear_infra_state() {
+    rm -f "$INFRA_STATE_FILE"
+}
+
+compute_infra_signature() {
+    local nic_tune_active=0
+    local phc2sys_active=0
+
+    nic_tune_enabled && nic_tune_active=1
+    phc2sys_enabled && phc2sys_active=1
+
+    cat <<EOF
+version=1
+run_gptp=$RUN_GPTP
+run_phc2sys=$phc2sys_active
+run_mrpd=$RUN_MRPD
+run_mrpd_watch=$RUN_MRPD_WATCH
+run_maap=$RUN_MAAP
+run_shaper=$RUN_SHAPER
+daemon_iface=$IFACE_DAEMONS
+ring_iface=$RING_IFACE
+nic_tune=$nic_tune_active
+ring_rx_target=$RING_RX_TARGET
+ring_tx_target=$RING_TX_TARGET
+combined_queues=$NIC_COMBINED_QUEUES
+coalesce_rx_usecs=$NIC_COALESCE_RX_USECS
+coalesce_tx_usecs=$NIC_COALESCE_TX_USECS
+gptp_bin=$GPTP_BIN
+gptp_cwd=$GPTP_CWD
+gptp_args=$GPTP_ARGS
+phc2sys_bin=$PHC2SYS_BIN
+phc2sys_args=$PHC2SYS_ARGS
+mrpd_bin=$MRPD_BIN
+mrpd_args=$MRPD_ARGS
+mrpd_log_flags=$MRPD_LOG_FLAGS
+maap_bin=$MAAP_BIN
+maap_args=$MAAP_ARGS
+shaper_bin=$SHAPER_BIN
+shaper_args=$SHAPER_ARGS
+shaper_init_iface=$SHAPER_INIT_IFACE
+shaper_link_speed_mbps=$SHAPER_LINK_SPEED_MBPS
+shaper_skip_root_qdisc=$SHAPER_SKIP_ROOT_QDISC
+shaper_classa_parent=$SHAPER_CLASSA_PARENT
+shaper_classb_parent=$SHAPER_CLASSB_PARENT
+shaper_classa_handle=$SHAPER_CLASSA_HANDLE
+shaper_classb_handle=$SHAPER_CLASSB_HANDLE
+shaper_classa_qdisc=$SHAPER_CLASSA_QDISC
+shaper_classb_qdisc=$SHAPER_CLASSB_QDISC
+shaper_classa_cbs_offload=$SHAPER_CLASSA_CBS_OFFLOAD
+shaper_classb_cbs_offload=$SHAPER_CLASSB_CBS_OFFLOAD
+shaper_classa_etf_delta_ns=$SHAPER_CLASSA_ETF_DELTA_NS
+shaper_classb_etf_delta_ns=$SHAPER_CLASSB_ETF_DELTA_NS
+shaper_classa_etf_offload=$SHAPER_CLASSA_ETF_OFFLOAD
+shaper_classb_etf_offload=$SHAPER_CLASSB_ETF_OFFLOAD
+shaper_classa_etf_skip_sock_check=$SHAPER_CLASSA_ETF_SKIP_SOCK_CHECK
+shaper_classb_etf_skip_sock_check=$SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK
+shaper_mqprio_hw=$SHAPER_MQPRIO_HW
+shaper_tc_map=$SHAPER_TC_MAP
+shaper_egress_qmap=$SHAPER_EGRESS_QMAP
+shaper_classa_qmap=$SHAPER_CLASSA_QMAP
+shaper_classb_qmap=$SHAPER_CLASSB_QMAP
+shaper_default_qmap=$SHAPER_DEFAULT_QMAP
+shaper_gptp_qmap=$SHAPER_GPTP_QMAP
+EOF
+}
+
+infra_state_matches() {
+    local desired current
+    [[ -f "$INFRA_STATE_FILE" ]] || return 1
+    desired="$(compute_infra_signature)"
+    current="$(cat "$INFRA_STATE_FILE" 2>/dev/null || true)"
+    [[ -n "$current" && "$desired" == "$current" ]]
+}
+
+write_infra_state() {
+    mkdir -p "$(dirname "$INFRA_STATE_FILE")"
+    compute_infra_signature >"$INFRA_STATE_FILE"
+}
+
 nic_tune_enabled() {
     case "${NIC_TUNE,,}" in
         1|true|yes|on)
@@ -383,12 +499,12 @@ apply_stack_profile() {
         split32)
             [[ "$CRF_TONEGEN_LAUNCH_LEAD_USEC" == "1200" ]] && CRF_TONEGEN_LAUNCH_LEAD_USEC="$STOCK_IGB_CRF_LAUNCH_LEAD_USEC"
             apply_milan_runtime_defaults
-            INI_FILES="$AUDIO_INI_0,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=0,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
-$AUDIO_INI_1,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
-$AUDIO_INI_2,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 2)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
-$AUDIO_INI_3,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=500000,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 3)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
-$CRF_INI,ifname=$IFACE_HOST,max_transit_usec=$CRF_TONEGEN_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$CRF_TONEGEN_MAX_TRANSMIT_DEFICIT_USEC,map_nv_tx_rate=$CRF_TONEGEN_TX_RATE,map_nv_crf_launch_lead_usec=$CRF_TONEGEN_LAUNCH_LEAD_USEC,map_nv_crf_diag_enable=$BUS32_CRF_DIAG_ENABLE,map_nv_crf_diag_log_every_packets=$BUS32_CRF_DIAG_LOG_EVERY_PACKETS,map_nv_crf_diag_jitter_thresh_ns=$BUS32_CRF_DIAG_JITTER_THRESH_NS \
-$CRF_LISTENER_INI,ifname=$IFACE_HOST"
+            INI_FILES="$AUDIO_INI_0,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=$BUS32_AAF_DEFERRED_START_BASE_USEC,map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=0,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_1,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=$((BUS32_AAF_DEFERRED_START_BASE_USEC + BUS32_AAF_DEFERRED_START_STEP_USEC)),map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC,map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_2,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=$((BUS32_AAF_DEFERRED_START_BASE_USEC + (BUS32_AAF_DEFERRED_START_STEP_USEC * 2))),map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 2)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$AUDIO_INI_3,ifname=$IFACE_HOST,max_transit_usec=$STOCK_IGB_AAF_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$STOCK_IGB_AAF_MAX_TRANSMIT_DEFICIT_USEC,fixed_timestamp=1,intf_nv_fixed_ts_runtime_lead_usec=0,deferred_start=selected_clock,deferred_start_stable_usec=$((BUS32_AAF_DEFERRED_START_BASE_USEC + (BUS32_AAF_DEFERRED_START_STEP_USEC * 3))),map_nv_tx_min_lead_usec=$STOCK_IGB_AAF_TX_MIN_LEAD_USEC,map_nv_tx_launch_skew_usec=$((STOCK_IGB_AAF_LAUNCH_SKEW_STEP_USEC * 3)),map_nv_selected_clock_mute_usec=$TONEGEN_SELECTED_CLOCK_MUTE_USEC,map_nv_selected_clock_trim_usec=$BUS32_AAF_SELECTED_CLOCK_TRIM_USEC \
+$SPLIT32_CRF_TALKER_INI,ifname=$IFACE_HOST,max_transit_usec=$CRF_TONEGEN_MAX_TRANSIT_USEC,max_transmit_deficit_usec=$CRF_TONEGEN_MAX_TRANSMIT_DEFICIT_USEC,map_nv_tx_rate=$CRF_TONEGEN_TX_RATE,map_nv_crf_launch_lead_usec=$CRF_TONEGEN_LAUNCH_LEAD_USEC,map_nv_crf_diag_enable=$BUS32_CRF_DIAG_ENABLE,map_nv_crf_diag_log_every_packets=$BUS32_CRF_DIAG_LOG_EVERY_PACKETS,map_nv_crf_diag_jitter_thresh_ns=$BUS32_CRF_DIAG_JITTER_THRESH_NS \
+$SPLIT32_CRF_LISTENER_INI,ifname=$IFACE_HOST"
             ;;
         tonegen)
             apply_milan_tonegen_timing_defaults
@@ -495,6 +611,279 @@ extract_ini_key() {
     ' "$ini_path"
 }
 
+extract_ini_section_key() {
+    local ini_path="$1"
+    local section="$2"
+    local key="$3"
+    awk -F= -v section="$section" -v key="$key" '
+        BEGIN {
+            in_section = 0
+        }
+        /^[[:space:]]*[#;]/ { next }
+        /^[[:space:]]*\[/ {
+            line = $0
+            gsub(/^[[:space:]]*\[/, "", line)
+            gsub(/\][[:space:]]*$/, "", line)
+            in_section = (line == section)
+            next
+        }
+        in_section {
+            k = $1
+            gsub(/[[:space:]]/, "", k)
+            if (k == key) {
+                v = $2
+                sub(/^[[:space:]]+/, "", v)
+                sub(/[[:space:]]+$/, "", v)
+                print v
+                exit
+            }
+        }
+    ' "$ini_path"
+}
+
+extract_ini_entry_override() {
+    local ini_entry="$1"
+    local key="$2"
+    local suffix token name value
+
+    [[ "$ini_entry" == *,* ]] || return 1
+    suffix="${ini_entry#*,}"
+    IFS=',' read -r -a _ini_override_tokens <<< "$suffix"
+    for token in "${_ini_override_tokens[@]}"; do
+        [[ "$token" == *=* ]] || continue
+        name="${token%%=*}"
+        value="${token#*=}"
+        if [[ "$name" == "$key" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+extract_ini_entry_value() {
+    local ini_entry="$1"
+    local ini_path="$2"
+    local key="$3"
+    local value
+
+    value="$(extract_ini_entry_override "$ini_entry" "$key" || true)"
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    extract_ini_key "$ini_path" "$key"
+}
+
+aaf_packet_sample_bytes() {
+    local audio_type="${1,,}"
+    local audio_bit_depth="$2"
+
+    if [[ "$audio_type" == "float" ]]; then
+        [[ "$audio_bit_depth" == "32" ]] || return 1
+        printf '4\n'
+        return 0
+    fi
+
+    case "$audio_bit_depth" in
+        32) printf '4\n' ;;
+        24) printf '3\n' ;;
+        16) printf '2\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+compute_aaf_talker_shaper_values() {
+    local ini_entry="$1"
+    local ini_path="$2"
+    local sr_class="$3"
+    local max_interval_frames="$4"
+    local tx_rate audio_rate audio_channels audio_bit_depth audio_type
+    local packet_sample_bytes frames_per_packet payload_size max_frame_size
+    local measurement_interval bandwidth_bps
+
+    tx_rate="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_tx_rate" || true)"
+    [[ -z "$tx_rate" ]] && tx_rate="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_tx_interval" || true)"
+    [[ -z "$tx_rate" ]] && tx_rate="4000"
+
+    audio_rate="$(extract_ini_entry_value "$ini_entry" "$ini_path" "intf_nv_audio_rate" || true)"
+    audio_channels="$(extract_ini_entry_value "$ini_entry" "$ini_path" "intf_nv_audio_channels" || true)"
+    audio_bit_depth="$(extract_ini_entry_value "$ini_entry" "$ini_path" "intf_nv_audio_bit_depth" || true)"
+    audio_type="$(extract_ini_entry_value "$ini_entry" "$ini_path" "intf_nv_audio_type" || true)"
+    [[ -z "$audio_type" ]] && audio_type="int"
+
+    [[ "$tx_rate" =~ ^[0-9]+$ && "$tx_rate" -gt 0 ]] || return 1
+    [[ "$audio_rate" =~ ^[0-9]+$ && "$audio_rate" -gt 0 ]] || return 1
+    [[ "$audio_channels" =~ ^[0-9]+$ && "$audio_channels" -gt 0 ]] || return 1
+    [[ "$audio_bit_depth" =~ ^[0-9]+$ && "$audio_bit_depth" -gt 0 ]] || return 1
+
+    packet_sample_bytes="$(aaf_packet_sample_bytes "$audio_type" "$audio_bit_depth" || true)"
+    [[ "$packet_sample_bytes" =~ ^[0-9]+$ && "$packet_sample_bytes" -gt 0 ]] || return 1
+
+    frames_per_packet=$(( audio_rate / tx_rate ))
+    if (( audio_rate % tx_rate != 0 )); then
+        frames_per_packet=$((frames_per_packet + 1))
+    fi
+    (( frames_per_packet > 0 )) || return 1
+
+    payload_size=$((frames_per_packet * packet_sample_bytes * audio_channels))
+    # AAF talker maxFrameSize = payload + 24 bytes AVTP/AAF header, then the
+    # endpoint adds 18 bytes L2/FCS overhead before reserving shaper bandwidth.
+    max_frame_size=$((payload_size + 24 + 18))
+    if [[ "$sr_class" == "A" ]]; then
+        measurement_interval=125
+    else
+        measurement_interval=250
+    fi
+    bandwidth_bps=$(( ((1000000 * max_frame_size * 8 * max_interval_frames) + measurement_interval - 1) / measurement_interval ))
+
+    printf '%s %s\n' "$bandwidth_bps" "$max_frame_size"
+}
+
+compute_crf_talker_shaper_values() {
+    local ini_entry="$1"
+    local ini_path="$2"
+    local sr_class="$3"
+    local max_interval_frames="$4"
+    local base_freq timestamp_interval timestamps_per_pdu tx_rate
+    local measurement_interval max_frame_size bandwidth_bps denominator
+
+    base_freq="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_crf_base_freq" || true)"
+    timestamp_interval="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_crf_timestamp_interval" || true)"
+    timestamps_per_pdu="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_crf_timestamps_per_pdu" || true)"
+    tx_rate="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_nv_tx_rate" || true)"
+    [[ -z "$base_freq" ]] && base_freq="48000"
+    [[ -z "$timestamp_interval" ]] && timestamp_interval="96"
+    [[ -z "$timestamps_per_pdu" ]] && timestamps_per_pdu="1"
+
+    [[ "$base_freq" =~ ^[0-9]+$ && "$base_freq" -gt 0 ]] || return 1
+    [[ "$timestamp_interval" =~ ^[0-9]+$ && "$timestamp_interval" -gt 0 ]] || return 1
+    [[ "$timestamps_per_pdu" =~ ^[0-9]+$ && "$timestamps_per_pdu" -gt 0 ]] || return 1
+
+    if [[ -z "$tx_rate" ]]; then
+        denominator=$((timestamp_interval * timestamps_per_pdu))
+        (( denominator > 0 )) || return 1
+        tx_rate=$(( (base_freq + (denominator / 2)) / denominator ))
+    fi
+    [[ "$tx_rate" =~ ^[0-9]+$ && "$tx_rate" -gt 0 ]] || return 1
+
+    if [[ "$sr_class" == "A" ]]; then
+        measurement_interval=125
+    else
+        measurement_interval=250
+    fi
+
+    # CRF talker maxFrameSize = packed AVTP CRF header (20 bytes) plus N
+    # timestamps (8 bytes each), then endpoint adds 18 bytes L2/FCS overhead.
+    max_frame_size=$((20 + (timestamps_per_pdu * 8) + 18))
+    bandwidth_bps=$(( ((1000000 * max_frame_size * 8 * max_interval_frames) + measurement_interval - 1) / measurement_interval ))
+
+    printf '%s %s\n' "$bandwidth_bps" "$max_frame_size"
+}
+
+compute_ini_entry_shaper_values() {
+    local ini_entry="$1"
+    local ini_path="$2"
+    local role map_fn sr_class max_interval_frames values
+
+    role="$(extract_ini_entry_value "$ini_entry" "$ini_path" "role" || true)"
+    role="${role,,}"
+    [[ "$role" == "talker" ]] || return 1
+
+    sr_class="$(extract_ini_entry_value "$ini_entry" "$ini_path" "sr_class" || true)"
+    sr_class="${sr_class^^}"
+    [[ "$sr_class" == "A" || "$sr_class" == "B" ]] || return 2
+
+    max_interval_frames="$(extract_ini_entry_value "$ini_entry" "$ini_path" "max_interval_frames" || true)"
+    [[ -z "$max_interval_frames" ]] && max_interval_frames="1"
+    [[ "$max_interval_frames" =~ ^[0-9]+$ && "$max_interval_frames" -gt 0 ]] || return 2
+
+    map_fn="$(extract_ini_entry_value "$ini_entry" "$ini_path" "map_fn" || true)"
+    case "$map_fn" in
+        openavbMapAVTPAudioInitialize)
+            values="$(compute_aaf_talker_shaper_values "$ini_entry" "$ini_path" "$sr_class" "$max_interval_frames" || true)"
+            [[ -n "$values" ]] || return 2
+            printf '%s %s %s\n' "$sr_class" ${values}
+            ;;
+        openavbMapCrfInitialize)
+            values="$(compute_crf_talker_shaper_values "$ini_entry" "$ini_path" "$sr_class" "$max_interval_frames" || true)"
+            [[ -n "$values" ]] || return 2
+            printf '%s %s %s\n' "$sr_class" ${values}
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
+compute_shaper_presets_from_inis() {
+    local log_result="${1:-1}"
+    local ini_entry ini_path role sr_class values bandwidth max_frame
+    local classa_bw=0 classa_max_frame=0 classa_talkers=0 classa_disabled=0
+    local classb_bw=0 classb_max_frame=0 classb_talkers=0 classb_disabled=0
+    local -a disabled_notes=()
+
+    SHAPER_PRESET_CLASSA_BW=""
+    SHAPER_PRESET_CLASSA_MAX_FRAME=""
+    SHAPER_PRESET_CLASSB_BW=""
+    SHAPER_PRESET_CLASSB_MAX_FRAME=""
+    SHAPER_PRESET_SUMMARY=""
+
+    for ini_entry in "${INI_LIST_ARR[@]}"; do
+        ini_path="$(resolve_ini_path "${ini_entry%%,*}")"
+        role="$(extract_ini_entry_value "$ini_entry" "$ini_path" "role" || true)"
+        role="${role,,}"
+        [[ "$role" == "talker" ]] || continue
+
+        sr_class="$(extract_ini_entry_value "$ini_entry" "$ini_path" "sr_class" || true)"
+        sr_class="${sr_class^^}"
+        [[ "$sr_class" == "A" || "$sr_class" == "B" ]] || continue
+
+        if ! values="$(compute_ini_entry_shaper_values "$ini_entry" "$ini_path" 2>/dev/null)"; then
+            if [[ "$sr_class" == "A" ]]; then
+                classa_disabled=1
+            else
+                classb_disabled=1
+            fi
+            disabled_notes+=("${sr_class}:${ini_path##*/}")
+            continue
+        fi
+
+        read -r sr_class bandwidth max_frame <<< "$values"
+        if [[ "$sr_class" == "A" ]]; then
+            classa_bw=$((classa_bw + bandwidth))
+            (( max_frame > classa_max_frame )) && classa_max_frame="$max_frame"
+            classa_talkers=$((classa_talkers + 1))
+        else
+            classb_bw=$((classb_bw + bandwidth))
+            (( max_frame > classb_max_frame )) && classb_max_frame="$max_frame"
+            classb_talkers=$((classb_talkers + 1))
+        fi
+    done
+
+    if (( classa_talkers > 0 && classa_disabled == 0 )); then
+        SHAPER_PRESET_CLASSA_BW="$classa_bw"
+        SHAPER_PRESET_CLASSA_MAX_FRAME="$classa_max_frame"
+        SHAPER_PRESET_SUMMARY+="ClassA=${classa_bw}bps/${classa_max_frame}B "
+    fi
+    if (( classb_talkers > 0 && classb_disabled == 0 )); then
+        SHAPER_PRESET_CLASSB_BW="$classb_bw"
+        SHAPER_PRESET_CLASSB_MAX_FRAME="$classb_max_frame"
+        SHAPER_PRESET_SUMMARY+="ClassB=${classb_bw}bps/${classb_max_frame}B "
+    fi
+    SHAPER_PRESET_SUMMARY="${SHAPER_PRESET_SUMMARY% }"
+
+    if (( log_result != 0 && ${#disabled_notes[@]} > 0 )); then
+        log_system_note "Shaper presets disabled for unsupported talker INIs: ${disabled_notes[*]}"
+    fi
+    if (( log_result != 0 )) && [[ -n "$SHAPER_PRESET_SUMMARY" ]]; then
+        log_system_note "Computed expected class totals from active INIs: $SHAPER_PRESET_SUMMARY"
+    elif (( log_result != 0 )); then
+        log_system_note "No expected class totals computed from active INIs; runtime reservations will shape classes live."
+    fi
+}
+
 validate_stream_ids_and_dests() {
     declare -A stream_key_owner=()
     declare -A uid_missing_stream_addr_owner=()
@@ -513,7 +902,13 @@ validate_stream_ids_and_dests() {
             stream_addr="$(extract_ini_key "$ini_path" "stream_addr" || true)"
             stream_addr="${stream_addr,,}"
 
-            if [[ -n "$stream_addr" ]]; then
+            # Listener stream IDs with an omitted or all-zero source MAC are
+            # intentionally unresolved placeholders. AVDECC/controller bind will
+            # supply the remote talker stream ID later, so they must not be
+            # rejected up front as local tuple collisions.
+            if [[ "$role" == "listener" && ( -z "$stream_addr" || "$stream_addr" == "00:00:00:00:00:00" ) ]]; then
+                :
+            elif [[ -n "$stream_addr" ]]; then
                 stream_key="${stream_addr}|${uid}"
                 if [[ -n "${stream_key_owner[$stream_key]:-}" && "${stream_key_owner[$stream_key]}" != "$ini_path" ]]; then
                     echo "ERROR: Duplicate stream tuple stream_addr=$stream_addr stream_uid=$uid in $ini_path and ${stream_key_owner[$stream_key]}" >&2
@@ -540,6 +935,9 @@ validate_stream_ids_and_dests() {
         dest="$(extract_ini_key "$ini_path" "dest_addr" || true)"
         if [[ -n "$dest" ]]; then
             dest="${dest,,}"
+            if [[ "$dest" == "00:00:00:00:00:00" ]]; then
+                continue
+            fi
             if [[ -n "${talker_dest_owner[$dest]:-}" && "${talker_dest_owner[$dest]}" != "$ini_path" ]]; then
                 echo "ERROR: Duplicate talker dest_addr=$dest in $ini_path and ${talker_dest_owner[$dest]}" >&2
                 exit 1
@@ -547,6 +945,77 @@ validate_stream_ids_and_dests() {
             talker_dest_owner[$dest]="$ini_path"
         fi
     done
+}
+
+validate_dynamic_addressing_requirements() {
+    local maap_port
+    local maap_enabled=0
+    local ini_entry ini_path role uid stream_addr dest deferred_start
+    local -a talkers_need_maap=()
+    local -a deferred_talkers_need_maap=()
+    local -a listeners_need_bind=()
+    local -a listeners_need_dest=()
+
+    maap_port="$(extract_ini_section_key "$ACTIVE_ENDPOINT_INI" "maap" "port" || true)"
+    if [[ "$maap_port" =~ ^[0-9]+$ ]] && (( maap_port > 0 )); then
+        maap_enabled=1
+    fi
+
+    for ini_entry in "${INI_LIST_ARR[@]}"; do
+        ini_path="$(resolve_ini_path "${ini_entry%%,*}")"
+        role="$(extract_ini_key "$ini_path" "role" || true)"
+        role="${role,,}"
+        uid="$(extract_ini_key "$ini_path" "stream_uid" || true)"
+        deferred_start=""
+        if [[ "$ini_entry" == *,deferred_start=* ]]; then
+            deferred_start="${ini_entry#*,deferred_start=}"
+            deferred_start="${deferred_start%%,*}"
+            deferred_start="${deferred_start,,}"
+        fi
+
+        stream_addr="$(extract_ini_key "$ini_path" "stream_addr" || true)"
+        stream_addr="${stream_addr,,}"
+        dest="$(extract_ini_key "$ini_path" "dest_addr" || true)"
+        dest="${dest,,}"
+
+        if [[ "$role" == "talker" && ( -z "$dest" || "$dest" == "00:00:00:00:00:00" ) ]]; then
+            talkers_need_maap+=("${ini_path##*/}:${uid:-?}")
+            if [[ "$deferred_start" == "selected_clock" || "$deferred_start" == "selected-clock" ]]; then
+                deferred_talkers_need_maap+=("${ini_path##*/}:${uid:-?}")
+            fi
+        fi
+
+        if [[ "$role" == "listener" && ( -z "$stream_addr" || "$stream_addr" == "00:00:00:00:00:00" ) ]]; then
+            listeners_need_bind+=("${ini_path##*/}:${uid:-?}")
+        fi
+
+        if [[ "$role" == "listener" && ( -z "$dest" || "$dest" == "00:00:00:00:00:00" ) ]]; then
+            listeners_need_dest+=("${ini_path##*/}:${uid:-?}")
+        fi
+    done
+
+    if (( ${#talkers_need_maap[@]} > 0 )) && (( ! maap_enabled )); then
+        echo "ERROR: Talker INIs rely on dynamic dest_addr assignment, but [maap] port is disabled in $ACTIVE_ENDPOINT_INI." >&2
+        echo "Affected streams: ${talkers_need_maap[*]}" >&2
+        echo "Enable MAAP in endpoint.ini or set explicit talker dest_addr values before starting." >&2
+        exit 1
+    fi
+
+    if (( ${#talkers_need_maap[@]} > 0 )); then
+        echo "Notice: dynamic talker dest_addr via MAAP for ${talkers_need_maap[*]} (endpoint [maap] port=${maap_port:-0})."
+    fi
+
+    if (( ${#deferred_talkers_need_maap[@]} > 0 )); then
+        echo "Notice: deferred selected_clock talkers will keep dest_addr unresolved until their clock-stable start is released: ${deferred_talkers_need_maap[*]}."
+    fi
+
+    if (( ${#listeners_need_bind[@]} > 0 )); then
+        echo "Notice: unresolved listener stream_addr for ${listeners_need_bind[*]}; controller/AVDECC bind must resolve these listeners."
+    fi
+
+    if (( ${#listeners_need_dest[@]} > 0 )); then
+        echo "Notice: unresolved listener dest_addr for ${listeners_need_dest[*]}; SRP/AVDECC must supply the destination MAC or these listeners need an explicit dest_addr."
+    fi
 }
 
 collect_expected_uids() {
@@ -561,15 +1030,35 @@ collect_expected_uids() {
 
 collect_expected_maap_uids() {
     EXPECTED_MAAP_UIDS=()
-    local ini_entry ini_path uid dest
+    local ini_entry ini_path role uid dest deferred_start initial_state
     for ini_entry in "${INI_LIST_ARR[@]}"; do
         ini_path="$(resolve_ini_path "${ini_entry%%,*}")"
+        role="$(extract_ini_key "$ini_path" "role" || true)"
+        role="${role,,}"
+        [[ "$role" != "talker" ]] && continue
+        deferred_start=""
+        if [[ "$ini_entry" == *,deferred_start=* ]]; then
+            deferred_start="${ini_entry#*,deferred_start=}"
+            deferred_start="${deferred_start%%,*}"
+            deferred_start="${deferred_start,,}"
+        fi
+        if [[ "$deferred_start" == "selected_clock" || "$deferred_start" == "selected-clock" ]]; then
+            continue
+        fi
+        initial_state="$(extract_ini_key "$ini_path" "initial_state" || true)"
+        initial_state="${initial_state,,}"
+        if [[ "$initial_state" == "stopped" ]]; then
+            continue
+        fi
         uid="$(extract_ini_key "$ini_path" "stream_uid" || true)"
         [[ -z "$uid" ]] && continue
         dest="$(extract_ini_key "$ini_path" "dest_addr" || true)"
-        # No explicit dest_addr means startup uses a placeholder and MAAP should
-        # provide the final multicast destination before controller connect.
-        if [[ -z "$dest" ]]; then
+        dest="${dest,,}"
+        # No explicit dest_addr, or an all-zero placeholder, means startup uses
+        # MAAP to provide the final multicast destination before controller connect.
+        # Only include talkers that can actually run before AVDECC is up. Deferred
+        # selected_clock talkers and initial_state=stopped talkers resolve later.
+        if [[ -z "$dest" || "$dest" == "00:00:00:00:00:00" ]]; then
             EXPECTED_MAAP_UIDS+=("$uid")
         fi
     done
@@ -630,13 +1119,25 @@ wait_for_host_stream_registration() {
 wait_for_host_maap_ready() {
     local timeout="$MAAP_READY_WAIT_SEC"
     local expected="${#EXPECTED_MAAP_UIDS[@]}"
-    host_log_includes_info || return 0
     [[ "$timeout" -le 0 || "$expected" -le 0 ]] && return 0
 
     local deadline=$((SECONDS + timeout))
     local count_alloc=0
+    local count_shaper=0
     while (( SECONDS < deadline )); do
-        count_alloc="$(rg -c "Endpoint MAAP] INFO: Allocated MAAP address" "$HOST_LOG" 2>/dev/null || echo 0)"
+        count_alloc="$(awk '
+            /Endpoint MAAP] (INFO|WARNING): Allocated MAAP address/ { c++ }
+            END { print c + 0 }
+        ' "$HOST_LOG" 2>/dev/null || echo 0)"
+        if [[ "$RUN_SHAPER" == "1" ]]; then
+            count_shaper="$(awk '
+                /SHAPER Main] INFO: The received command is "-ri / { c++ }
+                END { print c + 0 }
+            ' "$SHAPER_LOG" 2>/dev/null || echo 0)"
+            if (( count_shaper > count_alloc )); then
+                count_alloc="$count_shaper"
+            fi
+        fi
         if (( count_alloc >= expected )); then
             return 0
         fi
@@ -645,7 +1146,7 @@ wait_for_host_maap_ready() {
     done
 
     log_startup_note "Host MAAP readiness timeout after ${timeout}s (${count_alloc}/${expected} allocations observed)."
-    log_startup_note "AVDECC may advertise placeholder destination MACs until MAAP settles."
+    log_startup_note "AVDECC may expose incomplete talker stream info until MAAP settles."
     return 0
 }
 
@@ -853,6 +1354,39 @@ read_current_ring_value() {
     '
 }
 
+read_current_channel_value() {
+    local iface="$1"
+    local key="$2"
+    "$ETHTOOL_BIN" -l "$iface" 2>/dev/null | awk -v key="$key" '
+        /^Current hardware settings:/ { in_current = 1; next }
+        in_current {
+            gsub(/^[[:space:]]+/, "", $0)
+            if ($1 == key ":") {
+                print $2
+                exit
+            }
+        }
+    '
+}
+
+read_ethtool_named_value() {
+    local subcmd="$1"
+    local iface="$2"
+    local key="$3"
+    "$ETHTOOL_BIN" "$subcmd" "$iface" 2>/dev/null | awk -F':' -v key="$key" '
+        {
+            lhs = $1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", lhs)
+            if (lhs == key) {
+                rhs = $2
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", rhs)
+                print rhs
+                exit
+            }
+        }
+    '
+}
+
 log_system_command() {
     {
         printf '$'
@@ -877,6 +1411,19 @@ run_ethtool_step() {
     }
 }
 
+log_system_note() {
+    printf '%s\n' "$1" >>"$SYSTEM_LOG"
+}
+
+cleanup_tc_state() {
+    local iface="${IFACE_DAEMONS:-}"
+    [[ -z "$iface" || -z "${TC_BIN:-}" ]] && return 0
+
+    "$TC_BIN" filter del dev "$iface" egress >/dev/null 2>&1 || true
+    "$TC_BIN" filter del dev "$iface" ingress >/dev/null 2>&1 || true
+    "$TC_BIN" qdisc del dev "$iface" clsact >/dev/null 2>&1 || true
+}
+
 verify_ring_buffers() {
     local current_rx current_tx
     current_rx="$(read_current_ring_value "$RING_IFACE" "RX")"
@@ -895,6 +1442,10 @@ verify_ring_buffers() {
 }
 
 ensure_nic_tuning() {
+    local eee_status rx_usecs tx_usecs ring_rx ring_tx
+    local tso_state gso_state gro_state lro_state rxvlan_state txvlan_state
+    local pause_autoneg pause_rx pause_tx combined
+
     if ! nic_tune_enabled; then
         [[ "${NIC_TUNE,,}" == "auto" ]] && printf "NIC Tune - skipped.\n"
         return 0
@@ -912,17 +1463,87 @@ ensure_nic_tuning() {
         log_system_command "$ETHTOOL_BIN" -l "$RING_IFACE"
     } >>"$SYSTEM_LOG" 2>&1
 
-    run_ethtool_step "disable eee" --set-eee "$RING_IFACE" eee off
-    run_ethtool_step "disable coalescing" -C "$RING_IFACE" rx-usecs "$NIC_COALESCE_RX_USECS" tx-usecs "$NIC_COALESCE_TX_USECS"
-    run_ethtool_step "set ring" -G "$RING_IFACE" rx "$RING_RX_TARGET" tx "$RING_TX_TARGET"
-    run_ethtool_step "disable tso" -K "$RING_IFACE" tso off
-    run_ethtool_step "disable gso" -K "$RING_IFACE" gso off
-    run_ethtool_step "disable gro" -K "$RING_IFACE" gro off
-    run_ethtool_step "disable lro" -K "$RING_IFACE" lro off
-    run_ethtool_step "disable rxvlan" -K "$RING_IFACE" rxvlan off
-    run_ethtool_step "disable txvlan" -K "$RING_IFACE" txvlan off
-    run_ethtool_step "disable pause frames" -A "$RING_IFACE" rx off tx off
-    run_ethtool_step "set combined queues" -L "$RING_IFACE" combined "$NIC_COMBINED_QUEUES"
+    eee_status="$(read_ethtool_named_value --show-eee "$RING_IFACE" "EEE status")"
+    if [[ -z "$eee_status" || "${eee_status,,}" != "disabled" ]]; then
+        run_ethtool_step "disable eee" --set-eee "$RING_IFACE" eee off
+    else
+        log_system_note "[disable eee] already disabled; skipping"
+    fi
+
+    rx_usecs="$(read_ethtool_named_value -c "$RING_IFACE" "rx-usecs")"
+    tx_usecs="$(read_ethtool_named_value -c "$RING_IFACE" "tx-usecs")"
+    if [[ -z "$rx_usecs" || -z "$tx_usecs" || "$rx_usecs" != "$NIC_COALESCE_RX_USECS" || "$tx_usecs" != "$NIC_COALESCE_TX_USECS" ]]; then
+        run_ethtool_step "disable coalescing" -C "$RING_IFACE" rx-usecs "$NIC_COALESCE_RX_USECS" tx-usecs "$NIC_COALESCE_TX_USECS"
+    else
+        log_system_note "[disable coalescing] already rx-usecs=$rx_usecs tx-usecs=$tx_usecs; skipping"
+    fi
+
+    ring_rx="$(read_current_ring_value "$RING_IFACE" "RX")"
+    ring_tx="$(read_current_ring_value "$RING_IFACE" "TX")"
+    if [[ -z "$ring_rx" || -z "$ring_tx" || "$ring_rx" != "$RING_RX_TARGET" || "$ring_tx" != "$RING_TX_TARGET" ]]; then
+        run_ethtool_step "set ring" -G "$RING_IFACE" rx "$RING_RX_TARGET" tx "$RING_TX_TARGET"
+    else
+        log_system_note "[set ring] already rx=$ring_rx tx=$ring_tx; skipping"
+    fi
+
+    tso_state="$(read_ethtool_named_value -k "$RING_IFACE" "tcp-segmentation-offload")"
+    if [[ -z "$tso_state" || "${tso_state,,}" != "off" ]]; then
+        run_ethtool_step "disable tso" -K "$RING_IFACE" tso off
+    else
+        log_system_note "[disable tso] already off; skipping"
+    fi
+
+    gso_state="$(read_ethtool_named_value -k "$RING_IFACE" "generic-segmentation-offload")"
+    if [[ -z "$gso_state" || "${gso_state,,}" != "off" ]]; then
+        run_ethtool_step "disable gso" -K "$RING_IFACE" gso off
+    else
+        log_system_note "[disable gso] already off; skipping"
+    fi
+
+    gro_state="$(read_ethtool_named_value -k "$RING_IFACE" "generic-receive-offload")"
+    if [[ -z "$gro_state" || "${gro_state,,}" != "off" ]]; then
+        run_ethtool_step "disable gro" -K "$RING_IFACE" gro off
+    else
+        log_system_note "[disable gro] already off; skipping"
+    fi
+
+    lro_state="$(read_ethtool_named_value -k "$RING_IFACE" "large-receive-offload")"
+    if [[ -z "$lro_state" || "${lro_state,,}" != "off [fixed]" && "${lro_state,,}" != "off" ]]; then
+        run_ethtool_step "disable lro" -K "$RING_IFACE" lro off
+    else
+        log_system_note "[disable lro] already off; skipping"
+    fi
+
+    rxvlan_state="$(read_ethtool_named_value -k "$RING_IFACE" "rx-vlan-offload")"
+    if [[ -z "$rxvlan_state" || "${rxvlan_state,,}" != "off" ]]; then
+        run_ethtool_step "disable rxvlan" -K "$RING_IFACE" rxvlan off
+    else
+        log_system_note "[disable rxvlan] already off; skipping"
+    fi
+
+    txvlan_state="$(read_ethtool_named_value -k "$RING_IFACE" "tx-vlan-offload")"
+    if [[ -z "$txvlan_state" || "${txvlan_state,,}" != "off" ]]; then
+        run_ethtool_step "disable txvlan" -K "$RING_IFACE" txvlan off
+    else
+        log_system_note "[disable txvlan] already off; skipping"
+    fi
+
+    pause_autoneg="$(read_ethtool_named_value -a "$RING_IFACE" "Autonegotiate")"
+    pause_rx="$(read_ethtool_named_value -a "$RING_IFACE" "RX")"
+    pause_tx="$(read_ethtool_named_value -a "$RING_IFACE" "TX")"
+    if [[ -z "$pause_autoneg" || -z "$pause_rx" || -z "$pause_tx" || "${pause_autoneg,,}" != "off" || "${pause_rx,,}" != "off" || "${pause_tx,,}" != "off" ]]; then
+        run_ethtool_step "disable pause frames" -A "$RING_IFACE" autoneg off rx off tx off
+    else
+        log_system_note "[disable pause frames] already autoneg=$pause_autoneg rx=$pause_rx tx=$pause_tx; skipping"
+    fi
+
+    combined="$(read_current_channel_value "$RING_IFACE" "Combined")"
+    if [[ -z "$combined" || "$combined" != "$NIC_COMBINED_QUEUES" ]]; then
+        run_ethtool_step "set combined queues" -L "$RING_IFACE" combined "$NIC_COMBINED_QUEUES"
+    else
+        log_system_note "[set combined queues] already combined=$combined; skipping"
+    fi
+
     verify_ring_buffers
 
     {
@@ -934,6 +1555,13 @@ ensure_nic_tuning() {
         log_system_command "$ETHTOOL_BIN" -a "$RING_IFACE"
         log_system_command "$ETHTOOL_BIN" -l "$RING_IFACE"
     } >>"$SYSTEM_LOG" 2>&1
+
+    pause_autoneg="$(read_ethtool_named_value -a "$RING_IFACE" "Autonegotiate")"
+    pause_rx="$(read_ethtool_named_value -a "$RING_IFACE" "RX")"
+    pause_tx="$(read_ethtool_named_value -a "$RING_IFACE" "TX")"
+    if [[ -n "$pause_autoneg" && -n "$pause_rx" && -n "$pause_tx" && ( "${pause_autoneg,,}" != "off" || "${pause_rx,,}" != "off" || "${pause_tx,,}" != "off" ) ]]; then
+        log_system_note "WARNING: pause frames remain autoneg=$pause_autoneg rx=$pause_rx tx=$pause_tx on $RING_IFACE after NIC tuning."
+    fi
 
     progress_finish
 }
@@ -948,6 +1576,7 @@ require_files() {
     reorder_crf_inis_last
     build_ini_args
     validate_stream_ids_and_dests
+    validate_dynamic_addressing_requirements
     collect_expected_uids
     collect_expected_maap_uids
     local missing=0
@@ -968,6 +1597,8 @@ require_files() {
     if [[ $missing -ne 0 ]]; then
         exit 1
     fi
+
+    compute_shaper_presets_from_inis
 }
 
 require_bins() {
@@ -1054,7 +1685,28 @@ build_mrpd_profile_if_requested() {
 
 stop_session() {
     local sess="$1"
+    local i
+
+    tmux has-session -t "$sess" 2>/dev/null || return 0
+
+    tmux send-keys -t "$sess" C-c 2>/dev/null || true
+    for ((i=0; i<TMUX_STOP_GRACE_SEC; i++)); do
+        tmux has-session -t "$sess" 2>/dev/null || return 0
+        sleep 1
+    done
+
     tmux kill-session -t "$sess" 2>/dev/null || true
+}
+
+session_up() {
+    local sess="$1"
+    tmux has-session -t "$sess" 2>/dev/null
+}
+
+reset_log_file() {
+    local log_path="$1"
+    mkdir -p "$(dirname "$log_path")"
+    : >"$log_path"
 }
 
 wait_for_process_name_exit() {
@@ -1140,40 +1792,115 @@ print_component_status() {
     printf "    %-10s session=%-4s proc=%-4s pids=%s\n" "$label" "$session_state" "$proc_state" "$pids"
 }
 
-stop_stack() {
+stop_profile_stack() {
     stop_session "$SESS_HOST"
+    if [[ "$HOST_STOP_SETTLE_SEC" -gt 0 ]]; then
+        sleep "$HOST_STOP_SETTLE_SEC"
+    fi
     stop_session "$SESS_AVDECC"
-    stop_session "$SESS_SHAPER"
+
+    # Also stop non-tmux leftovers to keep stream-layer runs deterministic.
+    pkill -f "[o]penavb_avdecc -I $IFACE_AVDECC" 2>/dev/null || true
+    pkill -f "[o]penavb_host -I $IFACE_HOST" 2>/dev/null || true
+}
+
+stop_all_stack() {
+    stop_profile_stack
     stop_session "$SESS_MAAP"
     stop_session "$SESS_MRPD_WATCH"
     stop_session "$SESS_MRPD"
+    stop_session "$SESS_SHAPER"
     stop_session "$SESS_PHC2SYS"
     stop_session "$SESS_GPTP"
 
     # Also stop non-tmux leftovers to keep runs deterministic.
+    pkill -f "[m]aap_daemon -i $IFACE_DAEMONS" 2>/dev/null || true
+    pkill -f "[m]rpd .* -i $IFACE_DAEMONS" 2>/dev/null || true
     terminate_process_name "daemon_cl" || true
     terminate_process_name "phc2sys" || true
-    pkill -f "[m]rpd .* -i $IFACE_DAEMONS" 2>/dev/null || true
-    pkill -f "[m]aap_daemon -i $IFACE_DAEMONS" 2>/dev/null || true
     pkill -f "[s]haper_daemon" 2>/dev/null || true
-    pkill -f "[o]penavb_avdecc -I $IFACE_AVDECC" 2>/dev/null || true
-    pkill -f "[o]penavb_host -I $IFACE_HOST" 2>/dev/null || true
+    cleanup_tc_state
+    clear_infra_state
+}
+
+stop_stack() {
+    if persistent_infra_enabled; then
+        stop_profile_stack
+    else
+        stop_all_stack
+    fi
+
+    if [[ "$POST_STOP_SETTLE_SEC" -gt 0 ]]; then
+        sleep "$POST_STOP_SETTLE_SEC"
+    fi
 }
 
 start_stack() {
     local profile="${STACK_PROFILE,,}"
     local ini_entry
+    local reuse_persistent_infra=0
+    local infra_recycle_reason=""
 
     require_files
     build_mrpd_profile_if_requested
     require_bins
-    stop_stack
+    if persistent_infra_enabled; then
+        if persistent_infra_running; then
+            if infra_state_matches; then
+                reuse_persistent_infra=1
+                stop_profile_stack
+            else
+                infra_recycle_reason="Persistent Milan infra does not match requested run config; recycling seeded infrastructure."
+                stop_all_stack
+            fi
+        else
+            clear_infra_state
+            stop_profile_stack
+        fi
+    else
+        stop_all_stack
+    fi
+
+    if [[ "$POST_STOP_SETTLE_SEC" -gt 0 ]]; then
+        sleep "$POST_STOP_SETTLE_SEC"
+    fi
+
     cleanup_ipc_paths
 
     mkdir -p "$LOG_DIR"
-    rm -f \
-        "$SYSTEM_LOG" "$GPTP_LOG" "$PHC2SYS_LOG" "$MRPD_LOG" "$MAAP_LOG" "$SHAPER_LOG" \
-        "$AVDECC_LOG" "$HOST_LOG" "$MRPD_TALKER_FAILED_LOG"
+    reset_log_file "$SYSTEM_LOG"
+    reset_log_file "$HOST_LOG"
+    reset_log_file "$AVDECC_LOG"
+    if persistent_infra_enabled && session_up "$SESS_GPTP"; then
+        reset_log_file "$GPTP_LOG"
+    else
+        rm -f "$GPTP_LOG"
+    fi
+    if persistent_infra_enabled && session_up "$SESS_PHC2SYS"; then
+        reset_log_file "$PHC2SYS_LOG"
+    else
+        rm -f "$PHC2SYS_LOG"
+    fi
+    if persistent_infra_enabled && session_up "$SESS_SHAPER"; then
+        reset_log_file "$SHAPER_LOG"
+    else
+        rm -f "$SHAPER_LOG"
+    fi
+    if persistent_infra_enabled && session_up "$SESS_MRPD"; then
+        reset_log_file "$MRPD_LOG"
+    else
+        rm -f "$MRPD_LOG"
+    fi
+    if persistent_infra_enabled && session_up "$SESS_MRPD_WATCH"; then
+        reset_log_file "$MRPD_TALKER_FAILED_LOG"
+    else
+        rm -f "$MRPD_TALKER_FAILED_LOG"
+    fi
+    if persistent_infra_enabled && session_up "$SESS_MAAP"; then
+        reset_log_file "$MAAP_LOG"
+    else
+        rm -f "$MAAP_LOG"
+    fi
 
     if ! parse_openavb_log_level "$HOST_LOG_LEVEL" >/dev/null 2>&1; then
         echo "ERROR: Invalid HOST_LOG_LEVEL='$HOST_LOG_LEVEL'. Use none|error|warning|info|status|debug|verbose or 0-6." >&2
@@ -1185,68 +1912,19 @@ start_stack() {
     fi
 
     printf "Starting %s.\n" "$profile"
+    if (( reuse_persistent_infra )); then
+        log_system_note "Reusing persistent Milan infra from $INFRA_STATE_FILE."
+    elif [[ -n "$infra_recycle_reason" ]]; then
+        log_system_note "$infra_recycle_reason"
+    fi
     run_pre_start_checks
 
-    if [[ "$RUN_GPTP" == "1" ]]; then
-        progress_begin "gPTP"
-        start_session "$SESS_GPTP" \
-            "cd $GPTP_CWD && exec $GPTP_BIN $IFACE_DAEMONS $GPTP_ARGS >>$GPTP_LOG 2>&1"
-        if ! wait_for_gptp_ready; then
-            stop_stack
-            return 1
-        fi
-        progress_finish
-    fi
-    if phc2sys_enabled; then
-        local phc2sys_bin_q phc2sys_log_q phc2sys_tmp_q
-        printf -v phc2sys_bin_q '%q' "$PHC2SYS_BIN"
-        printf -v phc2sys_log_q '%q' "$PHC2SYS_LOG"
-        printf -v phc2sys_tmp_q '%q' "${PHC2SYS_LOG}.tmp"
-        progress_begin "phc2sys"
-        start_session "$SESS_PHC2SYS" \
-            "count=0; : > $phc2sys_log_q; stdbuf -oL -eL $phc2sys_bin_q $PHC2SYS_ARGS 2>&1 | while IFS= read -r line; do printf '%s\n' \"\$line\" >>$phc2sys_log_q; count=\$((count + 1)); if (( $PHC2SYS_LOG_TRIM_EVERY > 0 && count % $PHC2SYS_LOG_TRIM_EVERY == 0 )); then tail -n $PHC2SYS_LOG_MAX_LINES $phc2sys_log_q > $phc2sys_tmp_q && mv $phc2sys_tmp_q $phc2sys_log_q; fi; done"
-        if ! wait_for_phc2sys_ready; then
-            stop_stack
-            return 1
-        fi
-        progress_finish
-    fi
-    if [[ "$RUN_MRPD" == "1" ]]; then
-        local mrpd_log_switch
-        if [[ -n "$MRPD_LOG_FLAGS" ]]; then
-            mrpd_log_switch="-${MRPD_LOG_FLAGS}"
-        else
-            mrpd_log_switch=""
-        fi
-        progress_begin "MRPD"
-        start_session "$SESS_MRPD" \
-            "exec stdbuf -oL -eL $MRPD_BIN $mrpd_log_switch -i $IFACE_DAEMONS $MRPD_ARGS >>$MRPD_LOG 2>&1"
-        if ! wait_for_mrpd_srp_ready; then
-            stop_stack
-            return 1
-        fi
-        progress_finish
-        if [[ "$RUN_MRPD_WATCH" == "1" ]]; then
-            progress_begin "MRPD Watch"
-            start_session "$SESS_MRPD_WATCH" \
-                "exec stdbuf -oL tail -n0 -F $MRPD_LOG 2>/dev/null | stdbuf -oL rg --line-buffered 'TALKER FAILED' | stdbuf -oL sed -n 's/^MRPD \\([0-9][0-9]*\\.[0-9][0-9]*\\).*$/\\1/p' >>$MRPD_TALKER_FAILED_LOG 2>&1"
-            progress_tick
-            progress_finish
-        fi
-    fi
-    if [[ "$RUN_MAAP" == "1" ]]; then
-        progress_begin "MAAP Daemon"
-        start_session "$SESS_MAAP" \
-            "exec $MAAP_BIN -i $IFACE_DAEMONS $MAAP_ARGS >>$MAAP_LOG 2>&1"
-        sleep 1
-        progress_tick
-        progress_finish
-    fi
     if [[ "$RUN_SHAPER" == "1" ]]; then
         local shaper_env
         shaper_env="SHAPER_TC_LOG=$(printf '%q' "$SHAPER_TC_LOG")"
         [[ -n "$SHAPER_SKIP_ROOT_QDISC" ]] && shaper_env+=" SHAPER_SKIP_ROOT_QDISC=$(printf '%q' "$SHAPER_SKIP_ROOT_QDISC")"
         [[ -n "$SHAPER_LINK_SPEED_MBPS" ]] && shaper_env+=" SHAPER_LINK_SPEED_MBPS=$(printf '%q' "$SHAPER_LINK_SPEED_MBPS")"
+        [[ -n "$SHAPER_INIT_IFACE" ]] && shaper_env+=" SHAPER_INIT_IFACE=$(printf '%q' "$SHAPER_INIT_IFACE")"
         [[ -n "$SHAPER_CLASSA_PARENT" ]] && shaper_env+=" SHAPER_CLASSA_PARENT=$(printf '%q' "$SHAPER_CLASSA_PARENT")"
         [[ -n "$SHAPER_CLASSB_PARENT" ]] && shaper_env+=" SHAPER_CLASSB_PARENT=$(printf '%q' "$SHAPER_CLASSB_PARENT")"
         [[ -n "$SHAPER_CLASSA_HANDLE" ]] && shaper_env+=" SHAPER_CLASSA_HANDLE=$(printf '%q' "$SHAPER_CLASSA_HANDLE")"
@@ -1269,9 +1947,84 @@ start_stack() {
         [[ -n "$SHAPER_MQPRIO_HW" ]] && shaper_env+=" SHAPER_MQPRIO_HW=$(printf '%q' "$SHAPER_MQPRIO_HW")"
         [[ -n "$SHAPER_TC_MAP" ]] && shaper_env+=" SHAPER_TC_MAP=$(printf '%q' "$SHAPER_TC_MAP")"
         progress_begin "Shaper"
-        start_session "$SESS_SHAPER" \
-            "exec env $shaper_env $SHAPER_BIN $SHAPER_ARGS >>$SHAPER_LOG 2>&1"
-        sleep 1
+        if persistent_infra_enabled && session_up "$SESS_SHAPER"; then
+            progress_tick
+        else
+            start_session "$SESS_SHAPER" \
+                "exec env $shaper_env $SHAPER_BIN $SHAPER_ARGS >>$SHAPER_LOG 2>&1"
+            sleep 1
+            progress_tick
+        fi
+        progress_finish
+    fi
+
+    if [[ "$RUN_GPTP" == "1" ]]; then
+        progress_begin "gPTP"
+        if ! ( persistent_infra_enabled && session_up "$SESS_GPTP" ); then
+            start_session "$SESS_GPTP" \
+                "cd $GPTP_CWD && exec $GPTP_BIN $IFACE_DAEMONS $GPTP_ARGS >>$GPTP_LOG 2>&1"
+        fi
+        if ! wait_for_gptp_ready; then
+            stop_all_stack
+            return 1
+        fi
+        progress_finish
+    fi
+    if phc2sys_enabled; then
+        local phc2sys_bin_q phc2sys_log_q phc2sys_tmp_q
+        printf -v phc2sys_bin_q '%q' "$PHC2SYS_BIN"
+        printf -v phc2sys_log_q '%q' "$PHC2SYS_LOG"
+        printf -v phc2sys_tmp_q '%q' "${PHC2SYS_LOG}.tmp"
+        progress_begin "phc2sys"
+        if ! ( persistent_infra_enabled && session_up "$SESS_PHC2SYS" ); then
+            start_session "$SESS_PHC2SYS" \
+                "count=0; : > $phc2sys_log_q; stdbuf -oL -eL $phc2sys_bin_q $PHC2SYS_ARGS 2>&1 | while IFS= read -r line; do printf '%s\n' \"\$line\" >>$phc2sys_log_q; count=\$((count + 1)); if (( $PHC2SYS_LOG_TRIM_EVERY > 0 && count % $PHC2SYS_LOG_TRIM_EVERY == 0 )); then tail -n $PHC2SYS_LOG_MAX_LINES $phc2sys_log_q > $phc2sys_tmp_q && mv $phc2sys_tmp_q $phc2sys_log_q; fi; done"
+        fi
+        if ! wait_for_phc2sys_ready; then
+            stop_all_stack
+            return 1
+        fi
+        progress_finish
+    fi
+    if persistent_infra_enabled; then
+        write_infra_state
+    else
+        clear_infra_state
+    fi
+    if [[ "$RUN_MRPD" == "1" ]]; then
+        local mrpd_log_switch
+        if [[ -n "$MRPD_LOG_FLAGS" ]]; then
+            mrpd_log_switch="-${MRPD_LOG_FLAGS}"
+        else
+            mrpd_log_switch=""
+        fi
+        progress_begin "MRPD"
+        if ! ( persistent_infra_enabled && session_up "$SESS_MRPD" ); then
+            start_session "$SESS_MRPD" \
+                "exec stdbuf -oL -eL $MRPD_BIN $mrpd_log_switch -i $IFACE_DAEMONS $MRPD_ARGS >>$MRPD_LOG 2>&1"
+        fi
+        if ! wait_for_mrpd_srp_ready; then
+            stop_all_stack
+            return 1
+        fi
+        progress_finish
+        if [[ "$RUN_MRPD_WATCH" == "1" ]]; then
+            progress_begin "MRPD Watch"
+            if ! ( persistent_infra_enabled && session_up "$SESS_MRPD_WATCH" ); then
+                start_session "$SESS_MRPD_WATCH" \
+                    "exec stdbuf -oL tail -n0 -F $MRPD_LOG 2>/dev/null | stdbuf -oL rg --line-buffered 'TALKER FAILED' | stdbuf -oL sed -n 's/^MRPD \\([0-9][0-9]*\\.[0-9][0-9]*\\).*$/\\1/p' >>$MRPD_TALKER_FAILED_LOG 2>&1"
+            fi
+            progress_tick
+            progress_finish
+        fi
+    fi
+    if [[ "$RUN_MAAP" == "1" ]]; then
+        progress_begin "MAAP Daemon"
+        if ! ( persistent_infra_enabled && session_up "$SESS_MAAP" ); then
+            start_session "$SESS_MAAP" \
+                "exec $MAAP_BIN -i $IFACE_DAEMONS $MAAP_ARGS >>$MAAP_LOG 2>&1"
+            sleep 1
+        fi
         progress_tick
         progress_finish
     fi
@@ -1386,6 +2139,9 @@ start_stack() {
 
 status_stack() {
     apply_stack_profile
+    reorder_crf_inis_last
+    build_ini_args
+    compute_shaper_presets_from_inis 0
 
     echo "Status"
     print_kv "Profile" "${STACK_PROFILE,,}"
@@ -1394,6 +2150,8 @@ status_stack() {
     print_kv "Daemon iface" "$IFACE_DAEMONS"
     print_kv "State INI" "$ACTIVE_ENDPOINT_SAVE_INI"
     print_kv "Host log level" "$HOST_LOG_LEVEL"
+    print_kv "Infra mode" "$(persistent_infra_enabled && printf 'persistent' || printf 'ephemeral')"
+    [[ -n "$SHAPER_PRESET_SUMMARY" ]] && print_kv "INI class load" "$SHAPER_PRESET_SUMMARY"
     echo "  Components:"
     [[ "$RUN_GPTP" == "1" ]] && print_component_status "gPTP" "$SESS_GPTP" "[d]aemon_cl"
     phc2sys_enabled && print_component_status "phc2sys" "$SESS_PHC2SYS" "[p]hc2sys( |$)"
@@ -1471,6 +2229,10 @@ case "$cmd" in
     restart)
         stop_stack
         start_stack
+        ;;
+    infra-stop)
+        stop_all_stack
+        cleanup_ipc_paths
         ;;
     status)
         status_stack

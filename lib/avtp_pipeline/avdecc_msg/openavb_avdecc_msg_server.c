@@ -133,6 +133,17 @@ static bool openavbAvdeccMsgCountersAffectStreamState(
 		pPrevious->media_unlocked != pCurrent->media_unlocked);
 }
 
+static bool openavbAvdeccMsgCountersChanged(
+	const openavb_avtp_diag_counters_t *pPrevious,
+	const openavb_avtp_diag_counters_t *pCurrent)
+{
+	if (!pPrevious || !pCurrent) {
+		return FALSE;
+	}
+
+	return memcmp(pPrevious, pCurrent, sizeof(*pPrevious)) != 0;
+}
+
 static void openavbAvdeccMsgSrvrSyncInitialClockSourceToClient(
 	int avdeccMsgHandle,
 	openavb_tl_data_cfg_t *pStream)
@@ -457,6 +468,7 @@ bool openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(int avdeccMsgHandle, const
 	avdecc_msg_state_t *pState = AvdeccMsgStateListGet(avdeccMsgHandle);
 	openavb_avtp_diag_counters_t previousCounters;
 	bool notifyStreamState = FALSE;
+	bool notifyCounters = FALSE;
 
 	if (!pState) {
 		AVB_LOGF_ERROR("avdeccMsgHandle %d not valid", avdeccMsgHandle);
@@ -468,9 +480,10 @@ bool openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(int avdeccMsgHandle, const
 
 	previousCounters = pState->counters;
 	pState->counters = *pCounters;
+	notifyCounters = openavbAvdeccMsgCountersChanged(&previousCounters, pCounters);
 	notifyStreamState = openavbAvdeccMsgCountersAffectStreamState(&previousCounters, pCounters);
 
-	if (notifyStreamState && pState->stream) {
+	if ((notifyStreamState || notifyCounters) && pState->stream) {
 		U16 descriptorType = OPENAVB_AEM_DESCRIPTOR_INVALID;
 		U16 descriptorIndex = OPENAVB_AEM_DESCRIPTOR_INVALID;
 		openavb_aem_descriptor_stream_io_t *pDescriptor = openavbAvdeccMsgFindStreamDescriptor(
@@ -479,7 +492,13 @@ bool openavbAvdeccMsgSrvrHndlCountersUpdateFromClient(int avdeccMsgHandle, const
 			&descriptorType,
 			&descriptorIndex);
 		if (pDescriptor) {
-			openavbAecpSMEntityModelEntityNotifyStreamState(descriptorType, descriptorIndex);
+			if (notifyStreamState) {
+				openavbAecpSMEntityModelEntityNotifyStreamState(descriptorType, descriptorIndex);
+			}
+			else if (descriptorType == OPENAVB_AEM_DESCRIPTOR_STREAM_INPUT ||
+					descriptorType == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+				openavbAecpSMEntityModelEntityNotifyCounters(descriptorType, descriptorIndex);
+			}
 		}
 	}
 
