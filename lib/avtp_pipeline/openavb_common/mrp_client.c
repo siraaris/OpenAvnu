@@ -117,6 +117,17 @@ static void log_listener_askfailed_line(
 		line);
 }
 
+static int is_zero_streamid(const unsigned char streamid[8])
+{
+	int i;
+	for (i = 0; i < 8; ++i) {
+		if (streamid[i] != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
 static void log_talker_failed_line(
 	const char *buf,
 	int buflen,
@@ -241,6 +252,10 @@ int process_mrp_msg(char *buf, int buflen)
 				 recovered_streamid[2], recovered_streamid[3],
 				 recovered_streamid[4], recovered_streamid[5],
 				 recovered_streamid[6], recovered_streamid[7]);
+			if (is_zero_streamid(recovered_streamid)) {
+				AVB_LOG_DEBUG("Ignoring listener attribute with zero stream ID");
+				break;
+			}
 			switch (substate) {
 			case 0:
 				AVB_LOG_DEBUG("with state ignore");
@@ -355,6 +370,10 @@ int process_mrp_msg(char *buf, int buflen)
 					 recovered_streamid[2], recovered_streamid[3],
 					 recovered_streamid[4], recovered_streamid[5],
 					 recovered_streamid[6], recovered_streamid[7]);
+				if (is_zero_streamid(recovered_streamid)) {
+					AVB_LOG_DEBUG("Ignoring listener event with zero stream ID");
+					break;
+				}
 				switch (substate) {
 				case 0:
 					AVB_LOG_DEBUG("with state ignore");

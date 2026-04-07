@@ -333,11 +333,12 @@ openavbRC strmAttachCb(void* pv,
 		ps->lastLsnrDeclTsNs = nowNs;
 	}
 
-	// Treat Asking_Failed as transient listener presence to avoid tearing down
-	// active talker queues during short SRP churn windows.
+	// Treat Asking_Failed as transient listener presence only after queues have
+	// already been established. Starting a new talker on Asking_Failed races SRP
+	// and qdisc setup during startup.
 	if (lsnrDecl == openavbSrp_LDSt_Ready
 		|| lsnrDecl == openavbSrp_LDSt_Ready_Failed
-		|| lsnrDecl == openavbSrp_LDSt_Asking_Failed)
+		|| (lsnrDecl == openavbSrp_LDSt_Asking_Failed && ps->fwmark != INVALID_FWMARK))
 	{
 		// Somebody is listening - get ready to stream
 

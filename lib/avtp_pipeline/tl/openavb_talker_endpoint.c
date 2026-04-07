@@ -129,8 +129,7 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 
 	if (!pTLState->bStreaming) {
 		if (lsnrDecl == openavbSrp_LDSt_Ready
-			|| lsnrDecl == openavbSrp_LDSt_Ready_Failed
-			|| lsnrDecl == openavbSrp_LDSt_Asking_Failed) {
+			|| lsnrDecl == openavbSrp_LDSt_Ready_Failed) {
 
 			updateTalkerStreamParamsFromEndpoint(
 				pCfg, pTalkerData, streamID, ifname, destAddr, srClass, classRate, vlanID, priority, fwmark);

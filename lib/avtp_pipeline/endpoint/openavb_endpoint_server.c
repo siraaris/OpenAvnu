@@ -272,16 +272,23 @@ bool openavbEptSrvrRegisterStream(int h,
 			max_frames_per_interval = 1;
 		}
 
-		ps->hndShaper = openavbShaperHandle(
-			ps->srClass,
-			measurement_interval,
-			tSpec->maxFrameSize + 18 /* Header size */,
-			max_frames_per_interval,
-			ps->destAddr);
-		if (!ps->hndShaper) {
-			AVB_LOG_ERROR("Unable to start Shaping");
+			ps->hndShaper = openavbShaperHandle(
+				ps->srClass,
+				measurement_interval,
+				tSpec->maxFrameSize + 18 /* Header size */,
+				max_frames_per_interval,
+				ps->destAddr);
+			if (!ps->hndShaper) {
+				AVB_LOG_ERROR("Unable to start Shaping; aborting talker registration");
+				if (ps->hndMaap) {
+					openavbMaapRelease(ps->hndMaap);
+					ps->hndMaap = NULL;
+				}
+				delStream(ps);
+				AVB_TRACE_EXIT(AVB_TRACE_ENDPOINT);
+				return FALSE;
+			}
 		}
-	}
 
 	// Do SRP talker register
 	AVB_LOGF_DEBUG("REGISTER: ps=%p, streamID=%d, tspec=%d,%d, srClass=%d, srRank=%d, latency=%d, tsRate=%d, da="ETH_FORMAT"",

@@ -31,6 +31,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -53,6 +54,8 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
  ******************************************************************************/
 
 #define STREAMDA_LENGTH 18
+#define SHAPER_RESPONSE_BUFFER_SIZE 512
+#define SHAPER_COMMAND_TIMEOUT_MSEC 5000
 
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
@@ -64,6 +67,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 typedef struct shaper_reservation
 {
 	int in_use;
+	int confirmed;
 	SRClassIdx_t sr_class;
 	int measurement_interval; // microseconds
 	int max_frame_size; // bytes
@@ -79,6 +83,12 @@ static shaper_reservation shaperReservationList[MAX_SHAPER_RESERVATIONS];
 static bool shaperRunning = FALSE;
 static pthread_t shaperThreadHandle;
 static void* shaperThread(void *arg);
+
+typedef enum shaperCommandType_t {
+	SHAPER_COMMAND_NONE = 0,
+	SHAPER_COMMAND_RESERVE,
+	SHAPER_COMMAND_RELEASE,
+} shaperCommandType_t;
 
 enum shaperState_t {
 	SHAPER_STATE_UNKNOWN,
@@ -99,6 +109,241 @@ static MUTEX_HANDLE(shaperMutex);
 #define SHAPER_LOCK() { MUTEX_CREATE_ERR(); MUTEX_LOCK(shaperMutex); MUTEX_LOG_ERR("Mutex lock failure"); }
 #define SHAPER_UNLOCK() { MUTEX_CREATE_ERR(); MUTEX_UNLOCK(shaperMutex); MUTEX_LOG_ERR("Mutex unlock failure"); }
 
+static shaperCommandType_t shaperCommandType = SHAPER_COMMAND_NONE;
+static shaper_reservation *shaperCommandReservation = NULL;
+static bool shaperCommandPending = FALSE;
+static bool shaperCommandSuccess = FALSE;
+static char shaperCommandDetail[200];
+
+static bool shaperHasActiveReservationsLocked(void)
+{
+	int i;
+	for (i = 0; i < MAX_SHAPER_RESERVATIONS; ++i) {
+		if (shaperReservationList[i].in_use) {
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void shaperCommandSetResultLocked(bool success, const char *detail)
+{
+	shaperCommandPending = FALSE;
+	shaperCommandSuccess = success;
+	if (detail) {
+		snprintf(shaperCommandDetail, sizeof(shaperCommandDetail), "%s", detail);
+	}
+	else {
+		shaperCommandDetail[0] = '\0';
+	}
+}
+
+static void shaperCommandFailLocked(const char *detail)
+{
+	if (!shaperCommandPending) {
+		return;
+	}
+	if (shaperCommandType == SHAPER_COMMAND_RESERVE && shaperCommandReservation) {
+		shaperCommandReservation->confirmed = FALSE;
+	}
+	shaperCommandSetResultLocked(FALSE, detail);
+}
+
+static void shaperHandleResponseLine(char *line)
+{
+	char *msg = line;
+	char *resultMsg = NULL;
+
+	while (*msg == ' ' || *msg == '\t') {
+		msg++;
+	}
+	if (*msg == '\0') {
+		return;
+	}
+
+	resultMsg = strstr(msg, "RESULT:OK");
+	if (resultMsg != NULL) {
+		const char *detail = resultMsg + 9;
+		while (*detail == ' ' || *detail == '\t') {
+			detail++;
+		}
+
+		SHAPER_LOCK();
+		if (shaperCommandPending) {
+			if (shaperCommandType == SHAPER_COMMAND_RESERVE && shaperCommandReservation) {
+				shaperCommandReservation->confirmed = TRUE;
+				shaperState = SHAPER_STATE_ENABLED;
+			}
+			else if (shaperCommandType == SHAPER_COMMAND_RELEASE && shaperCommandReservation) {
+				shaperCommandReservation->confirmed = FALSE;
+				shaperCommandReservation->in_use = FALSE;
+				shaperState = shaperHasActiveReservationsLocked()
+					? SHAPER_STATE_ENABLED
+					: SHAPER_STATE_CONNECTED;
+			}
+			shaperCommandSetResultLocked(TRUE, detail);
+		}
+		SHAPER_UNLOCK();
+
+		AVB_LOGF_DEBUG("Shaper Response:  %s", resultMsg);
+		return;
+	}
+
+	resultMsg = strstr(msg, "RESULT:ERROR");
+	if (resultMsg != NULL) {
+		const char *detail = resultMsg + 12;
+		while (*detail == ' ' || *detail == '\t') {
+			detail++;
+		}
+
+		SHAPER_LOCK();
+		shaperCommandFailLocked(detail);
+		SHAPER_UNLOCK();
+
+		AVB_LOGF_ERROR("Shaper Response:  %s", resultMsg);
+		return;
+	}
+
+	if (strncmp(msg, "ERROR:", 6) == 0) {
+		AVB_LOGF_ERROR("Shaper Response:  %s", msg + 7);
+		return;
+	}
+	if (strncmp(msg, "WARNING:", 8) == 0) {
+		AVB_LOGF_WARNING("Shaper Response:  %s", msg + 9);
+		return;
+	}
+	if (strncmp(msg, "DEBUG:", 6) == 0) {
+		AVB_LOGF_DEBUG("Shaper Response:  %s", msg + 7);
+		return;
+	}
+	AVB_LOGF_DEBUG("Shaper Response:  %s", msg);
+}
+
+static void shaperProcessResponseChunk(const char *chunk, int chunkLen, char *accum, int *accumLen)
+{
+	int i;
+	int start = 0;
+
+	if (!chunk || chunkLen <= 0 || !accum || !accumLen) {
+		return;
+	}
+
+	if (*accumLen + chunkLen >= SHAPER_RESPONSE_BUFFER_SIZE) {
+		AVB_LOG_WARNING("Shaper response buffer overflow; dropping partial response");
+		*accumLen = 0;
+	}
+	if (chunkLen >= SHAPER_RESPONSE_BUFFER_SIZE) {
+		chunk += (chunkLen - (SHAPER_RESPONSE_BUFFER_SIZE - 1));
+		chunkLen = SHAPER_RESPONSE_BUFFER_SIZE - 1;
+	}
+	memcpy(accum + *accumLen, chunk, chunkLen);
+	*accumLen += chunkLen;
+	accum[*accumLen] = '\0';
+
+	for (i = 0; i < *accumLen; ++i) {
+		if (accum[i] == '\n' || accum[i] == '\r') {
+			char *line;
+			accum[i] = '\0';
+			line = &accum[start];
+			while (*line == ' ' || *line == '\t') {
+				line++;
+			}
+			if (*line) {
+				shaperHandleResponseLine(line);
+			}
+			start = i + 1;
+		}
+	}
+
+	if (start > 0) {
+		int remaining = *accumLen - start;
+		if (remaining > 0) {
+			memmove(accum, accum + start, remaining);
+		}
+		*accumLen = remaining;
+		accum[*accumLen] = '\0';
+	}
+}
+
+static bool waitForShaperCommandResult(const char *verb, const unsigned char *stream_da)
+{
+	U64 startNs = 0;
+	U64 nowNs = 0;
+	char detail[sizeof(shaperCommandDetail)];
+
+	CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &startNs);
+
+	while (TRUE) {
+		bool pending;
+		bool success;
+		enum shaperState_t state;
+
+		SHAPER_LOCK();
+		pending = shaperCommandPending;
+		success = shaperCommandSuccess;
+		state = shaperState;
+		snprintf(detail, sizeof(detail), "%s", shaperCommandDetail);
+		SHAPER_UNLOCK();
+
+		if (!pending) {
+			if (success) {
+				if (detail[0]) {
+					AVB_LOGF_INFO("Shaper %s confirmed for " ETH_FORMAT ": %s",
+						verb,
+						ETH_OCTETS(stream_da),
+						detail);
+				}
+				else {
+					AVB_LOGF_INFO("Shaper %s confirmed for " ETH_FORMAT,
+						verb,
+						ETH_OCTETS(stream_da));
+				}
+				return TRUE;
+			}
+			if (detail[0]) {
+				AVB_LOGF_ERROR("Shaper %s failed for " ETH_FORMAT ": %s",
+					verb,
+					ETH_OCTETS(stream_da),
+					detail);
+			}
+			else {
+				AVB_LOGF_ERROR("Shaper %s failed for " ETH_FORMAT,
+					verb,
+					ETH_OCTETS(stream_da));
+			}
+			return FALSE;
+		}
+
+		if (state == SHAPER_STATE_ERROR || state == SHAPER_STATE_NOT_AVAILABLE) {
+			SHAPER_LOCK();
+			shaperCommandFailLocked("daemon became unavailable while waiting for command result");
+			snprintf(detail, sizeof(detail), "%s", shaperCommandDetail);
+			SHAPER_UNLOCK();
+			AVB_LOGF_ERROR("Shaper %s failed for " ETH_FORMAT ": %s",
+				verb,
+				ETH_OCTETS(stream_da),
+				detail);
+			return FALSE;
+		}
+
+		CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &nowNs);
+		if ((nowNs - startNs) >= ((U64)SHAPER_COMMAND_TIMEOUT_MSEC * 1000000ULL)) {
+			SHAPER_LOCK();
+			shaperCommandFailLocked("timeout waiting for shaper daemon acknowledgement");
+			shaperState = SHAPER_STATE_ERROR;
+			snprintf(detail, sizeof(detail), "%s", shaperCommandDetail);
+			SHAPER_UNLOCK();
+			AVB_LOGF_ERROR("Shaper %s timed out for " ETH_FORMAT ": %s",
+				verb,
+				ETH_OCTETS(stream_da),
+				detail);
+			return FALSE;
+		}
+
+		SLEEP_MSEC(10);
+	}
+}
+
 
 /* Local function to interact with the SHAPER daemon. */
 static void* shaperThread(void *arg)
@@ -111,6 +356,8 @@ static void* shaperThread(void *arg)
 
 	char recvbuffer[200];
 	int recvbytes;
+	char recvAccum[SHAPER_RESPONSE_BUFFER_SIZE];
+	int recvAccumLen = 0;
 
 	AVB_LOG_DEBUG("Shaper Thread Starting");
 
@@ -159,7 +406,6 @@ static void* shaperThread(void *arg)
 
 	FD_ZERO(&read_fds);
 	FD_ZERO(&master);
-	FD_SET(STDIN_FILENO, &master);
 	FD_SET(socketfd, &master);
 	fdmax = socketfd;
 
@@ -173,6 +419,10 @@ static void* shaperThread(void *arg)
 
 	while (shaperRunning || shaperState == SHAPER_STATE_ENABLED)
 	{
+		if (shaperState == SHAPER_STATE_ERROR)
+		{
+			break;
+		}
 		if (!shaperRunning && shaperState == SHAPER_STATE_ENABLED)
 		{
 			// TODO:  Tell the SHAPER daemon to stop shaping.
@@ -195,26 +445,16 @@ static void* shaperThread(void *arg)
 		{
 			while ((recvbytes = recv(socketfd, recvbuffer, sizeof(recvbuffer) - 1, 0)) > 0)
 			{
-				/* Log the response data */
-				recvbuffer[recvbytes] = '\0';
-				if (strncmp(recvbuffer, "ERROR:", 6) == 0) {
-					AVB_LOGF_ERROR("Shaper Response:  %s", recvbuffer + 7);
-				}
-				else if (strncmp(recvbuffer, "WARNING:", 8) == 0) {
-					AVB_LOGF_WARNING("Shaper Response:  %s", recvbuffer + 9);
-				}
-				else if (strncmp(recvbuffer, "DEBUG:", 6) == 0) {
-					AVB_LOGF_DEBUG("Shaper Response:  %s", recvbuffer + 7);
-				}
-				else {
-					AVB_LOGF_DEBUG("Shaper Response:  %s", recvbuffer);
-				}
+				shaperProcessResponseChunk(recvbuffer, recvbytes, recvAccum, &recvAccumLen);
 			}
 			if (recvbytes == 0)
 			{
 				/* The SHAPER daemon closed the connection.  Assume it shut down, and we should too. */
 				// AVDECC_TODO:  Should we try to reconnect?
 				AVB_LOG_ERROR("Shaper daemon exited.");
+				SHAPER_LOCK();
+				shaperCommandFailLocked("shaper daemon exited");
+				SHAPER_UNLOCK();
 				shaperState = SHAPER_STATE_ERROR;
 				break;
 			}
@@ -222,6 +462,9 @@ static void* shaperThread(void *arg)
 			{
 				/* Something went wrong.  Abort! */
 				AVB_LOGF_ERROR("Shaper:  Error %d reading from network socket (%s)", errno, strerror(errno));
+				SHAPER_LOCK();
+				shaperCommandFailLocked("network read error while waiting for shaper daemon");
+				SHAPER_UNLOCK();
 				shaperState = SHAPER_STATE_ERROR;
 				break;
 			}
@@ -353,6 +596,7 @@ void* openavbShaperHandle(SRClassIdx_t sr_class, int measurement_interval_usec, 
 
 	// Fill in the information.
 	shaperReservationList[i].in_use = TRUE;
+	shaperReservationList[i].confirmed = FALSE;
 	shaperReservationList[i].sr_class = sr_class;
 	shaperReservationList[i].measurement_interval = measurement_interval_usec;
 	shaperReservationList[i].max_frame_size = max_frame_size_bytes;
@@ -398,17 +642,34 @@ void* openavbShaperHandle(SRClassIdx_t sr_class, int measurement_interval_usec, 
 	}
 	AVB_LOGF_DEBUG("Sending Shaper command:  %s", szCommand);
 	strcat(szCommand, "\n");
+	SHAPER_LOCK();
+	if (shaperCommandPending) {
+		SHAPER_UNLOCK();
+		AVB_LOG_ERROR("Shaper command attempted while another command is pending");
+		shaperReservationList[i].in_use = FALSE;
+		return NULL;
+	}
+	shaperCommandType = SHAPER_COMMAND_RESERVE;
+	shaperCommandReservation = &shaperReservationList[i];
+	shaperCommandPending = TRUE;
+	shaperCommandSuccess = FALSE;
+	shaperCommandDetail[0] = '\0';
 	if (send(socketfd, szCommand, strlen(szCommand), 0) < 0)
 	{
 		/* Something went wrong.  Abort! */
+		shaperCommandFailLocked("failed to write reserve command to shaper daemon");
+		SHAPER_UNLOCK();
 		AVB_LOGF_ERROR("Shaper:  Error %d writing to network socket (%s)", errno, strerror(errno));
 		shaperState = SHAPER_STATE_ERROR;
+		shaperReservationList[i].in_use = FALSE;
 		return NULL;
 	}
+	SHAPER_UNLOCK();
 
-	shaperState = SHAPER_STATE_ENABLED;
-
-	// TODO:  Verify that the command was successful.
+	if (!waitForShaperCommandResult("reserve", shaperReservationList[i].stream_da)) {
+		shaperReservationList[i].in_use = FALSE;
+		return NULL;
+	}
 
 	return (void *)(&(shaperReservationList[i]));
 }
@@ -433,18 +694,33 @@ void openavbShaperRelease(void* handle)
 					shaperReservationList[i].stream_da[4],
 					shaperReservationList[i].stream_da[5]);
 
-				shaperReservationList[i].in_use = FALSE;
-
 				AVB_LOGF_DEBUG("Sending Shaper command:  %s", szCommand);
 				strcat(szCommand, "\n");
+				SHAPER_LOCK();
+				if (shaperCommandPending) {
+					SHAPER_UNLOCK();
+					AVB_LOG_ERROR("Shaper release attempted while another command is pending");
+					break;
+				}
+				shaperCommandType = SHAPER_COMMAND_RELEASE;
+				shaperCommandReservation = &shaperReservationList[i];
+				shaperCommandPending = TRUE;
+				shaperCommandSuccess = FALSE;
+				shaperCommandDetail[0] = '\0';
 				if (send(socketfd, szCommand, strlen(szCommand), 0) < 0)
 				{
 					/* Something went wrong. */
+					shaperCommandFailLocked("failed to write release command to shaper daemon");
+					SHAPER_UNLOCK();
 					AVB_LOGF_ERROR("Shaper:  Error %d writing to network socket (%s)", errno, strerror(errno));
 					shaperState = SHAPER_STATE_ERROR;
 				}
 				else {
-					// TODO:  Verify that the command was successful.
+					SHAPER_UNLOCK();
+					if (!waitForShaperCommandResult("release", shaperReservationList[i].stream_da)) {
+						AVB_LOGF_WARNING("Shaper release did not complete for " ETH_FORMAT,
+							ETH_OCTETS(shaperReservationList[i].stream_da));
+					}
 				}
 			}
 			break;
