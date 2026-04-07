@@ -259,6 +259,7 @@ static int act_as_server(const char *listenport, char *iface, int daemonize)
 	Maap_Notify recvnotify;
 	uintptr_t notifysocket;
 	int exit_received = 0;
+	int interactive_stdin = (!daemonize && isatty(STDIN_FILENO));
 
 	int ret;
 
@@ -277,7 +278,7 @@ static int act_as_server(const char *listenport, char *iface, int daemonize)
 
 	FD_ZERO(&read_fds);
 	FD_ZERO(&master);
-	if (!daemonize) {
+	if (interactive_stdin) {
 		FD_SET(STDIN_FILENO, &master);
 	}
 	FD_SET(socketfd, &master);
@@ -332,7 +333,7 @@ static int act_as_server(const char *listenport, char *iface, int daemonize)
 	 */
 
 	MAAP_LOG_STATUS("Server started");
-	if (!daemonize) {
+	if (interactive_stdin) {
 		puts("Enter \"help\" for a list of valid commands.");
 	}
 
@@ -489,7 +490,7 @@ static int act_as_server(const char *listenport, char *iface, int daemonize)
 		}
 
 		/* Handle any commands received via stdin. */
-		if (!daemonize && FD_ISSET(STDIN_FILENO, &read_fds))
+		if (interactive_stdin && FD_ISSET(STDIN_FILENO, &read_fds))
 		{
 			recvbytes = read(STDIN_FILENO, recvbuffer, sizeof(recvbuffer) - 1);
 			if (recvbytes <= 0)
@@ -770,7 +771,6 @@ static int act_as_client(const char *listenport)
 
 	FD_ZERO(&read_fds);
 	FD_ZERO(&master);
-	FD_SET(STDIN_FILENO, &master);
 	FD_SET(socketfd, &master);
 	fdmax = socketfd;
 

@@ -290,8 +290,20 @@ static int process_commands_from_stream(int sockfd, char *accum, int *accum_len,
 
 			if (*cmd)
 			{
+				char result_msg[COMMAND_BUFFER_SIZE + 32];
 				SHAPER_LOGF_INFO("The received command is \"%s\"", cmd);
 				ret = process_command(sockfd, cmd);
+				if (sockfd >= 0)
+				{
+					if (ret > 0) {
+						snprintf(result_msg, sizeof(result_msg), "RESULT:OK %s\n", cmd);
+						send(sockfd, result_msg, strlen(result_msg), 0);
+					}
+					else if (ret < 0) {
+						snprintf(result_msg, sizeof(result_msg), "RESULT:ERROR %s\n", cmd);
+						send(sockfd, result_msg, strlen(result_msg), 0);
+					}
+				}
 				if (!ret)
 				{
 					*accum_len = 0;
@@ -1263,7 +1275,7 @@ int process_command(int sockfd, char command[])
 		return -1;
 	}
 
-	if (input.quit == 1 || input.delete_qdisc == 1)
+	if (input.delete_qdisc == 1)
 	{
 		if (sr_classa != 0 || sr_classb != 0)
 		{
@@ -1277,11 +1289,11 @@ int process_command(int sockfd, char command[])
 			classa_bw = classb_bw = 0;
 			classa_max_frame_size = classb_max_frame_size = 0;
 		}
+	}
 
-		if (input.quit == 1)
-		{
-			return 0;
-		}
+	if (input.quit == 1)
+	{
+		return 0;
 	}
 
 	if (sr_classa == 0 && sr_classb == 0)
@@ -1645,6 +1657,7 @@ int main (int argc, char *argv[])
 	fd_set read_fds;
 	int fdmax;
 	int recvbytes;
+	int interactive_stdin = 0;
 
 	shaperLogInit();
 
@@ -1938,6 +1951,8 @@ int main (int argc, char *argv[])
 		return 1;
 	}
 
+	interactive_stdin = (!daemonize && isatty(STDIN_FILENO));
+
 	// Setup signal handler
 	// We catch SIGINT and shutdown cleanly
 	int err;
@@ -1978,13 +1993,16 @@ int main (int argc, char *argv[])
 	}
 	nextclientindex = 0;
 
-	fputs(USER_COMMAND_PROMPT, stdout);
-	fflush(stdout);
+	if (interactive_stdin)
+	{
+		fputs(USER_COMMAND_PROMPT, stdout);
+		fflush(stdout);
+	}
 
 	while (!exit_received)
 	{
 		FD_ZERO(&read_fds);
-		if (!daemonize)
+		if (interactive_stdin)
 		{
 			FD_SET(STDIN_FILENO, &read_fds);
 		}
@@ -2019,7 +2037,7 @@ int main (int argc, char *argv[])
 		else
 		{
 			/* Handle any commands received via stdin. */
-			if (FD_ISSET(STDIN_FILENO, &read_fds))
+			if (interactive_stdin && FD_ISSET(STDIN_FILENO, &read_fds))
 			{
 			recvbytes = read(STDIN_FILENO, command, sizeof(command) - 1);
 			if (recvbytes < 0)
@@ -2082,10 +2100,9 @@ int main (int argc, char *argv[])
 						clientCommandBuf[nextclientindex][0] = '\0';
 						nextclientindex = (nextclientindex + 1) % MAX_CLIENT_CONNECTIONS; /* Next slot used for the next try. */
 
-					/* Send a prompt to the user. */
-					send(newfd, USER_COMMAND_PROMPT, strlen(USER_COMMAND_PROMPT), 0);
+						/* Remote clients are machine consumers; keep their stream prompt-free. */
+					}
 				}
-			}
 
 			for (i = 0; i < MAX_CLIENT_CONNECTIONS; ++i)
 			{
@@ -2123,13 +2140,12 @@ int main (int argc, char *argv[])
 						/* Received a command to exit. */
 						exit_received = 1;
 					}
-					else
-					{
-						/* Send another prompt to the user. */
-						send(clientfd[i], USER_COMMAND_PROMPT, strlen(USER_COMMAND_PROMPT), 0);
+						else
+						{
+							/* Remote clients are machine consumers; keep their stream prompt-free. */
+						}
 					}
 				}
-			}
 		}
 	}//main while loop
 

@@ -350,7 +350,6 @@ static void* maapThread(void *arg)
 
 	FD_ZERO(&read_fds);
 	FD_ZERO(&master);
-	FD_SET(STDIN_FILENO, &master);
 	FD_SET(socketfd, &master);
 	fdmax = socketfd;
 
