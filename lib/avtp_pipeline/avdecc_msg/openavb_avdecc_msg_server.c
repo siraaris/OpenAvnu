@@ -64,6 +64,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 // forward declarations
 static bool openavbAvdeccMsgSrvrReceiveFromClient(int avdeccMsgHandle, openavbAvdeccMessage_t *msg);
+static const char * GetStateString(openavbAvdeccMsgStateType_t state);
 
 // OSAL specific functions
 #include "openavb_avdecc_msg_server_osal.c"

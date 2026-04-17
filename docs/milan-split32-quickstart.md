@@ -283,9 +283,9 @@ Notes:
 If the stack starts but you do not get audio:
 
 - confirm `sudo ./run_milan_stack_tmux.sh status` shows all core components `proc=up`
-- check `/tmp/openavnu-avb-logs/daemon_cl_current.log`
-- check `/tmp/openavnu-avb-logs/phc2sys_current.log`
-- check `/tmp/openavnu-avb-logs/openavb_host_current.log`
+- check `/var/log/3sb/openavnu/daemon_cl.log`
+- check `/var/log/3sb/openavnu/phc2sys.log`
+- check `/var/log/3sb/openavnu/openavb_host.log`
 - confirm the source is really writing 32-channel `96k/S32_LE` audio into `bus32_play`
 - confirm Hive shows the talker streams and the listener connections as active
 
