@@ -33,11 +33,14 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include "simple_rawsock.h"
 #include "openavb_time_osal_pub.h"
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if_packet.h>
+#include <linux/errqueue.h>
 #include <linux/filter.h>
 #include <linux/net_tstamp.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -53,6 +56,12 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define SR_CLASS_B_DEFAULT_PRIORITY 2
 #define SENDMMSG_LAUNCH_OFFSET_REFRESH_NS (10000000ULL)
 #define SENDMMSG_LAUNCH_OFFSET_LOG_LIMIT 16
+#define SENDMMSG_CRF_SUBTYPE 0x04
+#define SENDMMSG_CRF_SEQ_SHIFT 8
+#define SENDMMSG_CRF_STREAM_UID 8
+#define SENDMMSG_DIAG_MIN_LEAD_WARN_NS 300000ULL
+#define SENDMMSG_CRF_MIN_LEAD_WARN_NS 1000000ULL
+#define SENDMMSG_CRF_SEND_DIAG_INTERVAL 2048ULL
 
 static bool sendmmsgRawsockGetTaiTime(U64 *pTaiTimeNs)
 {
@@ -144,6 +153,11 @@ static bool sendmmsgRawsockSetPriority(sendmmsg_rawsock_t *rawsock, U32 priority
 		priority = 7;
 	}
 
+	if (rawsock->socketPriorityValid && rawsock->socketPriority == priority) {
+		AVB_LOGF_DEBUG("SO_PRIORITY=%u unchanged from %s", priority, source ? source : "unknown");
+		return TRUE;
+	}
+
 	int sockPriority = (int)priority;
 	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_PRIORITY, &sockPriority, sizeof(sockPriority)) < 0) {
 		AVB_LOGF_ERROR("Setting TX priority from %s failed (%d: %s)",
@@ -151,8 +165,30 @@ static bool sendmmsgRawsockSetPriority(sendmmsg_rawsock_t *rawsock, U32 priority
 		return FALSE;
 	}
 
+	rawsock->socketPriorityValid = TRUE;
+	rawsock->socketPriority = priority;
 	AVB_LOGF_DEBUG("SO_PRIORITY=%d set from %s", sockPriority, source ? source : "unknown");
 	return TRUE;
+}
+
+static U32 sendmmsgRawsockEnvU32(const char *name, U32 defaultValue)
+{
+	const char *value = getenv(name);
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (!value || !*value) {
+		return defaultValue;
+	}
+
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || (end && *end != '\0') || parsed > UINT32_MAX) {
+		AVB_LOGF_WARNING("Ignoring invalid %s=%s", name, value);
+		return defaultValue;
+	}
+
+	return (U32)parsed;
 }
 
 static bool sendmmsgRawsockClassMarkToPriority(int mark, U32 *pPriority)
@@ -299,7 +335,7 @@ static int sendmmsgRawsockSendBurst(sendmmsg_rawsock_t *rawsock, int *pErrno)
 	int attempt;
 	int sz;
 
-	for (attempt = 0; attempt <= SENDMMSG_ENOBUFS_RETRIES; ++attempt) {
+	for (attempt = 0; attempt <= (int)rawsock->enobufsRetries; ++attempt) {
 		sz = sendmmsg(rawsock->sock, rawsock->mmsg, rawsock->buffersReady, 0);
 		if (sz >= 0) {
 			if (attempt > 0) {
@@ -319,20 +355,629 @@ static int sendmmsgRawsockSendBurst(sendmmsg_rawsock_t *rawsock, int *pErrno)
 			return sz;
 		}
 
-		if (attempt == SENDMMSG_ENOBUFS_RETRIES) {
+		if (attempt == (int)rawsock->enobufsRetries) {
 			if (pErrno) {
 				*pErrno = errno;
 			}
 			return sz;
 		}
 
-		usleep(SENDMMSG_ENOBUFS_SLEEP_USEC);
+		if (rawsock->enobufsSleepUsec > 0) {
+			usleep(rawsock->enobufsSleepUsec);
+		}
 	}
 
 	if (pErrno) {
 		*pErrno = errno;
 	}
 	return -1;
+}
+
+static bool sendmmsgRawsockExtractTxtimeNs(struct msghdr const *msg, U64 *pTxtimeNs)
+{
+#if USE_LAUNCHTIME
+	struct cmsghdr *cmsg;
+
+	if (!msg || !pTxtimeNs || !msg->msg_control || msg->msg_controllen < CMSG_LEN(sizeof(uint64_t))) {
+		return FALSE;
+	}
+
+	for (cmsg = CMSG_FIRSTHDR((struct msghdr *)msg); cmsg; cmsg = CMSG_NXTHDR((struct msghdr *)msg, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TXTIME &&
+				cmsg->cmsg_len >= CMSG_LEN(sizeof(uint64_t))) {
+			memcpy(pTxtimeNs, CMSG_DATA(cmsg), sizeof(*pTxtimeNs));
+			return TRUE;
+		}
+	}
+#else
+	(void)msg;
+	(void)pTxtimeNs;
+#endif
+	return FALSE;
+}
+
+static void sendmmsgRawsockDescribePacket(U8 const *pkt, size_t pktLen, char *buffer, size_t bufferLen)
+{
+	size_t l2Len = ETH_HLEN;
+	U16 etherType = 0;
+	U8 subtype = 0;
+	U16 streamUid = 0;
+	U8 const *streamId = NULL;
+
+	if (!buffer || bufferLen == 0) {
+		return;
+	}
+	buffer[0] = '\0';
+
+	if (!pkt || pktLen < ETH_HLEN) {
+		snprintf(buffer, bufferLen, "pkt_len=%zu", pktLen);
+		return;
+	}
+
+	memcpy(&etherType, pkt + 12, sizeof(etherType));
+	etherType = ntohs(etherType);
+	if ((etherType == ETHERTYPE_VLAN || etherType == 0x88A8) && pktLen >= (ETH_HLEN + 4U)) {
+		l2Len += 4U;
+		memcpy(&etherType, pkt + 16, sizeof(etherType));
+		etherType = ntohs(etherType);
+	}
+
+	if (pktLen < l2Len + 12U) {
+		snprintf(buffer, bufferLen, "eth=0x%04x l2=%zu pkt_len=%zu", etherType, l2Len, pktLen);
+		return;
+	}
+
+	subtype = pkt[l2Len] & 0x7FU;
+	streamId = pkt + l2Len + 4U;
+	streamUid = (U16)(((U16)streamId[6] << 8) | (U16)streamId[7]);
+
+	snprintf(buffer, bufferLen,
+		"eth=0x%04x l2=%zu subtype=0x%02x stream_id=%02x:%02x:%02x:%02x:%02x:%02x/%u pkt_len=%zu",
+		etherType,
+		l2Len,
+		subtype,
+		streamId[0], streamId[1], streamId[2], streamId[3], streamId[4], streamId[5],
+		streamUid,
+		pktLen);
+}
+
+static void sendmmsgRawsockClearTxMeta(sendmmsg_rawsock_t *rawsock, int index)
+{
+	if (!rawsock || index < 0 || index >= MSG_COUNT) {
+		return;
+	}
+
+	rawsock->txMetaValid[index] = false;
+	rawsock->txSubtype[index] = 0;
+	rawsock->txStreamUid[index] = 0;
+	rawsock->txSeq[index] = 0;
+	rawsock->txSeqValid[index] = false;
+}
+
+static bool sendmmsgRawsockExtractTxMeta(U8 const *pkt, size_t pktLen,
+	U8 *pSubtype, U16 *pStreamUid, U8 *pSeq, bool *pSeqValid)
+{
+	size_t l2Len = ETH_HLEN;
+	U16 etherType = 0;
+	U32 subtypeData = 0;
+	U8 const *pAvtp = NULL;
+	U8 const *pStreamId = NULL;
+
+	if (!pkt || pktLen < ETH_HLEN || !pSubtype || !pStreamUid || !pSeq || !pSeqValid) {
+		return FALSE;
+	}
+
+	memcpy(&etherType, pkt + 12, sizeof(etherType));
+	etherType = ntohs(etherType);
+	if ((etherType == ETHERTYPE_VLAN || etherType == 0x88A8) && pktLen >= (ETH_HLEN + 4U)) {
+		l2Len += 4U;
+		memcpy(&etherType, pkt + 16, sizeof(etherType));
+		etherType = ntohs(etherType);
+	}
+
+	if (pktLen < l2Len + 12U) {
+		return FALSE;
+	}
+
+	pAvtp = pkt + l2Len;
+	pStreamId = pAvtp + 4U;
+	*pSubtype = pAvtp[0] & 0x7FU;
+	*pStreamUid = (U16)(((U16)pStreamId[6] << 8) | (U16)pStreamId[7]);
+	*pSeqValid = TRUE;
+	if (*pSubtype == SENDMMSG_CRF_SUBTYPE) {
+		memcpy(&subtypeData, pAvtp, sizeof(subtypeData));
+		subtypeData = ntohl(subtypeData);
+		*pSeq = (U8)((subtypeData >> SENDMMSG_CRF_SEQ_SHIFT) & 0xFF);
+	}
+	else {
+		*pSeq = pAvtp[2];
+	}
+
+	return TRUE;
+}
+
+static bool sendmmsgRawsockTrackCrf(U8 subtype, U16 streamUid, bool seqValid)
+{
+	return (seqValid && subtype == SENDMMSG_CRF_SUBTYPE && streamUid == SENDMMSG_CRF_STREAM_UID);
+}
+
+static void sendmmsgRawsockLogCrfSeqRow(sendmmsg_rawsock_t *rawsock, const char *stage, const char *event,
+	U32 *pLogCount, int slot, int sent, int ready, U8 seq, U8 expectedSeq, U64 requestedLaunchNs, U64 kernelLaunchNs)
+{
+	if (!rawsock || !stage || !event || !pLogCount) {
+		return;
+	}
+
+	(*pLogCount)++;
+	if (*pLogCount <= 16U || ((*pLogCount % 256U) == 0U)) {
+		AVB_LOGF_WARNING(
+			"TX OUTLIER ROW flags=..Z stage=%s event=%s stream=%u slot=%d sent=%d ready=%d seq=%u expected=%u requested_launch=%" PRIu64 " kernel_launch=%" PRIu64 " rows=%u",
+			stage,
+			event,
+			(unsigned)SENDMMSG_CRF_STREAM_UID,
+			slot,
+			sent,
+			ready,
+			(unsigned)seq,
+			(unsigned)expectedSeq,
+			requestedLaunchNs,
+			kernelLaunchNs,
+			*pLogCount);
+	}
+}
+
+static void sendmmsgRawsockLogCrfLeadRow(sendmmsg_rawsock_t *rawsock, const char *stage, const char *event,
+	U32 *pLogCount, int slot, U8 seq, U64 requestedLaunchNs, U64 kernelLaunchNs,
+	U64 readyWallNs, U64 readyTaiNs, U64 sendCallTaiNs, U64 sendReturnTaiNs,
+	S64 readyWallLeadNs, S64 readyKernelLeadNs, S64 sendCallLeadNs, S64 sendReturnLeadNs,
+	U64 minLeadNs)
+{
+	if (!rawsock || !stage || !event || !pLogCount) {
+		return;
+	}
+
+	(*pLogCount)++;
+	if (*pLogCount <= 16U || ((*pLogCount % 256U) == 0U)) {
+		AVB_LOGF_WARNING(
+			"TX OUTLIER ROW flags=..Z stage=%s event=%s stream=%u slot=%d seq=%u requested_launch=%" PRIu64 " kernel_launch=%" PRIu64 " ready_wall=%" PRIu64 " ready_tai=%" PRIu64 " send_call=%" PRIu64 " send_return=%" PRIu64 " lead_ready_wall=%" PRId64 " lead_ready_kernel=%" PRId64 " lead_send_call=%" PRId64 " lead_send_return=%" PRId64 " min_lead_ns=%" PRIu64 " rows=%u",
+			stage,
+			event,
+			(unsigned)SENDMMSG_CRF_STREAM_UID,
+			slot,
+			(unsigned)seq,
+			requestedLaunchNs,
+			kernelLaunchNs,
+			readyWallNs,
+			readyTaiNs,
+			sendCallTaiNs,
+			sendReturnTaiNs,
+			readyWallLeadNs,
+			readyKernelLeadNs,
+			sendCallLeadNs,
+			sendReturnLeadNs,
+			minLeadNs,
+			*pLogCount);
+	}
+}
+
+static void sendmmsgRawsockLogCrfLaunchStepRow(sendmmsg_rawsock_t *rawsock, const char *event,
+	U32 *pLogCount, int slot, U8 seq, U8 prevSeq, U64 requestedLaunchNs, U64 prevRequestedLaunchNs,
+	U64 kernelLaunchNs, U64 prevKernelLaunchNs, S64 requestedStepNs, S64 kernelStepNs)
+{
+	if (!rawsock || !event || !pLogCount) {
+		return;
+	}
+
+	(*pLogCount)++;
+	if (*pLogCount <= 16U || ((*pLogCount % 256U) == 0U)) {
+		AVB_LOGF_WARNING(
+			"TX OUTLIER ROW flags=..Z stage=send_queue_launch event=%s stream=%u slot=%d seq=%u prev_seq=%u requested_launch=%" PRIu64 " prev_requested_launch=%" PRIu64 " kernel_launch=%" PRIu64 " prev_kernel_launch=%" PRIu64 " requested_step_ns=%" PRId64 " kernel_step_ns=%" PRId64 " rows=%u",
+			event,
+			(unsigned)SENDMMSG_CRF_STREAM_UID,
+			slot,
+			(unsigned)seq,
+			(unsigned)prevSeq,
+			requestedLaunchNs,
+			prevRequestedLaunchNs,
+			kernelLaunchNs,
+			prevKernelLaunchNs,
+			requestedStepNs,
+			kernelStepNs,
+			*pLogCount);
+	}
+}
+
+static void sendmmsgRawsockLogBurstFailure(sendmmsg_rawsock_t *rawsock, int savedErrno, bool hadLaunchTimeCmsg)
+{
+	U64 taiNowNs = 0;
+	U64 firstTxtimeNs = 0;
+	U64 lastTxtimeNs = 0;
+	S64 firstLeadNs = 0;
+	S64 lastLeadNs = 0;
+	bool haveTaiNow = FALSE;
+	bool haveFirstTxtime = FALSE;
+	bool haveLastTxtime = FALSE;
+	int outqBytes = -1;
+	int sndbufBytes = -1;
+	socklen_t sndbufLen = sizeof(sndbufBytes);
+	char pktDesc[192];
+
+	if (!rawsock) {
+		return;
+	}
+
+	haveTaiNow = sendmmsgRawsockGetTaiTime(&taiNowNs);
+	if (rawsock->buffersReady > 0) {
+		haveFirstTxtime = sendmmsgRawsockExtractTxtimeNs(&rawsock->mmsg[0].msg_hdr, &firstTxtimeNs);
+		haveLastTxtime = sendmmsgRawsockExtractTxtimeNs(&rawsock->mmsg[rawsock->buffersReady - 1].msg_hdr, &lastTxtimeNs);
+		sendmmsgRawsockDescribePacket(rawsock->pktbuf[0], rawsock->miov[0].iov_len, pktDesc, sizeof(pktDesc));
+	}
+	else {
+		snprintf(pktDesc, sizeof(pktDesc), "no-packets");
+	}
+
+	if (haveTaiNow && haveFirstTxtime) {
+		firstLeadNs = (firstTxtimeNs >= taiNowNs)
+			? (S64)(firstTxtimeNs - taiNowNs)
+			: -((S64)(taiNowNs - firstTxtimeNs));
+	}
+	if (haveTaiNow && haveLastTxtime) {
+		lastLeadNs = (lastTxtimeNs >= taiNowNs)
+			? (S64)(lastTxtimeNs - taiNowNs)
+			: -((S64)(taiNowNs - lastTxtimeNs));
+	}
+
+	if (ioctl(rawsock->sock, TIOCOUTQ, &outqBytes) < 0) {
+		outqBytes = -1;
+	}
+	if (getsockopt(rawsock->sock, SOL_SOCKET, SO_SNDBUF, &sndbufBytes, &sndbufLen) < 0) {
+		sndbufBytes = -1;
+	}
+
+	AVB_LOGF_WARNING(
+		"sendmmsg errno=%d (%s) sock=%d ready=%d out=%d launchEnabled=%d sockConfigured=%d hadLaunchCmsg=%d tai_now=%" PRIu64 " first_txtime=%" PRIu64 " first_lead=%" PRId64 "ns last_txtime=%" PRIu64 " last_lead=%" PRId64 "ns wall_to_tai=%" PRId64 "ns outq=%d sndbuf=%d %s",
+		savedErrno,
+		strerror(savedErrno),
+		rawsock->sock,
+		rawsock->buffersReady,
+		rawsock->buffersOut,
+		rawsock->launchTimeEnabled ? 1 : 0,
+		rawsock->launchTimeSockConfigured ? 1 : 0,
+		hadLaunchTimeCmsg ? 1 : 0,
+		haveTaiNow ? taiNowNs : 0ULL,
+		haveFirstTxtime ? firstTxtimeNs : 0ULL,
+		(haveTaiNow && haveFirstTxtime) ? firstLeadNs : 0LL,
+		haveLastTxtime ? lastTxtimeNs : 0ULL,
+		(haveTaiNow && haveLastTxtime) ? lastLeadNs : 0LL,
+		rawsock->launchTimeClockOffsetValid ? rawsock->launchTimeWallToTaiOffsetNs : 0LL,
+		outqBytes,
+		sndbufBytes,
+		pktDesc);
+}
+
+static const char *sendmmsgRawsockErrqueueEventName(U8 origin, U8 code)
+{
+	if (origin == SO_EE_ORIGIN_TXTIME) {
+		switch (code) {
+			case SO_EE_CODE_TXTIME_INVALID_PARAM:
+				return "txtime_invalid_param";
+			case SO_EE_CODE_TXTIME_MISSED:
+				return "txtime_missed";
+			default:
+				return "txtime_other";
+		}
+	}
+
+	switch (origin) {
+		case SO_EE_ORIGIN_LOCAL:
+			return "local";
+		case SO_EE_ORIGIN_TXSTATUS:
+			return "txstatus";
+		default:
+			return "other";
+	}
+}
+
+static void sendmmsgRawsockDrainErrqueue(sendmmsg_rawsock_t *rawsock)
+{
+#if USE_LAUNCHTIME
+	unsigned char pktbuf[MAX_FRAME_SIZE];
+	unsigned char control[512];
+	struct iovec iov;
+	struct msghdr msg;
+
+	if (!rawsock || rawsock->sock < 0 || !rawsock->launchTimeSockConfigured) {
+		return;
+	}
+
+	for (;;) {
+		int rc;
+		bool logged = FALSE;
+		U8 subtype = 0;
+		U16 streamUid = 0;
+		U8 seq = 0;
+		bool seqValid = FALSE;
+		bool haveMeta = FALSE;
+		char pktDesc[192];
+		struct cmsghdr *cmsg;
+
+		memset(&msg, 0, sizeof(msg));
+		memset(&iov, 0, sizeof(iov));
+		memset(control, 0, sizeof(control));
+		memset(pktbuf, 0, sizeof(pktbuf));
+		iov.iov_base = pktbuf;
+		iov.iov_len = sizeof(pktbuf);
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = control;
+		msg.msg_controllen = sizeof(control);
+
+		rc = recvmsg(rawsock->sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+		if (rc < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				break;
+			}
+			rawsock->crfErrqueueLogCount++;
+			if (rawsock->crfErrqueueLogCount <= 8U || ((rawsock->crfErrqueueLogCount % 256U) == 0U)) {
+				AVB_LOGF_WARNING(
+					"TX OUTLIER ROW flags=..Z stage=send_errqueue event=recvmsg_failed stream=0 sock=%d mark=%d errno=%d rows=%u",
+					rawsock->sock,
+					rawsock->socketMarkValid ? rawsock->socketMark : 0,
+					errno,
+					rawsock->crfErrqueueLogCount);
+			}
+			break;
+		}
+
+		rawsock->diagErrqueueEvents++;
+		haveMeta = sendmmsgRawsockExtractTxMeta(pktbuf, (size_t)rc, &subtype, &streamUid, &seq, &seqValid);
+		sendmmsgRawsockDescribePacket(pktbuf, (size_t)rc, pktDesc, sizeof(pktDesc));
+
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			struct sock_extended_err *see;
+			const char *event;
+
+			if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct sock_extended_err))) {
+				continue;
+			}
+
+			see = (struct sock_extended_err *)CMSG_DATA(cmsg);
+			if (!see) {
+				continue;
+			}
+
+			if (see->ee_origin == SO_EE_ORIGIN_TXTIME && see->ee_code == SO_EE_CODE_TXTIME_MISSED) {
+				rawsock->diagErrqueueMissed++;
+			}
+
+			event = sendmmsgRawsockErrqueueEventName(see->ee_origin, see->ee_code);
+			rawsock->crfErrqueueLogCount++;
+			if (rawsock->crfErrqueueLogCount <= 32U || ((rawsock->crfErrqueueLogCount % 256U) == 0U)) {
+				AVB_LOGF_WARNING(
+					"TX OUTLIER ROW flags=..Z stage=send_errqueue event=%s stream=%u sock=%d mark=%d origin=%u code=%u ee_errno=%u ee_info=%u ee_data=%u cmsg_level=%d cmsg_type=%d pkt_len=%d subtype=0x%02x seq=%u seq_valid=%u desc=%s rows=%u",
+					event,
+					haveMeta ? (unsigned)streamUid : 0U,
+					rawsock->sock,
+					rawsock->socketMarkValid ? rawsock->socketMark : 0,
+					(unsigned)see->ee_origin,
+					(unsigned)see->ee_code,
+					(unsigned)see->ee_errno,
+					(unsigned)see->ee_info,
+					(unsigned)see->ee_data,
+					cmsg->cmsg_level,
+					cmsg->cmsg_type,
+					rc,
+					haveMeta ? subtype : 0U,
+					haveMeta ? (unsigned)seq : 0U,
+					haveMeta ? 1U : 0U,
+					pktDesc,
+					rawsock->crfErrqueueLogCount);
+			}
+			logged = TRUE;
+		}
+
+		if (!logged) {
+			rawsock->crfErrqueueLogCount++;
+			if (rawsock->crfErrqueueLogCount <= 16U || ((rawsock->crfErrqueueLogCount % 256U) == 0U)) {
+				AVB_LOGF_WARNING(
+					"TX OUTLIER ROW flags=..Z stage=send_errqueue event=no_extended_err stream=%u sock=%d mark=%d pkt_len=%d flags=0x%x desc=%s rows=%u",
+					haveMeta ? (unsigned)streamUid : 0U,
+					rawsock->sock,
+					rawsock->socketMarkValid ? rawsock->socketMark : 0,
+					rc,
+					msg.msg_flags,
+					pktDesc,
+					rawsock->crfErrqueueLogCount);
+			}
+		}
+	}
+#else
+	(void)rawsock;
+#endif
+}
+
+static void sendmmsgRawsockDiagReset(sendmmsg_rawsock_t *rawsock)
+{
+	if (!rawsock) {
+		return;
+	}
+
+	rawsock->diagBurstCount = 0;
+	rawsock->diagPacketCount = 0;
+	rawsock->diagLaunchMetricPacketCount = 0;
+	rawsock->diagNoLaunchTimeCount = 0;
+	rawsock->diagLateAtReadyCount = 0;
+	rawsock->diagLateAtSendCallCount = 0;
+	rawsock->diagLateAtSendReturnCount = 0;
+	rawsock->diagErrqueueEvents = 0;
+	rawsock->diagErrqueueMissed = 0;
+	rawsock->diagOutlierRowCount = 0;
+	rawsock->diagQueueBeforeSendMinNs = 0;
+	rawsock->diagQueueBeforeSendMaxNs = 0;
+	rawsock->diagQueueBeforeSendSumNs = 0;
+	rawsock->diagSubmitLatencyMinNs = 0;
+	rawsock->diagSubmitLatencyMaxNs = 0;
+	rawsock->diagSubmitLatencySumNs = 0;
+	rawsock->diagReadyWallLeadMinNs = 0;
+	rawsock->diagReadyWallLeadMaxNs = 0;
+	rawsock->diagReadyWallLeadSumNs = 0;
+	rawsock->diagReadyKernelLeadMinNs = 0;
+	rawsock->diagReadyKernelLeadMaxNs = 0;
+	rawsock->diagReadyKernelLeadSumNs = 0;
+	rawsock->diagSendCallLeadMinNs = 0;
+	rawsock->diagSendCallLeadMaxNs = 0;
+	rawsock->diagSendCallLeadSumNs = 0;
+	rawsock->diagSendReturnLeadMinNs = 0;
+	rawsock->diagSendReturnLeadMaxNs = 0;
+	rawsock->diagSendReturnLeadSumNs = 0;
+}
+
+static void sendmmsgRawsockDiagUpdateUnsigned(U64 *pMin, U64 *pMax, U64 *pSum, U64 count, U64 value)
+{
+	if (count == 0) {
+		*pMin = value;
+		*pMax = value;
+		*pSum = value;
+		return;
+	}
+
+	if (value < *pMin) {
+		*pMin = value;
+	}
+	if (value > *pMax) {
+		*pMax = value;
+	}
+	*pSum += value;
+}
+
+static void sendmmsgRawsockDiagUpdateSigned(S64 *pMin, S64 *pMax, S64 *pSum, U64 count, S64 value)
+{
+	if (count == 0) {
+		*pMin = value;
+		*pMax = value;
+		*pSum = value;
+		return;
+	}
+
+	if (value < *pMin) {
+		*pMin = value;
+	}
+	if (value > *pMax) {
+		*pMax = value;
+	}
+	*pSum += value;
+}
+
+static void sendmmsgRawsockDiagMaybeLog(sendmmsg_rawsock_t *rawsock)
+{
+	U64 leadCount = 0;
+
+	if (!rawsock || !rawsock->diagTimingEnabled || rawsock->diagTimingLogInterval == 0) {
+		return;
+	}
+
+	if (rawsock->diagBurstCount < rawsock->diagTimingLogInterval || rawsock->diagBurstCount == 0) {
+		return;
+	}
+
+	leadCount = rawsock->diagLaunchMetricPacketCount;
+	AVB_LOGF_WARNING(
+		"SENDMMSG DIAG bursts=%llu packets=%llu queue_ready_to_send_call_avg=%lluns min=%lluns max=%lluns submit_latency_avg=%lluns min=%lluns max=%lluns lead_ready_wall_avg=%lldns min=%lldns max=%lldns lead_ready_kernel_avg=%lldns min=%lldns max=%lldns lead_send_call_avg=%lldns min=%lldns max=%lldns lead_send_return_avg=%lldns min=%lldns max=%lldns late_ready=%llu late_send_call=%llu late_send_return=%llu no_launch=%llu errqueue=%llu errqueue_missed=%llu",
+		(unsigned long long)rawsock->diagBurstCount,
+		(unsigned long long)rawsock->diagPacketCount,
+		(unsigned long long)((rawsock->diagPacketCount > 0) ? (rawsock->diagQueueBeforeSendSumNs / rawsock->diagPacketCount) : 0ULL),
+		(unsigned long long)rawsock->diagQueueBeforeSendMinNs,
+		(unsigned long long)rawsock->diagQueueBeforeSendMaxNs,
+		(unsigned long long)((rawsock->diagBurstCount > 0) ? (rawsock->diagSubmitLatencySumNs / rawsock->diagBurstCount) : 0ULL),
+		(unsigned long long)rawsock->diagSubmitLatencyMinNs,
+		(unsigned long long)rawsock->diagSubmitLatencyMaxNs,
+		(long long)((leadCount > 0) ? (rawsock->diagReadyWallLeadSumNs / (S64)leadCount) : 0LL),
+		(long long)rawsock->diagReadyWallLeadMinNs,
+		(long long)rawsock->diagReadyWallLeadMaxNs,
+		(long long)((leadCount > 0) ? (rawsock->diagReadyKernelLeadSumNs / (S64)leadCount) : 0LL),
+		(long long)rawsock->diagReadyKernelLeadMinNs,
+		(long long)rawsock->diagReadyKernelLeadMaxNs,
+		(long long)((leadCount > 0) ? (rawsock->diagSendCallLeadSumNs / (S64)leadCount) : 0LL),
+		(long long)rawsock->diagSendCallLeadMinNs,
+		(long long)rawsock->diagSendCallLeadMaxNs,
+		(long long)((leadCount > 0) ? (rawsock->diagSendReturnLeadSumNs / (S64)leadCount) : 0LL),
+		(long long)rawsock->diagSendReturnLeadMinNs,
+		(long long)rawsock->diagSendReturnLeadMaxNs,
+		(unsigned long long)rawsock->diagLateAtReadyCount,
+		(unsigned long long)rawsock->diagLateAtSendCallCount,
+		(unsigned long long)rawsock->diagLateAtSendReturnCount,
+		(unsigned long long)rawsock->diagNoLaunchTimeCount,
+		(unsigned long long)rawsock->diagErrqueueEvents,
+		(unsigned long long)rawsock->diagErrqueueMissed);
+
+	sendmmsgRawsockDiagReset(rawsock);
+}
+
+static void sendmmsgRawsockCrfDiagReset(sendmmsg_rawsock_t *rawsock)
+{
+	if (!rawsock) {
+		return;
+	}
+
+	rawsock->crfDiagPacketCount = 0;
+	rawsock->crfDiagLeadMetricCount = 0;
+	rawsock->crfDiagReadyKernelLeadMinNs = 0;
+	rawsock->crfDiagReadyKernelLeadMaxNs = 0;
+	rawsock->crfDiagReadyKernelLeadSumNs = 0;
+	rawsock->crfDiagSendCallLeadMinNs = 0;
+	rawsock->crfDiagSendCallLeadMaxNs = 0;
+	rawsock->crfDiagSendCallLeadSumNs = 0;
+	rawsock->crfDiagSendReturnLeadMinNs = 0;
+	rawsock->crfDiagSendReturnLeadMaxNs = 0;
+	rawsock->crfDiagSendReturnLeadSumNs = 0;
+	rawsock->crfDiagLowLeadCount = 0;
+	rawsock->crfDiagLateCount = 0;
+	rawsock->crfDiagNoLaunchCount = 0;
+	rawsock->crfDiagBurstReadyMax = 0;
+}
+
+static void sendmmsgRawsockCrfDiagMaybeLog(sendmmsg_rawsock_t *rawsock)
+{
+	U64 leadCount = 0;
+	S64 readyKernelLeadAvgNs = 0;
+	S64 sendCallLeadAvgNs = 0;
+	S64 sendReturnLeadAvgNs = 0;
+
+	if (!rawsock || rawsock->crfDiagPacketCount < SENDMMSG_CRF_SEND_DIAG_INTERVAL) {
+		return;
+	}
+
+	leadCount = rawsock->crfDiagLeadMetricCount;
+	readyKernelLeadAvgNs = (leadCount > 0) ? (rawsock->crfDiagReadyKernelLeadSumNs / (S64)leadCount) : 0LL;
+	sendCallLeadAvgNs = (leadCount > 0) ? (rawsock->crfDiagSendCallLeadSumNs / (S64)leadCount) : 0LL;
+	sendReturnLeadAvgNs = (leadCount > 0) ? (rawsock->crfDiagSendReturnLeadSumNs / (S64)leadCount) : 0LL;
+	AVB_LOGF_WARNING(
+		"TX TRACE ROW flags=..Z stage=send_window event=diag stream=%u pkts=%" PRIu64 " lead_pkts=%" PRIu64 " rk_avg=%" PRId64 " rk_min=%" PRId64 " rk_max=%" PRId64 " low=%" PRIu64 " late=%" PRIu64 " nol=%" PRIu64 " burst=%u min_lead_ns=%" PRIu64,
+		(unsigned)SENDMMSG_CRF_STREAM_UID,
+		rawsock->crfDiagPacketCount,
+		leadCount,
+		readyKernelLeadAvgNs,
+		rawsock->crfDiagReadyKernelLeadMinNs,
+		rawsock->crfDiagReadyKernelLeadMaxNs,
+		rawsock->crfDiagLowLeadCount,
+		rawsock->crfDiagLateCount,
+		rawsock->crfDiagNoLaunchCount,
+		rawsock->crfDiagBurstReadyMax,
+		rawsock->crfMinLeadWarnNs);
+
+	if (rawsock->crfDiagLowLeadCount > 0 || rawsock->crfDiagLateCount > 0 || rawsock->crfDiagNoLaunchCount > 0) {
+		AVB_LOGF_WARNING(
+			"TX TRACE ROW flags=..Z stage=send_window_detail event=diag stream=%u sc_avg=%" PRId64 " sc_min=%" PRId64 " sc_max=%" PRId64 " sr_avg=%" PRId64 " sr_min=%" PRId64 " sr_max=%" PRId64,
+			(unsigned)SENDMMSG_CRF_STREAM_UID,
+			sendCallLeadAvgNs,
+			rawsock->crfDiagSendCallLeadMinNs,
+			rawsock->crfDiagSendCallLeadMaxNs,
+			sendReturnLeadAvgNs,
+			rawsock->crfDiagSendReturnLeadMinNs,
+			rawsock->crfDiagSendReturnLeadMaxNs);
+	}
+
+	sendmmsgRawsockCrfDiagReset(rawsock);
 }
 
 // Open a rawsock for TX or RX
@@ -393,11 +1038,20 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 		return NULL;
 	}
 
-	temp = SENDMMSG_TX_SNDBUF_BYTES;
+	rawsock->enobufsRetries = sendmmsgRawsockEnvU32("OPENAVB_SENDMMSG_ENOBUFS_RETRIES", SENDMMSG_ENOBUFS_RETRIES);
+	rawsock->enobufsSleepUsec = sendmmsgRawsockEnvU32("OPENAVB_SENDMMSG_ENOBUFS_SLEEP_USEC", SENDMMSG_ENOBUFS_SLEEP_USEC);
+	rawsock->txSndbufBytes = sendmmsgRawsockEnvU32("OPENAVB_SENDMMSG_TX_SNDBUF_BYTES", SENDMMSG_TX_SNDBUF_BYTES);
+
+	temp = (int)rawsock->txSndbufBytes;
 	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_SNDBUF, &temp, sizeof(temp)) < 0) {
 		AVB_LOGF_WARNING("Creating rawsock; failed to set SO_SNDBUF=%d (%d: %s)",
-			SENDMMSG_TX_SNDBUF_BYTES, errno, strerror(errno));
+			temp, errno, strerror(errno));
 	}
+	AVB_LOGF_INFO("sendmmsg TX config on %s: sndbuf=%u enobufs_retries=%u enobufs_sleep_usec=%u",
+		rawsock->base.ifInfo.name,
+		rawsock->txSndbufBytes,
+		rawsock->enobufsRetries,
+		rawsock->enobufsSleepUsec);
 
 	sendmmsgRawsockForceQdiscPath(rawsock);
 
@@ -419,6 +1073,15 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 	memset(rawsock->mmsg, 0, sizeof(rawsock->mmsg));
 	memset(rawsock->miov, 0, sizeof(rawsock->miov));
 	memset(rawsock->pktbuf, 0, sizeof(rawsock->pktbuf));
+	memset(rawsock->txMetaValid, 0, sizeof(rawsock->txMetaValid));
+	memset(rawsock->txSubtype, 0, sizeof(rawsock->txSubtype));
+	memset(rawsock->txStreamUid, 0, sizeof(rawsock->txStreamUid));
+	memset(rawsock->txSeq, 0, sizeof(rawsock->txSeq));
+	memset(rawsock->txSeqValid, 0, sizeof(rawsock->txSeqValid));
+	rawsock->socketPriorityValid = false;
+	rawsock->socketPriority = 0;
+	rawsock->socketMarkValid = false;
+	rawsock->socketMark = 0;
 #if USE_LAUNCHTIME
 	memset(rawsock->cmsgbuf, 0, sizeof(rawsock->cmsgbuf));
 	rawsock->launchTimeEnabled = true;
@@ -428,6 +1091,44 @@ void* sendmmsgRawsockOpen(sendmmsg_rawsock_t* rawsock, const char *ifname, bool 
 	rawsock->launchTimeWallToTaiOffsetNs = 0;
 	rawsock->launchTimeOffsetLastUpdateMonoNs = 0;
 	rawsock->launchTimeOffsetLogCount = 0;
+	memset(rawsock->txReadyWallNs, 0, sizeof(rawsock->txReadyWallNs));
+	memset(rawsock->txReadyTaiNs, 0, sizeof(rawsock->txReadyTaiNs));
+	memset(rawsock->txRequestedWallLaunchNs, 0, sizeof(rawsock->txRequestedWallLaunchNs));
+	memset(rawsock->txKernelLaunchNs, 0, sizeof(rawsock->txKernelLaunchNs));
+	rawsock->diagTimingLogInterval = 0;
+	{
+		const char *envDiagInterval = getenv("OPENAVB_SENDMMSG_DIAG_INTERVAL");
+		if (envDiagInterval && *envDiagInterval) {
+			char *endPtr = NULL;
+			unsigned long parsed = strtoul(envDiagInterval, &endPtr, 10);
+			if (endPtr != envDiagInterval && endPtr && *endPtr == '\0' && parsed > 0) {
+				rawsock->diagTimingLogInterval = (U32)parsed;
+			}
+		}
+	}
+	rawsock->diagTimingEnabled = (rawsock->diagTimingLogInterval > 0);
+	rawsock->diagMinLeadWarnNs = (U64)sendmmsgRawsockEnvU32("OPENAVB_SENDMMSG_DIAG_MIN_LEAD_NS", (U32)SENDMMSG_DIAG_MIN_LEAD_WARN_NS);
+	rawsock->crfMinLeadWarnNs = (U64)sendmmsgRawsockEnvU32(
+		"OPENAVB_SENDMMSG_CRF_MIN_LEAD_NS",
+		(U32)((rawsock->diagMinLeadWarnNs > SENDMMSG_CRF_MIN_LEAD_WARN_NS)
+			? rawsock->diagMinLeadWarnNs
+			: SENDMMSG_CRF_MIN_LEAD_WARN_NS));
+	sendmmsgRawsockDiagReset(rawsock);
+	rawsock->crfLastQueuedSeqValid = false;
+	rawsock->crfLastQueuedSeq = 0;
+	rawsock->crfLastQueuedLaunchValid = false;
+	rawsock->crfLastQueuedRequestedLaunchNs = 0;
+	rawsock->crfLastQueuedKernelLaunchNs = 0;
+	rawsock->crfLastSentSeqValid = false;
+	rawsock->crfLastSentSeq = 0;
+	sendmmsgRawsockCrfDiagReset(rawsock);
+	rawsock->crfLowLeadLogCount = 0;
+	rawsock->crfNoLaunchLogCount = 0;
+	rawsock->crfLateLeadLogCount = 0;
+	rawsock->crfQueueGapLogCount = 0;
+	rawsock->crfLaunchStepLogCount = 0;
+	rawsock->crfSendGapLogCount = 0;
+	rawsock->crfErrqueueLogCount = 0;
 #endif
 
 	rawsock->buffersOut = 0;
@@ -530,11 +1231,19 @@ bool sendmmsgRawsockTxSetMark(void *pvRawsock, int mark)
 		return FALSE;
 	}
 
+	if (rawsock->socketMarkValid && rawsock->socketMark == mark) {
+		AVB_LOGF_DEBUG("SO_MARK=%d unchanged", mark);
+		AVB_TRACE_EXIT(AVB_TRACE_RAWSOCK_DETAIL);
+		return TRUE;
+	}
+
 	if (setsockopt(rawsock->sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
 		AVB_LOGF_ERROR("Setting TX mark; setsockopt failed: %s", strerror(errno));
 		retval = FALSE;
 	}
 	else {
+		rawsock->socketMarkValid = TRUE;
+		rawsock->socketMark = mark;
 		AVB_LOGF_DEBUG("SO_MARK=%d OK", mark);
 		U32 classPriority = 0;
 		if (sendmmsgRawsockClassMarkToPriority(mark, &classPriority)) {
@@ -609,6 +1318,8 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 	bool useLaunchTime = false;
 	U64 kernelLaunchTimeNsec = timeNsec;
 #endif
+	U64 readyWallNs = 0;
+	U64 readyTaiNs = 0;
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
 		AVB_LOG_ERROR("Marking TX frame ready; invalid argument");
@@ -644,6 +1355,95 @@ bool sendmmsgRawsockTxFrameReady(void *pvRawsock, U8 *pBuffer, unsigned int len,
 	fillmsghdr(&(rawsock->mmsg[bufidx].msg_hdr), &(rawsock->miov[bufidx]), rawsock->pktbuf[bufidx], len);
 #endif
 
+	sendmmsgRawsockClearTxMeta(rawsock, bufidx);
+	if (sendmmsgRawsockExtractTxMeta(rawsock->pktbuf[bufidx], len,
+			&rawsock->txSubtype[bufidx],
+			&rawsock->txStreamUid[bufidx],
+			&rawsock->txSeq[bufidx],
+			&rawsock->txSeqValid[bufidx])) {
+		rawsock->txMetaValid[bufidx] = true;
+		if (sendmmsgRawsockTrackCrf(rawsock->txSubtype[bufidx], rawsock->txStreamUid[bufidx], rawsock->txSeqValid[bufidx])) {
+			if (rawsock->crfLastQueuedSeqValid) {
+				U8 expectedSeq = (U8)(rawsock->crfLastQueuedSeq + 1U);
+				if (rawsock->txSeq[bufidx] != expectedSeq) {
+					sendmmsgRawsockLogCrfSeqRow(
+						rawsock,
+						"send_queue",
+						"seq_gap",
+						&rawsock->crfQueueGapLogCount,
+						bufidx,
+						-1,
+						rawsock->buffersReady + 1,
+						rawsock->txSeq[bufidx],
+						expectedSeq,
+						timeNsec,
+						kernelLaunchTimeNsec);
+				}
+			}
+			if (rawsock->crfLastQueuedLaunchValid) {
+				S64 requestedStepNs = (timeNsec >= rawsock->crfLastQueuedRequestedLaunchNs)
+					? (S64)(timeNsec - rawsock->crfLastQueuedRequestedLaunchNs)
+					: -((S64)(rawsock->crfLastQueuedRequestedLaunchNs - timeNsec));
+				S64 kernelStepNs = (kernelLaunchTimeNsec >= rawsock->crfLastQueuedKernelLaunchNs)
+					? (S64)(kernelLaunchTimeNsec - rawsock->crfLastQueuedKernelLaunchNs)
+					: -((S64)(rawsock->crfLastQueuedKernelLaunchNs - kernelLaunchTimeNsec));
+				if (requestedStepNs <= 0 || kernelStepNs <= 0) {
+					sendmmsgRawsockLogCrfLaunchStepRow(
+						rawsock,
+						"non_monotonic",
+						&rawsock->crfLaunchStepLogCount,
+						bufidx,
+						rawsock->txSeq[bufidx],
+						rawsock->crfLastQueuedSeq,
+						timeNsec,
+						rawsock->crfLastQueuedRequestedLaunchNs,
+						kernelLaunchTimeNsec,
+						rawsock->crfLastQueuedKernelLaunchNs,
+						requestedStepNs,
+						kernelStepNs);
+				}
+				else if (requestedStepNs < 1500000LL || requestedStepNs > 2500000LL ||
+						kernelStepNs < 1500000LL || kernelStepNs > 2500000LL) {
+					sendmmsgRawsockLogCrfLaunchStepRow(
+						rawsock,
+						"step_outlier",
+						&rawsock->crfLaunchStepLogCount,
+						bufidx,
+						rawsock->txSeq[bufidx],
+						rawsock->crfLastQueuedSeq,
+						timeNsec,
+						rawsock->crfLastQueuedRequestedLaunchNs,
+						kernelLaunchTimeNsec,
+						rawsock->crfLastQueuedKernelLaunchNs,
+						requestedStepNs,
+						kernelStepNs);
+				}
+			}
+			rawsock->crfLastQueuedSeqValid = true;
+			rawsock->crfLastQueuedSeq = rawsock->txSeq[bufidx];
+			rawsock->crfLastQueuedLaunchValid = (timeNsec != 0 && kernelLaunchTimeNsec != 0);
+			rawsock->crfLastQueuedRequestedLaunchNs = timeNsec;
+			rawsock->crfLastQueuedKernelLaunchNs = kernelLaunchTimeNsec;
+		}
+	}
+
+#if USE_LAUNCHTIME
+	rawsock->txRequestedWallLaunchNs[bufidx] = timeNsec;
+	rawsock->txKernelLaunchNs[bufidx] = kernelLaunchTimeNsec;
+	if (rawsock->diagTimingEnabled ||
+			(rawsock->txMetaValid[bufidx] &&
+			 sendmmsgRawsockTrackCrf(rawsock->txSubtype[bufidx], rawsock->txStreamUid[bufidx], rawsock->txSeqValid[bufidx]))) {
+		if (!CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &readyWallNs)) {
+			readyWallNs = 0;
+		}
+		if (!sendmmsgRawsockGetTaiTime(&readyTaiNs)) {
+			readyTaiNs = 0;
+		}
+		rawsock->txReadyWallNs[bufidx] = readyWallNs;
+		rawsock->txReadyTaiNs[bufidx] = readyTaiNs;
+	}
+#endif
+
 
 	rawsock->buffersReady += 1;
 
@@ -668,8 +1468,11 @@ int sendmmsgRawsockSend(void *pvRawsock)
 	sendmmsg_rawsock_t *rawsock = (sendmmsg_rawsock_t*)pvRawsock;
 	int sz, bytes;
 	int sendErrno = 0;
+	U64 sendCallTaiNs = 0;
+	U64 sendReturnTaiNs = 0;
 #if USE_LAUNCHTIME
 	bool hadLaunchTimeCmsg = false;
+	bool haveCrfLeadMetrics = false;
 #endif
 
 	if (!VALID_TX_RAWSOCK(rawsock)) {
@@ -694,19 +1497,29 @@ int sendmmsgRawsockSend(void *pvRawsock)
 				break;
 			}
 		}
+		for (i = 0; i < rawsock->buffersReady; i++) {
+			if (rawsock->txMetaValid[i] &&
+					sendmmsgRawsockTrackCrf(rawsock->txSubtype[i], rawsock->txStreamUid[i], rawsock->txSeqValid[i])) {
+				haveCrfLeadMetrics = true;
+				break;
+			}
+		}
 	}
 #endif
+	if (rawsock->diagTimingEnabled || haveCrfLeadMetrics) {
+		(void)sendmmsgRawsockGetTaiTime(&sendCallTaiNs);
+	}
 	sz = sendmmsgRawsockSendBurst(rawsock, &sendErrno);
+	if (rawsock->diagTimingEnabled || haveCrfLeadMetrics) {
+		(void)sendmmsgRawsockGetTaiTime(&sendReturnTaiNs);
+		if (sendReturnTaiNs < sendCallTaiNs) {
+			sendReturnTaiNs = sendCallTaiNs;
+		}
+	}
 	if (sz < 0) {
 		int savedErrno = sendErrno;
 #if USE_LAUNCHTIME
-		AVB_LOGF_WARNING("sendmmsg errno=%d (%s) launchEnabled=%d sockConfigured=%d hadLaunchCmsg=%d first_controllen=%zu first_control=%p",
-			savedErrno, strerror(savedErrno),
-			rawsock->launchTimeEnabled ? 1 : 0,
-			rawsock->launchTimeSockConfigured ? 1 : 0,
-			hadLaunchTimeCmsg ? 1 : 0,
-			rawsock->buffersReady > 0 ? (size_t)rawsock->mmsg[0].msg_hdr.msg_controllen : 0U,
-			rawsock->buffersReady > 0 ? rawsock->mmsg[0].msg_hdr.msg_control : NULL);
+		sendmmsgRawsockLogBurstFailure(rawsock, savedErrno, hadLaunchTimeCmsg);
 		if (rawsock->launchTimeEnabled && rawsock->launchTimeSockConfigured &&
 				hadLaunchTimeCmsg && launchTimeErrnoIsUnsupported(savedErrno)) {
 			int i;
@@ -739,10 +1552,10 @@ int sendmmsgRawsockSend(void *pvRawsock)
 		}
 		else
 #endif
-		{
-			AVB_LOGF_ERROR("Call to sendmmsg failed! rc=%d errno=%d (%s)", sz, savedErrno, strerror(savedErrno));
-			bytes = sz;
-		}
+				{
+					AVB_LOGF_ERROR("Call to sendmmsg failed! rc=%d errno=%d (%s)", sz, savedErrno, strerror(savedErrno));
+					bytes = sz;
+				}
 	} else {
 		int i;
 		for (i = 0, bytes = 0; i < sz; i++) {
@@ -752,6 +1565,323 @@ int sendmmsgRawsockSend(void *pvRawsock)
 			AVB_LOGF_WARNING("Only sent %ld of %d messages; dropping others", sz, rawsock->buffersReady);
 		}
 	}
+
+	if (sz > 0) {
+		int i;
+		for (i = 0; i < sz; i++) {
+			if (!rawsock->txMetaValid[i] ||
+					!sendmmsgRawsockTrackCrf(rawsock->txSubtype[i], rawsock->txStreamUid[i], rawsock->txSeqValid[i])) {
+				continue;
+			}
+
+			if (rawsock->crfLastSentSeqValid) {
+				U8 expectedSeq = (U8)(rawsock->crfLastSentSeq + 1U);
+				if (rawsock->txSeq[i] != expectedSeq) {
+					sendmmsgRawsockLogCrfSeqRow(
+						rawsock,
+						"send_flush",
+						"seq_gap",
+						&rawsock->crfSendGapLogCount,
+						i,
+						sz,
+						rawsock->buffersReady,
+						rawsock->txSeq[i],
+						expectedSeq,
+						rawsock->txRequestedWallLaunchNs[i],
+						rawsock->txKernelLaunchNs[i]);
+				}
+			}
+			rawsock->crfLastSentSeqValid = true;
+			rawsock->crfLastSentSeq = rawsock->txSeq[i];
+		}
+	}
+
+	if (sz >= 0 && sz < rawsock->buffersReady) {
+		int i;
+		for (i = sz; i < rawsock->buffersReady; i++) {
+			if (!rawsock->txMetaValid[i] ||
+					!sendmmsgRawsockTrackCrf(rawsock->txSubtype[i], rawsock->txStreamUid[i], rawsock->txSeqValid[i])) {
+				continue;
+			}
+
+			sendmmsgRawsockLogCrfSeqRow(
+				rawsock,
+				"send_drop",
+				"tail_drop",
+				&rawsock->crfSendGapLogCount,
+				i,
+				sz,
+				rawsock->buffersReady,
+				rawsock->txSeq[i],
+				rawsock->crfLastSentSeqValid ? (U8)(rawsock->crfLastSentSeq + 1U) : rawsock->txSeq[i],
+				rawsock->txRequestedWallLaunchNs[i],
+				rawsock->txKernelLaunchNs[i]);
+		}
+	}
+
+#if USE_LAUNCHTIME
+	if (rawsock->diagTimingEnabled || haveCrfLeadMetrics) {
+		bool collectDiag = rawsock->diagTimingEnabled;
+		U64 submitLatencyNs = (sendReturnTaiNs >= sendCallTaiNs) ? (sendReturnTaiNs - sendCallTaiNs) : 0ULL;
+		int i;
+		if (collectDiag) {
+			sendmmsgRawsockDiagUpdateUnsigned(
+				&rawsock->diagSubmitLatencyMinNs,
+				&rawsock->diagSubmitLatencyMaxNs,
+				&rawsock->diagSubmitLatencySumNs,
+				rawsock->diagBurstCount,
+				submitLatencyNs);
+			rawsock->diagBurstCount++;
+		}
+
+		for (i = 0; i < rawsock->buffersReady; i++) {
+			U64 readyTaiNs = rawsock->txReadyTaiNs[i];
+			U64 readyWallNs = rawsock->txReadyWallNs[i];
+			U64 requestedWallLaunchNs = rawsock->txRequestedWallLaunchNs[i];
+			U64 kernelLaunchNs = rawsock->txKernelLaunchNs[i];
+			U64 queueBeforeSendNs = (sendCallTaiNs >= readyTaiNs) ? (sendCallTaiNs - readyTaiNs) : 0ULL;
+			bool isCrfPacket = rawsock->txMetaValid[i] &&
+				sendmmsgRawsockTrackCrf(rawsock->txSubtype[i], rawsock->txStreamUid[i], rawsock->txSeqValid[i]);
+
+			if (collectDiag) {
+				sendmmsgRawsockDiagUpdateUnsigned(
+					&rawsock->diagQueueBeforeSendMinNs,
+					&rawsock->diagQueueBeforeSendMaxNs,
+					&rawsock->diagQueueBeforeSendSumNs,
+					rawsock->diagPacketCount,
+					queueBeforeSendNs);
+				rawsock->diagPacketCount++;
+			}
+
+			if (kernelLaunchNs == 0 || readyTaiNs == 0 || readyWallNs == 0) {
+				if (isCrfPacket) {
+					rawsock->crfDiagPacketCount++;
+					if ((U32)rawsock->buffersReady > rawsock->crfDiagBurstReadyMax) {
+						rawsock->crfDiagBurstReadyMax = (U32)rawsock->buffersReady;
+					}
+					rawsock->crfDiagNoLaunchCount++;
+				}
+				if (collectDiag) {
+					rawsock->diagNoLaunchTimeCount++;
+					rawsock->diagOutlierRowCount++;
+					if (rawsock->diagOutlierRowCount <= 16ULL ||
+						((rawsock->diagOutlierRowCount % 256ULL) == 0ULL)) {
+						AVB_LOGF_WARNING(
+							"TX OUTLIER ROW flags=..Z stage=send stream=all requested_launch=%" PRIu64 " kernel_launch=%" PRIu64 " ready_wall=%" PRIu64 " ready_tai=%" PRIu64 " send_call=%" PRIu64 " send_return=%" PRIu64 " lead_ready_wall=na lead_ready_kernel=na lead_send_call=na lead_send_return=na no_launch=1 rows=%" PRIu64,
+							requestedWallLaunchNs,
+							kernelLaunchNs,
+							readyWallNs,
+							readyTaiNs,
+							sendCallTaiNs,
+							sendReturnTaiNs,
+							rawsock->diagOutlierRowCount);
+					}
+				}
+				if (isCrfPacket) {
+					sendmmsgRawsockLogCrfLeadRow(
+						rawsock,
+						"send_margin",
+						"no_launch",
+						&rawsock->crfNoLaunchLogCount,
+						i,
+						rawsock->txSeq[i],
+						requestedWallLaunchNs,
+						kernelLaunchNs,
+						readyWallNs,
+						readyTaiNs,
+						sendCallTaiNs,
+						sendReturnTaiNs,
+						0,
+						0,
+						0,
+						0,
+						rawsock->crfMinLeadWarnNs);
+					sendmmsgRawsockCrfDiagMaybeLog(rawsock);
+				}
+				continue;
+			}
+
+			{
+				S64 readyWallLeadNs = (requestedWallLaunchNs >= readyWallNs)
+					? (S64)(requestedWallLaunchNs - readyWallNs)
+					: -((S64)(readyWallNs - requestedWallLaunchNs));
+				S64 readyKernelLeadNs = (kernelLaunchNs >= readyTaiNs)
+					? (S64)(kernelLaunchNs - readyTaiNs)
+					: -((S64)(readyTaiNs - kernelLaunchNs));
+				S64 sendCallLeadNs = (kernelLaunchNs >= sendCallTaiNs)
+					? (S64)(kernelLaunchNs - sendCallTaiNs)
+					: -((S64)(sendCallTaiNs - kernelLaunchNs));
+				S64 sendReturnLeadNs = (kernelLaunchNs >= sendReturnTaiNs)
+					? (S64)(kernelLaunchNs - sendReturnTaiNs)
+					: -((S64)(sendReturnTaiNs - kernelLaunchNs));
+
+				if (collectDiag) {
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->diagReadyWallLeadMinNs,
+						&rawsock->diagReadyWallLeadMaxNs,
+						&rawsock->diagReadyWallLeadSumNs,
+						rawsock->diagLaunchMetricPacketCount,
+						readyWallLeadNs);
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->diagReadyKernelLeadMinNs,
+						&rawsock->diagReadyKernelLeadMaxNs,
+						&rawsock->diagReadyKernelLeadSumNs,
+						rawsock->diagLaunchMetricPacketCount,
+						readyKernelLeadNs);
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->diagSendCallLeadMinNs,
+						&rawsock->diagSendCallLeadMaxNs,
+						&rawsock->diagSendCallLeadSumNs,
+						rawsock->diagLaunchMetricPacketCount,
+						sendCallLeadNs);
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->diagSendReturnLeadMinNs,
+						&rawsock->diagSendReturnLeadMaxNs,
+						&rawsock->diagSendReturnLeadSumNs,
+						rawsock->diagLaunchMetricPacketCount,
+						sendReturnLeadNs);
+					rawsock->diagLaunchMetricPacketCount++;
+
+					if (readyKernelLeadNs < 0) {
+						rawsock->diagLateAtReadyCount++;
+					}
+					if (sendCallLeadNs < 0) {
+						rawsock->diagLateAtSendCallCount++;
+					}
+					if (sendReturnLeadNs < 0) {
+						rawsock->diagLateAtSendReturnCount++;
+					}
+				}
+
+				if (isCrfPacket) {
+					rawsock->crfDiagPacketCount++;
+					if ((U32)rawsock->buffersReady > rawsock->crfDiagBurstReadyMax) {
+						rawsock->crfDiagBurstReadyMax = (U32)rawsock->buffersReady;
+					}
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->crfDiagReadyKernelLeadMinNs,
+						&rawsock->crfDiagReadyKernelLeadMaxNs,
+						&rawsock->crfDiagReadyKernelLeadSumNs,
+						rawsock->crfDiagLeadMetricCount,
+						readyKernelLeadNs);
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->crfDiagSendCallLeadMinNs,
+						&rawsock->crfDiagSendCallLeadMaxNs,
+						&rawsock->crfDiagSendCallLeadSumNs,
+						rawsock->crfDiagLeadMetricCount,
+						sendCallLeadNs);
+					sendmmsgRawsockDiagUpdateSigned(
+						&rawsock->crfDiagSendReturnLeadMinNs,
+						&rawsock->crfDiagSendReturnLeadMaxNs,
+						&rawsock->crfDiagSendReturnLeadSumNs,
+						rawsock->crfDiagLeadMetricCount,
+						sendReturnLeadNs);
+					rawsock->crfDiagLeadMetricCount++;
+				}
+
+				if (isCrfPacket &&
+						(rawsock->crfMinLeadWarnNs > 0) &&
+						((readyKernelLeadNs >= 0 && (U64)readyKernelLeadNs < rawsock->crfMinLeadWarnNs) ||
+						 (sendCallLeadNs >= 0 && (U64)sendCallLeadNs < rawsock->crfMinLeadWarnNs) ||
+						 (sendReturnLeadNs >= 0 && (U64)sendReturnLeadNs < rawsock->crfMinLeadWarnNs))) {
+					rawsock->crfDiagLowLeadCount++;
+					sendmmsgRawsockLogCrfLeadRow(
+						rawsock,
+						"send_margin",
+						"low_lead",
+						&rawsock->crfLowLeadLogCount,
+						i,
+						rawsock->txSeq[i],
+						requestedWallLaunchNs,
+						kernelLaunchNs,
+						readyWallNs,
+						readyTaiNs,
+						sendCallTaiNs,
+						sendReturnTaiNs,
+						readyWallLeadNs,
+						readyKernelLeadNs,
+						sendCallLeadNs,
+						sendReturnLeadNs,
+						rawsock->crfMinLeadWarnNs);
+				}
+
+				if (isCrfPacket &&
+						(readyKernelLeadNs < 0 || sendCallLeadNs < 0 || sendReturnLeadNs < 0)) {
+					rawsock->crfDiagLateCount++;
+					sendmmsgRawsockLogCrfLeadRow(
+						rawsock,
+						"send",
+						"late",
+						&rawsock->crfLateLeadLogCount,
+						i,
+						rawsock->txSeq[i],
+						requestedWallLaunchNs,
+						kernelLaunchNs,
+						readyWallNs,
+						readyTaiNs,
+						sendCallTaiNs,
+						sendReturnTaiNs,
+						readyWallLeadNs,
+						readyKernelLeadNs,
+						sendCallLeadNs,
+						sendReturnLeadNs,
+						rawsock->crfMinLeadWarnNs);
+				}
+				if (isCrfPacket) {
+					sendmmsgRawsockCrfDiagMaybeLog(rawsock);
+				}
+
+				if (collectDiag && (readyKernelLeadNs < 0 || sendCallLeadNs < 0 || sendReturnLeadNs < 0)) {
+					rawsock->diagOutlierRowCount++;
+					if (rawsock->diagOutlierRowCount <= 16ULL ||
+						((rawsock->diagOutlierRowCount % 256ULL) == 0ULL)) {
+						AVB_LOGF_WARNING(
+							"TX OUTLIER ROW flags=..Z stage=send stream=all requested_launch=%" PRIu64 " kernel_launch=%" PRIu64 " ready_wall=%" PRIu64 " ready_tai=%" PRIu64 " send_call=%" PRIu64 " send_return=%" PRIu64 " lead_ready_wall=%" PRId64 " lead_ready_kernel=%" PRId64 " lead_send_call=%" PRId64 " lead_send_return=%" PRId64 " no_launch=0 rows=%" PRIu64,
+							requestedWallLaunchNs,
+							kernelLaunchNs,
+							readyWallNs,
+							readyTaiNs,
+							sendCallTaiNs,
+							sendReturnTaiNs,
+							readyWallLeadNs,
+							readyKernelLeadNs,
+							sendCallLeadNs,
+							sendReturnLeadNs,
+							rawsock->diagOutlierRowCount);
+					}
+				}
+			}
+		}
+
+	if (collectDiag) {
+			sendmmsgRawsockDiagMaybeLog(rawsock);
+		}
+	}
+#endif
+
+#if USE_LAUNCHTIME
+	sendmmsgRawsockDrainErrqueue(rawsock);
+#endif
+
+#if USE_LAUNCHTIME
+	{
+		int i;
+		for (i = 0; i < rawsock->buffersReady; i++) {
+			sendmmsgRawsockClearTxMeta(rawsock, i);
+			rawsock->txReadyWallNs[i] = 0;
+			rawsock->txReadyTaiNs[i] = 0;
+			rawsock->txRequestedWallLaunchNs[i] = 0;
+			rawsock->txKernelLaunchNs[i] = 0;
+		}
+	}
+#else
+	{
+		int i;
+		for (i = 0; i < rawsock->buffersReady; i++) {
+			sendmmsgRawsockClearTxMeta(rawsock, i);
+		}
+	}
+#endif
 
 	rawsock->buffersOut = rawsock->buffersReady = 0;
 

@@ -579,6 +579,14 @@ bool openavbAvdeccMsgClntHndlChangeRequestFromServer(int avdeccMsgHandle, openav
 		// Run requested.
 		AVB_LOGF_DEBUG("Run state requested for client %d", avdeccMsgHandle);
 		if (!(pState->pTLState->bRunning)) {
+			if (pState->pTLState && pState->pTLState->cfg.role == AVB_ROLE_TALKER) {
+				AVB_LOGF_WARNING("Client handling RUNNING request: handle=%d name=%s uid=%u running=%d paused=%d",
+					avdeccMsgHandle,
+					pState->pTLState->cfg.friendly_name,
+					pState->pTLState->cfg.stream_uid,
+					pState->pTLState->bRunning ? 1 : 0,
+					pState->pTLState->bPaused ? 1 : 0);
+			}
 			if (openavbTLRun((tl_handle_t) pState->pTLState)) {
 				// NOTE:  openavbTLRun() call will cause client change notification if successful.
 				AVB_LOGF_INFO("Client %d state changed to Running", avdeccMsgHandle);

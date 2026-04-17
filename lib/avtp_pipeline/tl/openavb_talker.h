@@ -64,6 +64,12 @@ typedef struct {
 	U64 			nextReportNS;
 	U64				nextSecondNS;
 	bool			useWallTimePacing;
+	U32				wakeDiagLogCount;
+	U64				wakeDiagSamples;
+	U64				wakeLateCount;
+	U64				wakeLateSumNs;
+	U64				wakeLateMinNs;
+	U64				wakeLateMaxNs;
 	unsigned long	lastReportFrames;
 	talker_stats_t	stats;
 

@@ -262,6 +262,20 @@ static int openavbTLCfgCallback(void *user, const char *tlSection, const char *n
 			&& pCfg->max_transit_usec <= UINT32_MAX)
 			valOK = TRUE;
 	}
+	else if (MATCH(name, "tx_submit_ahead_usec")) {
+		errno = 0;
+		pCfg->tx_submit_ahead_usec = strtol(value, &pEnd, 10);
+		if (*pEnd == '\0' && errno == 0
+			&& pCfg->tx_submit_ahead_usec <= UINT32_MAX)
+			valOK = TRUE;
+	}
+	else if (MATCH(name, "tx_submit_skew_usec")) {
+		errno = 0;
+		pCfg->tx_submit_skew_usec = strtol(value, &pEnd, 10);
+		if (*pEnd == '\0' && errno == 0
+			&& pCfg->tx_submit_skew_usec <= UINT32_MAX)
+			valOK = TRUE;
+	}
 	else if (MATCH(name, "max_transmit_deficit_usec")) {
 		errno = 0;
 		pCfg->max_transmit_deficit_usec = strtol(value, &pEnd, 10);
@@ -523,6 +537,16 @@ EXTERN_DLL_EXPORT bool openavbTLReadIniFileOsal(tl_handle_t TLhandle, const char
 		AVB_TRACE_EXIT(AVB_TRACE_TL);
 		return FALSE;
 	}
+
+	AVB_LOGF_INFO(
+		"TL parsed INI: file=%s name=%s uid=%u role=%u transit=%u deficit=%u ifname=%s",
+		fileName,
+		parseIniData.pCfg->friendly_name,
+		parseIniData.pCfg->stream_uid,
+		parseIniData.pCfg->role,
+		parseIniData.pCfg->max_transit_usec,
+		parseIniData.pCfg->max_transmit_deficit_usec,
+		parseIniData.pCfg->ifname);
 
 	// For a Talker, use the adapter MAC Address as the stream address when one was not supplied.
 	if (parseIniData.pCfg->role == AVB_ROLE_TALKER &&

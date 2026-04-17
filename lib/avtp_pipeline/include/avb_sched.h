@@ -51,6 +51,9 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #define TC_AVB_MARK_CLASS(M) 	(((M) >> TC_AVB_CLASS_SHIFT) - 1)
 #define TC_AVB_MARK_STREAM(M) 	((M)  & TC_AVB_STREAM_MASK)
 #define TC_AVB_MARK(C,S)		(((C + 1) << TC_AVB_CLASS_SHIFT) | (TC_AVB_STREAM_MASK & (S)))
+// Reserve the last Class A stream slot for the grouped direct AAF sender so
+// CRF can keep stream slot 0 and be steered independently.
+#define TC_AVB_CLASSA_GROUP_STREAM_SLOT 15
 
 #ifndef AVB_CLASS_LABEL
 #define AVB_CLASS_LABEL(C) ('A'+C)

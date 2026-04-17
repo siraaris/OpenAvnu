@@ -593,6 +593,13 @@ bool openavbAvdeccMsgSrvrChangeRequest(int avdeccMsgHandle, openavbAvdeccMsgStat
 	if (ret) {
 		// Save the requested state for future reference.
 		pState->lastRequestedState = desiredState;
+		if (desiredState == OPENAVB_AVDECC_MSG_RUNNING && pState->stream) {
+			AVB_LOGF_WARNING("Server requested RUNNING: handle=%d name=%s uid=%u reported=%s",
+				avdeccMsgHandle,
+				pState->stream->friendly_name,
+				pState->stream->stream_uid,
+				GetStateString(pState->lastReportedState));
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);

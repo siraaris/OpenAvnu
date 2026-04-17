@@ -378,6 +378,8 @@ EXTERN_DLL_EXPORT void openavbTLInitCfg(openavb_tl_cfg_t *pCfg)
 	pCfg->max_interval_frames = 1;
 	pCfg->max_frame_size = 1500;
 	pCfg->max_transit_usec = 50000;
+	pCfg->tx_submit_ahead_usec = 0;
+	pCfg->tx_submit_skew_usec = 0;
 	pCfg->max_transmit_deficit_usec = 50000;
 	pCfg->internal_latency = 0;
 	pCfg->max_stale = MICROSECONDS_PER_SECOND;
@@ -450,6 +452,17 @@ EXTERN_DLL_EXPORT bool openavbTLConfigure(tl_handle_t handle, openavb_tl_cfg_t *
 		AVB_LOG_ERROR("Failed to open mapping / interface library");
 		return FALSE;
 	}
+
+	AVB_LOGF_INFO(
+		"TL configure: name=%s uid=%u role=%u transit=%u submit_ahead=%u submit_skew=%u deficit=%u ifname=%s",
+		pCfg->friendly_name,
+		pCfg->stream_uid,
+		pCfg->role,
+		pCfg->max_transit_usec,
+		pCfg->tx_submit_ahead_usec,
+		pCfg->tx_submit_skew_usec,
+		pCfg->max_transmit_deficit_usec,
+		pCfg->ifname);
 
 	if (pCfg->pMapInitFn && pCfg->pMapInitFn(pTLState->pMediaQ, &pCfg->map_cb, pCfg->max_transit_usec)) {
 		checkMapCallbacks(&pTLState->cfg);
@@ -767,4 +780,3 @@ EXTERN_DLL_EXPORT void openavbTLPauseStream(tl_handle_t handle, bool bPause)
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
 }
-
