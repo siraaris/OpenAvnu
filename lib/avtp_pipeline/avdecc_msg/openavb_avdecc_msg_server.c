@@ -64,6 +64,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 // forward declarations
 static bool openavbAvdeccMsgSrvrReceiveFromClient(int avdeccMsgHandle, openavbAvdeccMessage_t *msg);
+static const char * GetStateString(openavbAvdeccMsgStateType_t state);
 
 // OSAL specific functions
 #include "openavb_avdecc_msg_server_osal.c"
@@ -593,6 +594,13 @@ bool openavbAvdeccMsgSrvrChangeRequest(int avdeccMsgHandle, openavbAvdeccMsgStat
 	if (ret) {
 		// Save the requested state for future reference.
 		pState->lastRequestedState = desiredState;
+		if (desiredState == OPENAVB_AVDECC_MSG_RUNNING && pState->stream) {
+			AVB_LOGF_WARNING("Server requested RUNNING: handle=%d name=%s uid=%u reported=%s",
+				avdeccMsgHandle,
+				pState->stream->friendly_name,
+				pState->stream->stream_uid,
+				GetStateString(pState->lastReportedState));
+		}
 	}
 
 	AVB_TRACE_EXIT(AVB_TRACE_AVDECC_MSG);

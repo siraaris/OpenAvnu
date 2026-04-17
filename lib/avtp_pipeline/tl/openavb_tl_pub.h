@@ -118,6 +118,10 @@ typedef struct {
 	/// Setting maximum transit time, on talker value is added to PTP Walltime,
 	/// on listener value is validated timestamp range
 	U32 max_transit_usec;
+	/// Queue the packet this many usec before its launch time (talker only)
+	U32 tx_submit_ahead_usec;
+	/// Additional per-stream queue-ahead skew relative to tx_submit_ahead_usec (talker only)
+	U32 tx_submit_skew_usec;
 	/// Maximum transmit deficit in usec - should be set to expected buffer size
 	/// on the listener side (talker only)
 	U32 max_transmit_deficit_usec;

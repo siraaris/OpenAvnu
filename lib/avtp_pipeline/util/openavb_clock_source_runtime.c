@@ -16,6 +16,10 @@ All rights reserved.
 #include "openavb_aem_types_pub.h"
 #include "openavb_time_osal_pub.h"
 
+#define AVB_LOG_COMPONENT "clockSourceRuntime"
+#include "openavb_pub.h"
+#include "openavb_log.h"
+
 typedef struct {
 	bool valid;
 	U64 timeNs;
@@ -57,6 +61,20 @@ typedef struct {
 
 static pthread_mutex_t gClockSourceRuntimeMutex = PTHREAD_MUTEX_INITIALIZER;
 static openavb_clock_source_runtime_state_t gClockSourceRuntime = {0};
+static U64 gClockSourceRuntimeCrfDiscontinuityCount = 0;
+static U64 gClockSourceRuntimeMediaDiscontinuityCount = 0;
+
+#define CLOCK_SOURCE_RUNTIME_DISCONTINUITY_LOG_NS (100000ULL)
+#define CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_WINDOW_NS (250000ULL)
+#define CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_MAX_NS (50000ULL)
+
+static const char *clockSourceRuntimeLocationLabel(U16 clock_source_location_type)
+{
+	if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+		return "output";
+	}
+	return "input";
+}
 
 static openavb_clock_source_runtime_time_bank_t *clockSourceRuntimeTimeBankForLocation(
 	openavb_clock_source_runtime_state_t *pState,
@@ -261,6 +279,52 @@ void openavbClockSourceRuntimeSetCrfTimeForLocation(
 	openavb_clock_source_runtime_time_t *pCrf =
 		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, TRUE);
 	if (pCrf) {
+		if (pCrf->valid && haveNow && pCrf->wallCaptureValid) {
+			U64 projectedPrevNs = pCrf->timeNs;
+			U64 wallStepNs = 0;
+			if (nowNs >= pCrf->wallCaptureNs) {
+				wallStepNs = (nowNs - pCrf->wallCaptureNs);
+				projectedPrevNs += wallStepNs;
+			}
+			S64 stepNs = crfTimeNs >= pCrf->timeNs
+				? (S64)(crfTimeNs - pCrf->timeNs)
+				: -((S64)(pCrf->timeNs - crfTimeNs));
+			S64 errNs = (crfTimeNs >= projectedPrevNs)
+				? (S64)(crfTimeNs - projectedPrevNs)
+				: -((S64)(projectedPrevNs - crfTimeNs));
+			if ((U64)llabs(errNs) > CLOCK_SOURCE_RUNTIME_DISCONTINUITY_LOG_NS) {
+				gClockSourceRuntimeCrfDiscontinuityCount++;
+				if (gClockSourceRuntimeCrfDiscontinuityCount <= 16 ||
+						(gClockSourceRuntimeCrfDiscontinuityCount % 2000ULL) == 0ULL) {
+					AVB_LOGF_WARNING(
+						"Clock source CRF discontinuity: location=%s/%u new=%llu prev_projected=%llu err=%lldns uncertain=%u generation=%u count=%llu",
+						clockSourceRuntimeLocationLabel(clock_source_location_type),
+						clock_source_location_index,
+						(unsigned long long)crfTimeNs,
+						(unsigned long long)projectedPrevNs,
+						(long long)errNs,
+						uncertain ? 1U : 0U,
+						pCrf->generation + 1U,
+						(unsigned long long)gClockSourceRuntimeCrfDiscontinuityCount);
+					if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+						AVB_LOGF_WARNING(
+							"TX OUTLIER ROW flags=.Y. stage=clocksrc_runtime event=crf_disc loc=%s/%u new=%llu prev=%llu now=%llu prev_wall=%llu wall_step=%llu step=%lld err=%lld uncertain=%u gen=%u count=%llu",
+							clockSourceRuntimeLocationLabel(clock_source_location_type),
+							clock_source_location_index,
+							(unsigned long long)crfTimeNs,
+							(unsigned long long)pCrf->timeNs,
+							(unsigned long long)nowNs,
+							(unsigned long long)pCrf->wallCaptureNs,
+							(unsigned long long)wallStepNs,
+							(long long)stepNs,
+							(long long)errNs,
+							uncertain ? 1U : 0U,
+							pCrf->generation + 1U,
+							(unsigned long long)gClockSourceRuntimeCrfDiscontinuityCount);
+					}
+				}
+			}
+		}
 		pCrf->timeNs = crfTimeNs;
 		pCrf->wallCaptureNs = nowNs;
 		pCrf->wallCaptureValid = haveNow;
@@ -374,7 +438,87 @@ void openavbClockSourceRuntimeSetMediaClockForLocation(
 	openavb_clock_source_runtime_time_t *pClock =
 		clockSourceRuntimeTimeGetSlot(pBank, clock_source_location_index, TRUE);
 	if (pClock) {
-		pClock->timeNs = mediaClockNs;
+		U64 storeMediaClockNs = mediaClockNs;
+		if (pClock->valid && haveNow && pClock->wallCaptureValid) {
+			U64 projectedPrevNs = pClock->timeNs;
+			U64 wallStepNs = 0;
+			if (nowNs >= pClock->wallCaptureNs) {
+				wallStepNs = (nowNs - pClock->wallCaptureNs);
+				projectedPrevNs += wallStepNs;
+			}
+			S64 stepNs = (mediaClockNs >= pClock->timeNs)
+				? (S64)(mediaClockNs - pClock->timeNs)
+				: -((S64)(pClock->timeNs - mediaClockNs));
+			S64 errNs = (mediaClockNs >= projectedPrevNs)
+				? (S64)(mediaClockNs - projectedPrevNs)
+				: -((S64)(projectedPrevNs - mediaClockNs));
+			if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT &&
+					!uncertain &&
+					(U64)llabs(errNs) <= CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_WINDOW_NS) {
+				S64 phaseAdjustNs = errNs / 8;
+				if (phaseAdjustNs > (S64)CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_MAX_NS) {
+					phaseAdjustNs = (S64)CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_MAX_NS;
+				}
+				else if (phaseAdjustNs < -((S64)CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_MAX_NS)) {
+					phaseAdjustNs = -((S64)CLOCK_SOURCE_RUNTIME_OUTPUT_SLEW_MAX_NS);
+				}
+				storeMediaClockNs = (phaseAdjustNs >= 0)
+					? (projectedPrevNs + (U64)phaseAdjustNs)
+					: ((projectedPrevNs > (U64)(-phaseAdjustNs))
+						? (projectedPrevNs - (U64)(-phaseAdjustNs))
+						: 0);
+				if (phaseAdjustNs != 0 &&
+						(gClockSourceRuntimeMediaDiscontinuityCount < 16 ||
+						 (gClockSourceRuntimeMediaDiscontinuityCount % 2000ULL) == 0ULL)) {
+					AVB_LOGF_INFO(
+						"TX OUTLIER ROW flags=.Y. stage=clocksrc_runtime event=media_slew loc=%s/%u raw=%llu projected=%llu stored=%llu wall_step=%llu step=%lld err=%lld adj=%lld uncertain=%u gen=%u",
+						clockSourceRuntimeLocationLabel(clock_source_location_type),
+						clock_source_location_index,
+						(unsigned long long)mediaClockNs,
+						(unsigned long long)projectedPrevNs,
+						(unsigned long long)storeMediaClockNs,
+						(unsigned long long)wallStepNs,
+						(long long)stepNs,
+						(long long)errNs,
+						(long long)phaseAdjustNs,
+						uncertain ? 1U : 0U,
+						pClock->generation + 1U);
+				}
+			}
+			if ((U64)llabs(errNs) > CLOCK_SOURCE_RUNTIME_DISCONTINUITY_LOG_NS) {
+				gClockSourceRuntimeMediaDiscontinuityCount++;
+				if (gClockSourceRuntimeMediaDiscontinuityCount <= 16 ||
+						(gClockSourceRuntimeMediaDiscontinuityCount % 2000ULL) == 0ULL) {
+					AVB_LOGF_WARNING(
+						"Clock source media discontinuity: location=%s/%u new=%llu prev_projected=%llu err=%lldns uncertain=%u generation=%u count=%llu",
+						clockSourceRuntimeLocationLabel(clock_source_location_type),
+						clock_source_location_index,
+						(unsigned long long)mediaClockNs,
+						(unsigned long long)projectedPrevNs,
+						(long long)errNs,
+						uncertain ? 1U : 0U,
+						pClock->generation + 1U,
+						(unsigned long long)gClockSourceRuntimeMediaDiscontinuityCount);
+					if (clock_source_location_type == OPENAVB_AEM_DESCRIPTOR_STREAM_OUTPUT) {
+						AVB_LOGF_WARNING(
+							"TX OUTLIER ROW flags=.Y. stage=clocksrc_runtime event=media_disc loc=%s/%u new=%llu prev=%llu now=%llu prev_wall=%llu wall_step=%llu step=%lld err=%lld uncertain=%u gen=%u count=%llu",
+							clockSourceRuntimeLocationLabel(clock_source_location_type),
+							clock_source_location_index,
+							(unsigned long long)mediaClockNs,
+							(unsigned long long)pClock->timeNs,
+							(unsigned long long)nowNs,
+							(unsigned long long)pClock->wallCaptureNs,
+							(unsigned long long)wallStepNs,
+							(long long)stepNs,
+							(long long)errNs,
+							uncertain ? 1U : 0U,
+							pClock->generation + 1U,
+							(unsigned long long)gClockSourceRuntimeMediaDiscontinuityCount);
+					}
+				}
+			}
+		}
+		pClock->timeNs = storeMediaClockNs;
 		pClock->wallCaptureNs = nowNs;
 		pClock->wallCaptureValid = haveNow;
 		pClock->uncertain = uncertain;

@@ -116,6 +116,7 @@ extern bool openavbIntfViewerInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *p
 
 // Linux interface modules
 extern bool openavbIntfAlsaInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
+extern bool openavbIntfAvb32DirectInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 extern bool openavbIntfBus32SplitInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 extern bool openavbIntfMpeg2tsFileInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
 extern bool openavbIntfWavFileInitialize(media_q_t *pMediaQ, openavb_intf_cb_t *pIntfCB);
@@ -280,6 +281,7 @@ int main(int argc, char *argv[])
 	registerStaticIntfModule(openavbIntfToneGenInitialize);
 	registerStaticIntfModule(openavbIntfViewerInitialize);
 	registerStaticIntfModule(openavbIntfAlsaInitialize);
+	registerStaticIntfModule(openavbIntfAvb32DirectInitialize);
 	registerStaticIntfModule(openavbIntfBus32SplitInitialize);
 	registerStaticIntfModule(openavbIntfMpeg2tsFileInitialize);
 	registerStaticIntfModule(openavbIntfWavFileInitialize);
@@ -395,7 +397,7 @@ int main(int argc, char *argv[])
 				continue;
 			}
 
-			AVB_LOGF_INFO("Deferred stream start released: %s uid=%u stable_for=%lluus selection_gen=%u source_gen=%u",
+			AVB_LOGF_WARNING("Deferred stream start released: %s uid=%u stable_for=%lluus selection_gen=%u source_gen=%u",
 				tlCfgList[i1].friendly_name,
 				tlCfgList[i1].stream_uid,
 				(unsigned long long)((nowNs - deferredStartList[i1].stableSinceNs) / 1000ULL),

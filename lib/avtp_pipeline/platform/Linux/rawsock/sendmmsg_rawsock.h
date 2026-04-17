@@ -41,7 +41,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "rawsock_impl.h"
 
 #define MSG_COUNT 8
-#define SENDMMSG_MAX_BURST 1
+#define SENDMMSG_MAX_BURST MSG_COUNT
 #define MAX_FRAME_SIZE 1024
 #define USE_LAUNCHTIME 1
 #define SENDMMSG_ENOBUFS_RETRIES 8
@@ -74,8 +74,20 @@ typedef struct {
 	struct iovec miov[MSG_COUNT];
 
 	unsigned char pktbuf[MSG_COUNT][MAX_FRAME_SIZE];
+	bool txMetaValid[MSG_COUNT];
+	U8 txSubtype[MSG_COUNT];
+	U16 txStreamUid[MSG_COUNT];
+	U8 txSeq[MSG_COUNT];
+	bool txSeqValid[MSG_COUNT];
 	unsigned long txOutOfBuffers;
 	unsigned long txOutOfBuffersCyclic;
+	U32 enobufsRetries;
+	U32 enobufsSleepUsec;
+	U32 txSndbufBytes;
+	bool socketPriorityValid;
+	U32 socketPriority;
+	bool socketMarkValid;
+	int socketMark;
 #if USE_LAUNCHTIME
 	unsigned char cmsgbuf[MSG_COUNT][CMSG_SPACE(sizeof(uint64_t))];
 	bool launchTimeEnabled;
@@ -85,6 +97,71 @@ typedef struct {
 	S64 launchTimeWallToTaiOffsetNs;
 	U64 launchTimeOffsetLastUpdateMonoNs;
 	U32 launchTimeOffsetLogCount;
+	bool diagTimingEnabled;
+	U32 diagTimingLogInterval;
+	U64 txReadyWallNs[MSG_COUNT];
+	U64 txReadyTaiNs[MSG_COUNT];
+	U64 txRequestedWallLaunchNs[MSG_COUNT];
+	U64 txKernelLaunchNs[MSG_COUNT];
+	U64 diagBurstCount;
+	U64 diagPacketCount;
+	U64 diagLaunchMetricPacketCount;
+	U64 diagMinLeadWarnNs;
+	U64 crfMinLeadWarnNs;
+	U64 diagNoLaunchTimeCount;
+	U64 diagErrqueueEvents;
+	U64 diagErrqueueMissed;
+	U64 diagLateAtReadyCount;
+	U64 diagLateAtSendCallCount;
+	U64 diagLateAtSendReturnCount;
+	U64 diagOutlierRowCount;
+	U64 crfDiagPacketCount;
+	U64 crfDiagLeadMetricCount;
+	S64 crfDiagReadyKernelLeadMinNs;
+	S64 crfDiagReadyKernelLeadMaxNs;
+	S64 crfDiagReadyKernelLeadSumNs;
+	S64 crfDiagSendCallLeadMinNs;
+	S64 crfDiagSendCallLeadMaxNs;
+	S64 crfDiagSendCallLeadSumNs;
+	S64 crfDiagSendReturnLeadMinNs;
+	S64 crfDiagSendReturnLeadMaxNs;
+	S64 crfDiagSendReturnLeadSumNs;
+	U64 crfDiagLowLeadCount;
+	U64 crfDiagLateCount;
+	U64 crfDiagNoLaunchCount;
+	U32 crfDiagBurstReadyMax;
+	U64 diagQueueBeforeSendMinNs;
+	U64 diagQueueBeforeSendMaxNs;
+	U64 diagQueueBeforeSendSumNs;
+	U64 diagSubmitLatencyMinNs;
+	U64 diagSubmitLatencyMaxNs;
+	U64 diagSubmitLatencySumNs;
+	S64 diagReadyWallLeadMinNs;
+	S64 diagReadyWallLeadMaxNs;
+	S64 diagReadyWallLeadSumNs;
+	S64 diagReadyKernelLeadMinNs;
+	S64 diagReadyKernelLeadMaxNs;
+	S64 diagReadyKernelLeadSumNs;
+	S64 diagSendCallLeadMinNs;
+	S64 diagSendCallLeadMaxNs;
+	S64 diagSendCallLeadSumNs;
+	S64 diagSendReturnLeadMinNs;
+	S64 diagSendReturnLeadMaxNs;
+	S64 diagSendReturnLeadSumNs;
+	bool crfLastQueuedSeqValid;
+	U8 crfLastQueuedSeq;
+	bool crfLastQueuedLaunchValid;
+	U64 crfLastQueuedRequestedLaunchNs;
+	U64 crfLastQueuedKernelLaunchNs;
+	bool crfLastSentSeqValid;
+	U8 crfLastSentSeq;
+	U32 crfErrqueueLogCount;
+	U32 crfLowLeadLogCount;
+	U32 crfNoLaunchLogCount;
+	U32 crfLateLeadLogCount;
+	U32 crfQueueGapLogCount;
+	U32 crfLaunchStepLogCount;
+	U32 crfSendGapLogCount;
 #endif
 } sendmmsg_rawsock_t;
 

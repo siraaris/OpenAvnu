@@ -180,6 +180,9 @@ U16 openavbQmgrAddStream(SRClassIdx_t nClass, unsigned classRate, unsigned maxIn
 	else {
 		// Find an unused stream in the appropriate SR class
 		for (nStream = 0, idx = nClass * MAX_AVB_STREAMS_PER_CLASS; nStream < MAX_AVB_STREAMS_PER_CLASS; nStream++, idx++) {
+			if (nClass == SR_CLASS_A && nStream == TC_AVB_CLASSA_GROUP_STREAM_SLOT) {
+				continue;
+			}
 			if (0 == qmgr_streams[idx].streamBytesPerSec) {
 				fwmark = TC_AVB_MARK(nClass, nStream);
 				break;

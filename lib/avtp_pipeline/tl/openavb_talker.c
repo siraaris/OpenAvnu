@@ -40,6 +40,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_avtp.h"
 #include "openavb_talker.h"
 #include "openavb_avdecc_msg_client.h"
+#include "avb_sched.h"
 
 // DEBUG Uncomment to turn on logging for just this module.
 //#define AVB_LOG_ON	1
@@ -48,6 +49,90 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_log.h"
 
 #include "openavb_debug.h"
+
+#define TALKER_WAKE_DIAG_INTERVAL 2048U
+#define TALKER_WAKE_LATE_WARN_NS 500000ULL
+#define DIRECT_TX_GROUP_UID_COUNT 4U
+#define DIRECT_TX_GROUP_FOLLOWER_SLEEP_MSEC 2U
+#define DIRECT_TX_GROUP_REQUIRED_MASK ((1u << DIRECT_TX_GROUP_UID_COUNT) - 1u)
+#define DIRECT_TX_GROUP_WORK_LEAD_MIN_NS 250000ULL
+#define DIRECT_TX_GROUP_WORK_LEAD_INIT_NS 1000000ULL
+#define DIRECT_TX_GROUP_WORK_LEAD_MARGIN_NS 250000ULL
+#define DIRECT_TX_GROUP_WORK_LEAD_MAX_NS 5000000ULL
+#define DIRECT_TX_GROUP_READY_LEAD_NS 250000ULL
+
+typedef struct {
+	pthread_mutex_t lock;
+	tl_state_t *members[DIRECT_TX_GROUP_UID_COUNT];
+	U32 activeMask;
+	U32 pendingMask;
+	U64 nextCycleNS;
+	U64 intervalNS;
+	bool useWallTimePacing;
+	U64 cycleCount;
+	void *sharedRawsock;
+	U32 sharedFwmark;
+	U64 workLeadNs;
+} direct_tx_group_t;
+
+static direct_tx_group_t sDirectTxGroup = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.members = { NULL, NULL, NULL, NULL },
+	.activeMask = 0,
+	.pendingMask = 0,
+	.nextCycleNS = 0,
+	.intervalNS = 0,
+	.useWallTimePacing = FALSE,
+	.cycleCount = 0,
+	.sharedRawsock = NULL,
+	.sharedFwmark = 0,
+	.workLeadNs = DIRECT_TX_GROUP_WORK_LEAD_INIT_NS,
+};
+
+static void talkerWakeDiagUpdate(U64 *pMin, U64 *pMax, U64 *pSum, U64 count, U64 value)
+{
+	if (count == 0) {
+		*pMin = value;
+		*pMax = value;
+		*pSum = value;
+		return;
+	}
+
+	if (value < *pMin) {
+		*pMin = value;
+	}
+	if (value > *pMax) {
+		*pMax = value;
+	}
+	*pSum += value;
+}
+
+static void talkerMaybeLogWakeDiag(talker_data_t *pTalkerData)
+{
+	if (!pTalkerData || pTalkerData->wakeDiagSamples == 0) {
+		return;
+	}
+
+	if (pTalkerData->wakeDiagSamples < TALKER_WAKE_DIAG_INTERVAL) {
+		return;
+	}
+
+	AVB_LOGF_WARNING(
+		"TALKER WAKE DIAG " STREAMID_FORMAT " wakes=%llu late_events=%llu late_avg=%lluns min=%lluns max=%lluns interval=%lluns",
+		STREAMID_ARGS(&pTalkerData->streamID),
+		(unsigned long long)pTalkerData->wakeDiagSamples,
+		(unsigned long long)pTalkerData->wakeLateCount,
+		(unsigned long long)((pTalkerData->wakeDiagSamples > 0) ? (pTalkerData->wakeLateSumNs / pTalkerData->wakeDiagSamples) : 0ULL),
+		(unsigned long long)pTalkerData->wakeLateMinNs,
+		(unsigned long long)pTalkerData->wakeLateMaxNs,
+		(unsigned long long)pTalkerData->intervalNS);
+
+	pTalkerData->wakeDiagSamples = 0;
+	pTalkerData->wakeLateCount = 0;
+	pTalkerData->wakeLateSumNs = 0;
+	pTalkerData->wakeLateMinNs = 0;
+	pTalkerData->wakeLateMaxNs = 0;
+}
 
 static inline void talkerSleepUntilWallTimeNS(U64 targetWallNs)
 {
@@ -62,6 +147,597 @@ static inline void talkerSleepUntilWallTimeNS(U64 targetWallNs)
 		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &monoNowNs);
 		SLEEP_UNTIL_NSEC(monoNowNs + (targetWallNs - wallNowNs));
 	}
+}
+
+static bool xUseDirectTxGroup(const tl_state_t *pTLState)
+{
+	const talker_data_t *pTalkerData;
+
+	if (!pTLState || pTLState->cfg.role != AVB_ROLE_TALKER) {
+		return FALSE;
+	}
+
+	pTalkerData = pTLState->pPvtTalkerData;
+	if (!pTalkerData) {
+		return FALSE;
+	}
+
+	if (!pTLState->cfg.intf_cb.intf_get_tx_start_cycle_cb) {
+		return FALSE;
+	}
+
+	return (pTalkerData->streamID.uniqueID < DIRECT_TX_GROUP_UID_COUNT);
+}
+
+static U32 xDirectTxGroupLeaderUid(U32 activeMask)
+{
+	U32 uid;
+
+	for (uid = 0; uid < DIRECT_TX_GROUP_UID_COUNT; uid++) {
+		if (activeMask & (1u << uid)) {
+			return uid;
+		}
+	}
+
+	return DIRECT_TX_GROUP_UID_COUNT;
+}
+
+static void xDirectTxGroupRegister(tl_state_t *pTLState)
+{
+	talker_data_t *pTalkerData;
+	avtp_stream_t *pStream;
+	U32 uid;
+	U32 mask;
+
+	if (!xUseDirectTxGroup(pTLState)) {
+		return;
+	}
+
+	pTalkerData = pTLState->pPvtTalkerData;
+	pStream = pTalkerData ? (avtp_stream_t *)pTalkerData->avtpHandle : NULL;
+	uid = pTalkerData->streamID.uniqueID;
+	mask = (1u << uid);
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	if (pStream) {
+		if (!sDirectTxGroup.sharedRawsock) {
+			sDirectTxGroup.sharedRawsock = pStream->rawsock;
+			sDirectTxGroup.sharedFwmark = TC_AVB_MARK(
+				TC_AVB_MARK_CLASS(pStream->tx_fwmark),
+				TC_AVB_CLASSA_GROUP_STREAM_SLOT);
+		}
+		else if (pStream->rawsock && pStream->rawsock != sDirectTxGroup.sharedRawsock) {
+			openavbRawsockClose(pStream->rawsock);
+		}
+
+		pStream->rawsock = sDirectTxGroup.sharedRawsock;
+		pStream->owns_rawsock = FALSE;
+		pStream->tx_fwmark = sDirectTxGroup.sharedFwmark;
+	}
+	sDirectTxGroup.members[uid] = pTLState;
+	sDirectTxGroup.activeMask |= mask;
+	if (sDirectTxGroup.intervalNS == 0 || pTalkerData->intervalNS < sDirectTxGroup.intervalNS) {
+		sDirectTxGroup.intervalNS = pTalkerData->intervalNS;
+	}
+	if (sDirectTxGroup.nextCycleNS == 0 ||
+			(pTalkerData->nextCycleNS != 0 && pTalkerData->nextCycleNS < sDirectTxGroup.nextCycleNS)) {
+		sDirectTxGroup.nextCycleNS = pTalkerData->nextCycleNS;
+	}
+	sDirectTxGroup.useWallTimePacing = pTalkerData->useWallTimePacing;
+	AVB_LOGF_WARNING("Direct TX group register: uid=%u active_mask=0x%x leader=%u next_cycle=%" PRIu64 " interval=%" PRIu64,
+		uid,
+		sDirectTxGroup.activeMask,
+		xDirectTxGroupLeaderUid(sDirectTxGroup.activeMask),
+		sDirectTxGroup.nextCycleNS,
+		sDirectTxGroup.intervalNS);
+	AVB_LOGF_WARNING("Direct TX group mark: uid=%u shared_fwmark=%u class=%d slot=%u",
+		uid,
+		sDirectTxGroup.sharedFwmark,
+		TC_AVB_MARK_CLASS(sDirectTxGroup.sharedFwmark),
+		TC_AVB_MARK_STREAM(sDirectTxGroup.sharedFwmark));
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+}
+
+static void xDirectTxGroupUnregister(tl_state_t *pTLState)
+{
+	talker_data_t *pTalkerData;
+	avtp_stream_t *pStream;
+	U32 uid;
+	U32 mask;
+
+	if (!xUseDirectTxGroup(pTLState)) {
+		return;
+	}
+
+	pTalkerData = pTLState->pPvtTalkerData;
+	pStream = pTalkerData ? (avtp_stream_t *)pTalkerData->avtpHandle : NULL;
+	uid = pTalkerData->streamID.uniqueID;
+	mask = (1u << uid);
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	if (sDirectTxGroup.members[uid] == pTLState) {
+		sDirectTxGroup.members[uid] = NULL;
+		sDirectTxGroup.activeMask &= ~mask;
+	}
+	if (sDirectTxGroup.activeMask == 0) {
+		if (pStream) {
+			pStream->rawsock = NULL;
+		}
+		if (sDirectTxGroup.sharedRawsock) {
+			openavbRawsockClose(sDirectTxGroup.sharedRawsock);
+			sDirectTxGroup.sharedRawsock = NULL;
+		}
+		sDirectTxGroup.pendingMask = 0;
+		sDirectTxGroup.nextCycleNS = 0;
+		sDirectTxGroup.intervalNS = 0;
+		sDirectTxGroup.useWallTimePacing = FALSE;
+		sDirectTxGroup.cycleCount = 0;
+		sDirectTxGroup.sharedFwmark = 0;
+		sDirectTxGroup.workLeadNs = DIRECT_TX_GROUP_WORK_LEAD_INIT_NS;
+	}
+	AVB_LOGF_WARNING("Direct TX group unregister: uid=%u active_mask=0x%x leader=%u",
+		uid,
+		sDirectTxGroup.activeMask,
+		xDirectTxGroupLeaderUid(sDirectTxGroup.activeMask));
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+}
+
+static bool xDirectTxGroupDoStream(tl_state_t *pTLState)
+{
+	openavb_tl_cfg_t *pCfg;
+	talker_data_t *pTalkerData;
+	U32 selfUid;
+	U32 leaderUid;
+	U32 activeMask;
+	U32 pendingMask;
+	U32 sentMask = 0;
+	U64 targetCycleNS;
+	U64 wakeCycleNS;
+	U64 intervalNS;
+	bool useWallTimePacing;
+	U64 nowNS = 0;
+	U64 housekeepingNowNS = 0;
+	U64 cycleCount = 0;
+	U64 sourcePresentationNS = 0;
+	tl_state_t *orderedStates[DIRECT_TX_GROUP_UID_COUNT] = { NULL, NULL, NULL, NULL };
+	U32 orderCount = 0;
+	U32 uid;
+	U64 maxSubmitAdvanceNs = 0;
+	U64 workLeadNs = DIRECT_TX_GROUP_WORK_LEAD_INIT_NS;
+	bool sourceDrivenCycle = FALSE;
+	bool newCycle = FALSE;
+
+	if (!xUseDirectTxGroup(pTLState) || !pTLState->bStreaming) {
+		return FALSE;
+	}
+
+	pCfg = &pTLState->cfg;
+	pTalkerData = pTLState->pPvtTalkerData;
+	selfUid = pTalkerData->streamID.uniqueID;
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	activeMask = sDirectTxGroup.activeMask;
+	pendingMask = sDirectTxGroup.pendingMask;
+	leaderUid = xDirectTxGroupLeaderUid(activeMask);
+	targetCycleNS = sDirectTxGroup.nextCycleNS ? sDirectTxGroup.nextCycleNS : pTalkerData->nextCycleNS;
+	intervalNS = sDirectTxGroup.intervalNS ? sDirectTxGroup.intervalNS : pTalkerData->intervalNS;
+	useWallTimePacing = sDirectTxGroup.useWallTimePacing;
+	workLeadNs = sDirectTxGroup.workLeadNs ? sDirectTxGroup.workLeadNs : DIRECT_TX_GROUP_WORK_LEAD_INIT_NS;
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+
+	if (!(activeMask & (1u << selfUid))) {
+		SLEEP_MSEC(DIRECT_TX_GROUP_FOLLOWER_SLEEP_MSEC);
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+		if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	if ((activeMask & DIRECT_TX_GROUP_REQUIRED_MASK) != DIRECT_TX_GROUP_REQUIRED_MASK) {
+		if (pTalkerData->wakeDiagLogCount < 32) {
+			AVB_LOGF_WARNING(
+				"Direct TX group waiting for full registration: uid=%u active_mask=0x%x required_mask=0x%x leader=%u",
+				selfUid,
+				activeMask,
+				DIRECT_TX_GROUP_REQUIRED_MASK,
+				leaderUid);
+			pTalkerData->wakeDiagLogCount++;
+		}
+		SLEEP_MSEC(DIRECT_TX_GROUP_FOLLOWER_SLEEP_MSEC);
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+		if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	if (leaderUid != selfUid) {
+		SLEEP_MSEC(DIRECT_TX_GROUP_FOLLOWER_SLEEP_MSEC);
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+		if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	activeMask = sDirectTxGroup.activeMask;
+	if (sDirectTxGroup.pendingMask == 0) {
+		sDirectTxGroup.pendingMask = activeMask & DIRECT_TX_GROUP_REQUIRED_MASK;
+		newCycle = TRUE;
+	}
+	pendingMask = sDirectTxGroup.pendingMask;
+	for (uid = 0; uid < DIRECT_TX_GROUP_UID_COUNT; uid++) {
+		tl_state_t *pCandState;
+		U64 submitAdvanceNs;
+
+		if (!(pendingMask & (1u << uid))) {
+			continue;
+		}
+		pCandState = sDirectTxGroup.members[uid];
+		if (!pCandState || !pCandState->bStreaming || !pCandState->pPvtTalkerData) {
+			continue;
+		}
+
+		submitAdvanceNs = ((U64)pCandState->cfg.tx_submit_ahead_usec +
+				(U64)pCandState->cfg.tx_submit_skew_usec) * 1000ULL;
+		if (submitAdvanceNs > maxSubmitAdvanceNs) {
+			maxSubmitAdvanceNs = submitAdvanceNs;
+		}
+	}
+	cycleCount = newCycle ? ++sDirectTxGroup.cycleCount : sDirectTxGroup.cycleCount;
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+
+	if (newCycle && useWallTimePacing && pCfg->intf_cb.intf_prepare_tx_cycle_cb) {
+		if (!pCfg->intf_cb.intf_prepare_tx_cycle_cb(pTLState->pMediaQ, intervalNS, &sourcePresentationNS)) {
+			pthread_mutex_lock(&sDirectTxGroup.lock);
+			if (sDirectTxGroup.pendingMask == pendingMask) {
+				sDirectTxGroup.pendingMask = 0;
+				sDirectTxGroup.nextCycleNS = 0;
+			}
+			pthread_mutex_unlock(&sDirectTxGroup.lock);
+			pTalkerData->nextCycleNS = 0;
+			SLEEP_NSEC(50000ULL);
+			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+			if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+				pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+				return TRUE;
+			}
+			return FALSE;
+		}
+
+		{
+			U64 transitNs = (U64)pCfg->max_transit_usec * 1000ULL;
+			targetCycleNS = (sourcePresentationNS > transitNs) ? (sourcePresentationNS - transitNs) : 0ULL;
+			sourceDrivenCycle = TRUE;
+			pthread_mutex_lock(&sDirectTxGroup.lock);
+			sDirectTxGroup.nextCycleNS = targetCycleNS;
+			pthread_mutex_unlock(&sDirectTxGroup.lock);
+			pTalkerData->nextCycleNS = targetCycleNS;
+		}
+	}
+
+	wakeCycleNS = targetCycleNS;
+	if (maxSubmitAdvanceNs != 0 && wakeCycleNS > maxSubmitAdvanceNs) {
+		wakeCycleNS -= maxSubmitAdvanceNs;
+	}
+	if (workLeadNs != 0 && wakeCycleNS > workLeadNs) {
+		wakeCycleNS -= workLeadNs;
+	}
+	else {
+		wakeCycleNS = 0;
+	}
+
+	if (useWallTimePacing) {
+		U64 wallNowNs = 0;
+		U64 staleThresholdNs = intervalNS * 4ULL;
+		if (staleThresholdNs < 2000000ULL) {
+			staleThresholdNs = 2000000ULL;
+		}
+		if (CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &wallNowNs) &&
+				targetCycleNS != 0 &&
+				(targetCycleNS + staleThresholdNs) < wallNowNs) {
+			U64 staleTargetCycleNS = targetCycleNS;
+			{
+				U64 rebasedCycleNS = ((wallNowNs + intervalNS - 1ULL) / intervalNS) * intervalNS;
+				pthread_mutex_lock(&sDirectTxGroup.lock);
+				if (sourceDrivenCycle || sDirectTxGroup.nextCycleNS < rebasedCycleNS) {
+					sDirectTxGroup.nextCycleNS = rebasedCycleNS;
+				}
+				targetCycleNS = sDirectTxGroup.nextCycleNS;
+				pthread_mutex_unlock(&sDirectTxGroup.lock);
+				pTalkerData->nextCycleNS = targetCycleNS;
+				AVB_LOGF_WARNING(
+					"Direct TX grouped cycle rebase: leader=%u stale_target=%" PRIu64 " now=%" PRIu64 " rebased=%" PRIu64 " interval=%" PRIu64 " source_driven=%u",
+					selfUid,
+					staleTargetCycleNS,
+					wallNowNs,
+					rebasedCycleNS,
+					intervalNS,
+					sourceDrivenCycle ? 1u : 0u);
+			}
+		}
+		wakeCycleNS = targetCycleNS;
+		if (maxSubmitAdvanceNs != 0 && wakeCycleNS > maxSubmitAdvanceNs) {
+			wakeCycleNS -= maxSubmitAdvanceNs;
+		}
+		if (workLeadNs != 0 && wakeCycleNS > workLeadNs) {
+			wakeCycleNS -= workLeadNs;
+		}
+		else {
+			wakeCycleNS = 0;
+		}
+		talkerSleepUntilWallTimeNS(wakeCycleNS);
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
+	}
+	else {
+		SLEEP_UNTIL_NSEC(wakeCycleNS);
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
+	}
+	CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	activeMask = sDirectTxGroup.activeMask;
+	pendingMask = sDirectTxGroup.pendingMask;
+	for (uid = 0; uid < DIRECT_TX_GROUP_UID_COUNT; uid++) {
+		U32 bestUid = DIRECT_TX_GROUP_UID_COUNT;
+		U32 bestSkew = 0;
+		U32 cand;
+
+		for (cand = 0; cand < DIRECT_TX_GROUP_UID_COUNT; cand++) {
+			tl_state_t *pCandState;
+			talker_data_t *pCandTalker;
+
+			if (!(pendingMask & (1u << cand))) {
+				continue;
+			}
+			pCandState = sDirectTxGroup.members[cand];
+			if (!pCandState || !pCandState->bStreaming || !pCandState->pPvtTalkerData) {
+				continue;
+			}
+			pCandTalker = pCandState->pPvtTalkerData;
+			if (!pCandTalker->avtpHandle) {
+				continue;
+			}
+			if (bestUid == DIRECT_TX_GROUP_UID_COUNT ||
+					pCandState->cfg.tx_submit_skew_usec > bestSkew ||
+					(pCandState->cfg.tx_submit_skew_usec == bestSkew && cand < bestUid)) {
+				U32 alreadyUsed = 0;
+				U32 idx;
+				for (idx = 0; idx < orderCount; idx++) {
+					if (orderedStates[idx] == pCandState) {
+						alreadyUsed = 1;
+						break;
+					}
+				}
+				if (!alreadyUsed) {
+					bestUid = cand;
+					bestSkew = pCandState->cfg.tx_submit_skew_usec;
+				}
+			}
+		}
+
+		if (bestUid == DIRECT_TX_GROUP_UID_COUNT) {
+			break;
+		}
+		orderedStates[orderCount++] = sDirectTxGroup.members[bestUid];
+	}
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+
+	if (orderCount == 0) {
+		SLEEP_NSEC(50000ULL);
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
+		if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+			pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	if (cycleCount <= 16) {
+		talker_data_t *pOrder0 = (orderCount > 0 && orderedStates[0]) ? (talker_data_t *)orderedStates[0]->pPvtTalkerData : NULL;
+		talker_data_t *pOrder1 = (orderCount > 1 && orderedStates[1]) ? (talker_data_t *)orderedStates[1]->pPvtTalkerData : NULL;
+		talker_data_t *pOrder2 = (orderCount > 2 && orderedStates[2]) ? (talker_data_t *)orderedStates[2]->pPvtTalkerData : NULL;
+		talker_data_t *pOrder3 = (orderCount > 3 && orderedStates[3]) ? (talker_data_t *)orderedStates[3]->pPvtTalkerData : NULL;
+		AVB_LOGF_WARNING("Direct TX grouped cycle: leader=%u active_mask=0x%x order=%u,%u,%u,%u wake=%" PRIu64 " target=%" PRIu64 " interval=%" PRIu64 " submit_advance=%" PRIu64 " work_lead=%" PRIu64,
+			selfUid,
+			activeMask,
+			pOrder0 ? pOrder0->streamID.uniqueID : 255u,
+			pOrder1 ? pOrder1->streamID.uniqueID : 255u,
+			pOrder2 ? pOrder2->streamID.uniqueID : 255u,
+			pOrder3 ? pOrder3->streamID.uniqueID : 255u,
+			wakeCycleNS,
+			targetCycleNS,
+			intervalNS,
+			maxSubmitAdvanceNs,
+			workLeadNs);
+	}
+
+	{
+		U64 burstStartNs = 0;
+		U64 burstEndNs = 0;
+		U64 burstDurationNs = 0;
+		U32 firstUid = 255u;
+		U32 lastUid = 255u;
+		U64 memberStartNs[DIRECT_TX_GROUP_UID_COUNT] = { 0, 0, 0, 0 };
+		U64 memberEndNs[DIRECT_TX_GROUP_UID_COUNT] = { 0, 0, 0, 0 };
+		U64 memberDurationNs[DIRECT_TX_GROUP_UID_COUNT] = { 0, 0, 0, 0 };
+		U32 memberUid[DIRECT_TX_GROUP_UID_COUNT] = { 255u, 255u, 255u, 255u };
+		openavbRC memberRc[DIRECT_TX_GROUP_UID_COUNT] = { 0, 0, 0, 0 };
+
+		if (useWallTimePacing) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &burstStartNs);
+		}
+		else {
+			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &burstStartNs);
+		}
+
+	for (uid = 0; uid < orderCount; uid++) {
+		tl_state_t *pMemberState = orderedStates[uid];
+		talker_data_t *pMemberTalker;
+		avtp_stream_t *pMemberStream;
+		openavbRC rc;
+
+		if (!pMemberState || !pMemberState->bStreaming || !pMemberState->pPvtTalkerData) {
+			continue;
+		}
+		pMemberTalker = pMemberState->pPvtTalkerData;
+		pMemberStream = (avtp_stream_t *)pMemberTalker->avtpHandle;
+		if (!pMemberStream) {
+			continue;
+		}
+
+		if (firstUid == 255u) {
+			firstUid = pMemberTalker->streamID.uniqueID;
+		}
+		lastUid = pMemberTalker->streamID.uniqueID;
+		memberUid[uid] = pMemberTalker->streamID.uniqueID;
+		if (useWallTimePacing) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &memberStartNs[uid]);
+		}
+		else {
+			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &memberStartNs[uid]);
+		}
+
+		/*
+		 * Grouped direct AAF owns submit pacing at the group level. Wake once
+		 * at the earliest group submit point, then queue the whole burst
+		 * immediately in skew order and flush once on the final member.
+		 * This matches the simulator's grouped sender more closely and avoids
+		 * holding the earliest packet until the last member's submit slot.
+		 */
+		pMemberStream->tx_skip_submit_pacing = TRUE;
+		pMemberTalker->cntWakes++;
+		rc = openavbAvtpTx(
+			pMemberTalker->avtpHandle,
+			(uid + 1u) == orderCount,
+			pMemberState->cfg.tx_blocking_in_intf);
+		pMemberStream->tx_skip_submit_pacing = FALSE;
+		memberRc[uid] = rc;
+		if (useWallTimePacing) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &memberEndNs[uid]);
+		}
+		else {
+			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &memberEndNs[uid]);
+		}
+		if (memberEndNs[uid] >= memberStartNs[uid]) {
+			memberDurationNs[uid] = memberEndNs[uid] - memberStartNs[uid];
+		}
+		if (IS_OPENAVB_SUCCESS(rc)) {
+			pMemberTalker->cntFrames++;
+			sentMask |= (1u << pMemberTalker->streamID.uniqueID);
+		}
+		if (cycleCount <= 16) {
+			AVB_LOGF_WARNING("Direct TX grouped result: cycle=%" PRIu64 " uid=%u rc=0x%x packet_ready=%u frames=%lu wakes=%lu",
+				cycleCount,
+				pMemberTalker->streamID.uniqueID,
+				(unsigned)rc,
+				IS_OPENAVB_SUCCESS(rc) ? 1u : 0u,
+				pMemberTalker->cntFrames,
+				pMemberTalker->cntWakes);
+		}
+	}
+
+		if (useWallTimePacing) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &burstEndNs);
+		}
+		else {
+			CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &burstEndNs);
+		}
+		if (burstEndNs >= burstStartNs) {
+			burstDurationNs = burstEndNs - burstStartNs;
+		}
+		if (burstDurationNs > 0) {
+			U64 desiredWorkLeadNs = burstDurationNs + DIRECT_TX_GROUP_WORK_LEAD_MARGIN_NS;
+			if (desiredWorkLeadNs < DIRECT_TX_GROUP_WORK_LEAD_MIN_NS) {
+				desiredWorkLeadNs = DIRECT_TX_GROUP_WORK_LEAD_MIN_NS;
+			}
+			if (desiredWorkLeadNs > DIRECT_TX_GROUP_WORK_LEAD_MAX_NS) {
+				desiredWorkLeadNs = DIRECT_TX_GROUP_WORK_LEAD_MAX_NS;
+			}
+			pthread_mutex_lock(&sDirectTxGroup.lock);
+			if (desiredWorkLeadNs > sDirectTxGroup.workLeadNs) {
+				sDirectTxGroup.workLeadNs = desiredWorkLeadNs;
+			}
+			workLeadNs = sDirectTxGroup.workLeadNs;
+			pthread_mutex_unlock(&sDirectTxGroup.lock);
+		}
+		if ((burstDurationNs >= 200000ULL || cycleCount <= 16) && firstUid != 255u) {
+			AVB_LOGF_WARNING(
+				"Direct TX grouped burst: cycle=%" PRIu64 " leader=%u first_uid=%u last_uid=%u members=%u duration=%" PRIu64 "ns wake=%" PRIu64 " target=%" PRIu64 " submit_advance=%" PRIu64 " work_lead=%" PRIu64,
+				cycleCount,
+				selfUid,
+				firstUid,
+				lastUid,
+				orderCount,
+				burstDurationNs,
+				wakeCycleNS,
+				targetCycleNS,
+				maxSubmitAdvanceNs,
+				workLeadNs);
+			if (burstDurationNs >= 500000ULL) {
+				for (uid = 0; uid < orderCount; uid++) {
+					if (memberUid[uid] == 255u) {
+						continue;
+					}
+					AVB_LOGF_WARNING(
+						"Direct TX grouped member: cycle=%" PRIu64 " uid=%u rc=0x%x duration=%" PRIu64 "ns start_offset=%" PRIu64 "ns end_offset=%" PRIu64 "ns",
+						cycleCount,
+						memberUid[uid],
+						(unsigned)memberRc[uid],
+						memberDurationNs[uid],
+						(memberStartNs[uid] >= burstStartNs) ? (memberStartNs[uid] - burstStartNs) : 0ULL,
+						(memberEndNs[uid] >= burstStartNs) ? (memberEndNs[uid] - burstStartNs) : 0ULL);
+				}
+			}
+		}
+	}
+
+	if (useWallTimePacing) {
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNS);
+	}
+	else {
+		CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &nowNS);
+	}
+
+	pthread_mutex_lock(&sDirectTxGroup.lock);
+	if (sDirectTxGroup.activeMask != 0) {
+		if (sentMask == 0) {
+			sDirectTxGroup.pendingMask = 0;
+			sDirectTxGroup.nextCycleNS = 0;
+		}
+		else {
+			sDirectTxGroup.pendingMask &= ~sentMask;
+		}
+		if (sDirectTxGroup.pendingMask != 0) {
+			sDirectTxGroup.nextCycleNS = targetCycleNS;
+		}
+		else if (sourceDrivenCycle) {
+			sDirectTxGroup.nextCycleNS = 0;
+		}
+		else {
+			sDirectTxGroup.nextCycleNS = targetCycleNS + intervalNS;
+			if ((sDirectTxGroup.nextCycleNS + (pCfg->max_transmit_deficit_usec * 1000ULL)) < nowNS) {
+				nowNS = ((nowNS + intervalNS) / intervalNS) * intervalNS;
+				sDirectTxGroup.nextCycleNS = nowNS + intervalNS;
+			}
+		}
+	}
+	if (pTalkerData) {
+		pTalkerData->nextCycleNS = sDirectTxGroup.nextCycleNS;
+	}
+	pthread_mutex_unlock(&sDirectTxGroup.lock);
+
+	if (housekeepingNowNS > pTalkerData->nextSecondNS) {
+		pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
+		return TRUE;
+	}
+
+	return FALSE;
 }
 
 
@@ -80,6 +756,13 @@ bool talkerStartStream(tl_state_t *pTLState)
 	talker_data_t *pTalkerData = pTLState->pPvtTalkerData;
 
 	assert(!pTLState->bStreaming);
+
+	AVB_LOGF_WARNING(STREAMID_FORMAT", talkerStartStream: name=%s initial=%d defer_selected=%d stable_wait=%u",
+		STREAMID_ARGS(&pTalkerData->streamID),
+		pCfg->friendly_name,
+		pCfg->initial_state,
+		pCfg->defer_start_until_selected_clock ? 1 : 0,
+		pCfg->defer_start_stable_usec);
 
 	pTalkerData->wakeFrames = pCfg->max_interval_frames * pCfg->batch_factor;
 
@@ -106,6 +789,8 @@ bool talkerStartStream(tl_state_t *pTLState)
 		&pTalkerData->streamID,
 		pTalkerData->destAddr,
 		pCfg->max_transit_usec,
+		pCfg->tx_submit_ahead_usec,
+		pCfg->tx_submit_skew_usec,
 		pTalkerData->fwmark,
 		pTalkerData->vlanID,
 		pTalkerData->vlanPCP,
@@ -142,6 +827,7 @@ bool talkerStartStream(tl_state_t *pTLState)
 	// setup the initial times
 	U64 nowNS;
 	U64 housekeepingNowNS = 0;
+	U64 sharedNextCycleNS = 0;
 	pTalkerData->useWallTimePacing = FALSE;
 #if IGB_LAUNCHTIME_ENABLED || ATL_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
 	if (!pCfg->tx_blocking_in_intf) {
@@ -171,20 +857,33 @@ bool talkerStartStream(tl_state_t *pTLState)
 	// Align clock : allows for some performance gain
 	nowNS = ((nowNS + (pTalkerData->intervalNS)) / pTalkerData->intervalNS) * pTalkerData->intervalNS;
 
+	if (pTalkerData->useWallTimePacing &&
+		pCfg->intf_cb.intf_get_tx_start_cycle_cb &&
+		pCfg->intf_cb.intf_get_tx_start_cycle_cb(pTLState->pMediaQ, pTalkerData->intervalNS, &sharedNextCycleNS) &&
+		sharedNextCycleNS > nowNS) {
+		pTalkerData->nextCycleNS = sharedNextCycleNS;
+		AVB_LOGF_INFO(STREAMID_FORMAT", talker using shared start cycle=%" PRIu64 " interval=%" PRIu64,
+			STREAMID_ARGS(&pTalkerData->streamID),
+			pTalkerData->nextCycleNS,
+			pTalkerData->intervalNS);
+	}
+	else {
+		pTalkerData->nextCycleNS = nowNS + pTalkerData->intervalNS;
+	}
+
 	// Keep reporting/housekeeping on monotonic time so counter publication
 	// is not stranded if gPTP walltime steps during startup or GM changes.
 	CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &housekeepingNowNS);
 	pTalkerData->nextReportNS = housekeepingNowNS + (pCfg->report_seconds * NANOSECONDS_PER_SECOND);
 	pTalkerData->lastReportFrames = 0;
 	pTalkerData->nextSecondNS = housekeepingNowNS + NANOSECONDS_PER_SECOND;
-	pTalkerData->nextCycleNS = nowNS + pTalkerData->intervalNS;
-
 	// Clear stats
 	openavbTalkerClearStats(pTLState);
 	pTalkerData->aecpCounters.stream_start++;
 
 	// we're good to go!
 	pTLState->bStreaming = TRUE;
+	xDirectTxGroupRegister(pTLState);
 	openavbAvdeccMsgClntPublishCounters(pTLState);
 
 	AVB_TRACE_EXIT(AVB_TRACE_TL);
@@ -229,6 +928,7 @@ void talkerStopStream(tl_state_t *pTLState)
 		);
 
 	if (pTLState->bStreaming) {
+		xDirectTxGroupUnregister(pTLState);
 		openavbAvtpGetDiagCounters(pTalkerData->avtpHandle, &liveCounters);
 		openavbAvtpDiagCountersAccumulate(&pTalkerData->aecpCounters, &liveCounters);
 		pTalkerData->aecpCounters.stream_stop++;
@@ -279,7 +979,13 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 	if (pTLState->bStreaming) {
 		U64 nowNS;
 		U64 housekeepingNowNS = 0;
+		U64 wakeWallNs = 0;
 		bool usedBusySpin = FALSE;
+
+		if (xUseDirectTxGroup(pTLState)) {
+			AVB_TRACE_EXIT(AVB_TRACE_TL);
+			return xDirectTxGroupDoStream(pTLState);
+		}
 
 		if (!pCfg->tx_blocking_in_intf) {
 
@@ -298,6 +1004,33 @@ static inline bool talkerDoStream(tl_state_t *pTLState)
 				// pacing by sleeping to the cycle boundary.
 				SLEEP_UNTIL_NSEC(pTalkerData->nextCycleNS);
 #endif
+			}
+
+			if (pTalkerData->useWallTimePacing &&
+					CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &wakeWallNs) &&
+					wakeWallNs >= pTalkerData->nextCycleNS) {
+				U64 wakeLateNs = wakeWallNs - pTalkerData->nextCycleNS;
+				talkerWakeDiagUpdate(
+					&pTalkerData->wakeLateMinNs,
+					&pTalkerData->wakeLateMaxNs,
+					&pTalkerData->wakeLateSumNs,
+					pTalkerData->wakeDiagSamples,
+					wakeLateNs);
+				pTalkerData->wakeDiagSamples++;
+				if (wakeLateNs > 0) {
+					pTalkerData->wakeLateCount++;
+				}
+				if (wakeLateNs >= TALKER_WAKE_LATE_WARN_NS && pTalkerData->wakeDiagLogCount < 32) {
+					AVB_LOGF_WARNING(
+						"TALKER WAKE LATE " STREAMID_FORMAT " target=%llu wake=%llu late=%lluns interval=%lluns",
+						STREAMID_ARGS(&pTalkerData->streamID),
+						(unsigned long long)pTalkerData->nextCycleNS,
+						(unsigned long long)wakeWallNs,
+						(unsigned long long)wakeLateNs,
+						(unsigned long long)pTalkerData->intervalNS);
+					pTalkerData->wakeDiagLogCount++;
+				}
+				talkerMaybeLogWakeDiag(pTalkerData);
 			}
 
 			//AVB_DBG_INTERVAL(8000, TRUE);

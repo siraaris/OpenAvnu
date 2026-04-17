@@ -276,6 +276,7 @@ include_directories(
 		${AVB_OSAL_DIR}/avdecc_msg
 		${AVB_SRC_DIR}/../common
 		${AVB_SRC_DIR}/mcs
+		${AVB_SRC_DIR}/../../thirdparty/3SBAVBABI/include
 		)
 
 # Need include and link directories for GLIB
@@ -385,6 +386,7 @@ if (NOT AVB_FEATURE_AVDECC)
 	endmacro()
 
 	add_intf_mod_platform ( "intf_alsa" )
+	add_intf_mod_platform ( "intf_avb32_direct" )
 	add_intf_mod_platform ( "intf_bus32split" )
 	if (AVB_FEATURE_GSTREAMER)
 		add_intf_mod_platform ( "intf_mpeg2ts_gst" )

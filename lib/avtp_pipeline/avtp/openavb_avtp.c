@@ -54,8 +54,225 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_log.h"
 
 #define AVTP_V0_HEADER_SIZE 12
+#define AVTP_TX_PATH_DIAG_INTERVAL 2048U
+#define AVTP_TX_PATH_WARN_NS 500000ULL
+#define AVTP_TX_ACQUIRE_WARN_NS 200000ULL
+#define AVTP_CRF_SUBTYPE 0x04
+#define AVTP_CRF_SEQ_SHIFT 8
+
+static bool avtpShouldLogSparse(U32 count)
+{
+	return (count < 32U) || ((count % 1024U) == 0U);
+}
+
+static void avtpTxPathDiagUpdate(U64 *pMin, U64 *pMax, U64 *pSum, U64 count, U64 value)
+{
+	if (count == 0) {
+		*pMin = value;
+		*pMax = value;
+		*pSum = value;
+		return;
+	}
+
+	if (value < *pMin) {
+		*pMin = value;
+	}
+	if (value > *pMax) {
+		*pMax = value;
+	}
+	*pSum += value;
+}
+
+static void avtpMaybeLogTxPathDiag(avtp_stream_t *pStream)
+{
+	U16 streamUid = 0;
+
+	if (!pStream || pStream->tx_path_samples == 0 || pStream->tx_path_samples < AVTP_TX_PATH_DIAG_INTERVAL) {
+		return;
+	}
+
+	memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+	streamUid = ntohs(streamUid);
+	AVB_LOGF_WARNING(
+		"AVTP TX PATH DIAG uid=%u subtype=0x%02x packets=%llu intf_avg=%lluns min=%lluns max=%lluns map_avg=%lluns min=%lluns max=%lluns build_avg=%lluns min=%lluns max=%lluns clamp=%llu",
+		streamUid,
+		pStream->subtype,
+		(unsigned long long)pStream->tx_path_samples,
+		(unsigned long long)(pStream->tx_path_intf_sum_ns / pStream->tx_path_samples),
+		(unsigned long long)pStream->tx_path_intf_min_ns,
+		(unsigned long long)pStream->tx_path_intf_max_ns,
+		(unsigned long long)(pStream->tx_path_map_sum_ns / pStream->tx_path_samples),
+		(unsigned long long)pStream->tx_path_map_min_ns,
+		(unsigned long long)pStream->tx_path_map_max_ns,
+		(unsigned long long)(pStream->tx_path_build_sum_ns / pStream->tx_path_samples),
+		(unsigned long long)pStream->tx_path_build_min_ns,
+		(unsigned long long)pStream->tx_path_build_max_ns,
+		(unsigned long long)pStream->tx_path_clamp_count);
+
+	pStream->tx_path_samples = 0;
+	pStream->tx_path_intf_sum_ns = 0;
+	pStream->tx_path_intf_min_ns = 0;
+	pStream->tx_path_intf_max_ns = 0;
+	pStream->tx_path_map_sum_ns = 0;
+	pStream->tx_path_map_min_ns = 0;
+	pStream->tx_path_map_max_ns = 0;
+	pStream->tx_path_build_sum_ns = 0;
+	pStream->tx_path_build_min_ns = 0;
+	pStream->tx_path_build_max_ns = 0;
+	pStream->tx_path_clamp_count = 0;
+	pStream->tx_emit_seq_valid = FALSE;
+	pStream->tx_last_emit_seq = 0;
+	pStream->tx_emit_gap_log_count = 0;
+}
+
+static bool avtpExtractTxSequence(avtp_stream_t *pStream, const U8 *pAvtpFrame, U8 *pSeq)
+{
+	if (!pStream || !pAvtpFrame || !pSeq) {
+		return FALSE;
+	}
+
+	if (pStream->subtype == AVTP_CRF_SUBTYPE) {
+		U32 subtypeData = 0;
+		memcpy(&subtypeData, pAvtpFrame, sizeof(subtypeData));
+		subtypeData = ntohl(subtypeData);
+		*pSeq = (U8)((subtypeData >> AVTP_CRF_SEQ_SHIFT) & 0xFF);
+		return TRUE;
+	}
+
+	*pSeq = pAvtpFrame[2];
+	return TRUE;
+}
+
+static U64 avtpMaybePaceSubmit(avtp_stream_t *pStream, U64 launchTimeNs)
+{
+	U64 nowNs = 0;
+	U64 submitAdvanceNs = 0;
+	U64 targetSubmitNs = 0;
+	U64 remainingNs = 0;
+	U64 monoStartNs = 0;
+	U64 monoEndNs = 0;
+
+	if (!pStream || launchTimeNs == 0) {
+		return 0;
+	}
+	/*
+	 * CRF already carries an explicit launch target from the mapper and is
+	 * submitted as a single stream, unlike grouped AAF which owns pacing at
+	 * the group layer. When the OpenAvnu gPTP walltime diverges from the
+	 * kernel CLOCK_TAI domain, submit pacing can sleep for seconds and then
+	 * hand rawsock a launch time that is already in the past. Bypass pacing
+	 * here and let ETF/TXTIME enforce the mapper-provided launch time.
+	 */
+	if (pStream->subtype == AVTP_CRF_SUBTYPE) {
+		return 0;
+	}
+	if (pStream->tx_skip_submit_pacing) {
+		return 0;
+	}
+
+	submitAdvanceNs = ((U64)pStream->tx_submit_ahead_usec + (U64)pStream->tx_submit_skew_usec) * 1000ULL;
+	if (submitAdvanceNs == 0 || launchTimeNs <= submitAdvanceNs) {
+		return 0;
+	}
+
+	targetSubmitNs = launchTimeNs - submitAdvanceNs;
+	(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &monoStartNs);
+	if (!CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs)) {
+		return 0;
+	}
+
+	if (nowNs >= targetSubmitNs) {
+		if (pStream->tx_submit_log_count < 16 && nowNs > targetSubmitNs) {
+			U16 streamUid = 0;
+			memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+			streamUid = ntohs(streamUid);
+			AVB_LOGF_INFO(
+				"AVTP TX submit window: uid=%u subtype=0x%02x submit=%" PRIu64 " now=%" PRIu64 " delta=%" PRId64 "ns ahead=%u skew=%u",
+				streamUid,
+				pStream->subtype,
+				targetSubmitNs,
+				nowNs,
+				(int64_t)(targetSubmitNs - nowNs),
+				pStream->tx_submit_ahead_usec,
+				pStream->tx_submit_skew_usec);
+			pStream->tx_submit_log_count++;
+		}
+		return 0;
+	}
+
+	remainingNs = targetSubmitNs - nowNs;
+	while (remainingNs > 100000ULL) {
+		SLEEP_NSEC(remainingNs - 50000ULL);
+		if (!CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs) || nowNs >= targetSubmitNs) {
+			break;
+		}
+		remainingNs = targetSubmitNs - nowNs;
+	}
+
+	if (nowNs < targetSubmitNs) {
+		SPIN_UNTIL_NSEC(targetSubmitNs);
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+	}
+
+	if (pStream->tx_submit_log_count < 16) {
+		U16 streamUid = 0;
+		memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+		streamUid = ntohs(streamUid);
+		AVB_LOGF_INFO(
+			"AVTP TX submit window: uid=%u subtype=0x%02x submit=%" PRIu64 " now=%" PRIu64 " delta=%" PRId64 "ns ahead=%u skew=%u",
+			streamUid,
+			pStream->subtype,
+			targetSubmitNs,
+			nowNs,
+			(int64_t)(targetSubmitNs - nowNs),
+			pStream->tx_submit_ahead_usec,
+			pStream->tx_submit_skew_usec);
+		pStream->tx_submit_log_count++;
+	}
+
+	(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &monoEndNs);
+	if (monoEndNs >= monoStartNs) {
+		U64 paceDurationNs = monoEndNs - monoStartNs;
+		if (paceDurationNs >= 5000000ULL && pStream->tx_submit_warn_log_count < 32) {
+			U16 streamUid = 0;
+			memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+			streamUid = ntohs(streamUid);
+			AVB_LOGF_WARNING(
+				"AVTP TX submit slow: uid=%u subtype=0x%02x launch=%" PRIu64 " submit=%" PRIu64 " final_now=%" PRIu64 " duration=%" PRIu64 "ns ahead=%u skew=%u",
+				streamUid,
+				pStream->subtype,
+				launchTimeNs,
+				targetSubmitNs,
+				nowNs,
+				paceDurationNs,
+				pStream->tx_submit_ahead_usec,
+				pStream->tx_submit_skew_usec);
+			pStream->tx_submit_warn_log_count++;
+		}
+		return paceDurationNs;
+	}
+
+	return 0;
+}
 
 #if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
+static S64 avtpSignedDeltaNs(U64 newer, U64 older)
+{
+	return (newer >= older)
+		? (S64)(newer - older)
+		: -((S64)(older - newer));
+}
+
+static U64 avtpApplySignedOffsetNs(U64 baseNs, S64 offsetNs)
+{
+	if (offsetNs >= 0) {
+		return baseNs + (U64)offsetNs;
+	}
+
+	U64 absOffsetNs = (U64)(-offsetNs);
+	return (baseNs > absOffsetNs) ? (baseNs - absOffsetNs) : 0ULL;
+}
+
 static bool avtpCalcLaunchTimeFromTimestamp(avtp_stream_t *pStream, const U8 *pAvtpFrame, U64 *launchTimeNsec, U64 *timestampTimeNsec)
 {
 	if (!pStream || !pAvtpFrame || !launchTimeNsec) {
@@ -126,7 +343,10 @@ static openavbRC openAvtpSock(avtp_stream_t *pStream)
 }
 
 
-// Evaluate the AVTP timestamp. Only valid for common AVTP stream subtypes
+// Evaluate the AVTP timestamp. Only valid for common AVTP stream subtypes.
+// CRF repurposes the bytes at the common timestamp offset for packet_info, so
+// generic timestamp smoothing/counting must not touch subtype 0x04 packets.
+#define AVTP_SUBTYPE_CRF                0x04
 #define HIDX_AVTP_HIDE7_TV1			1
 #define HIDX_AVTP_HIDE7_TU1			3
 #define HIDX_AVTP_TIMESPAMP32		12
@@ -134,7 +354,7 @@ static void processTimestampEval(avtp_stream_t *pStream, U8 *pHdr)
 {
 	AVB_TRACE_ENTRY(AVB_TRACE_AVTP_DETAIL);
 
-	if (pStream->tsEval) {
+	if (pStream->tsEval && pStream->subtype != AVTP_SUBTYPE_CRF) {
 		bool tsValid =  (pHdr[HIDX_AVTP_HIDE7_TV1] & 0x01) ? TRUE : FALSE;
 		bool tsUncertain = (pHdr[HIDX_AVTP_HIDE7_TU1] & 0x01) ? TRUE : FALSE;
 
@@ -156,6 +376,10 @@ static void openavbAvtpCountLateEarlyTimestamp(avtp_stream_t *pStream, U32 avtpT
 	S32 deltaUsec;
 
 	if (!pStream || !timestampValid || timestampUncertain) {
+		return;
+	}
+
+	if (pStream->subtype == AVTP_SUBTYPE_CRF) {
 		return;
 	}
 
@@ -184,6 +408,8 @@ openavbRC openavbAvtpTxInit(
 	AVBStreamID_t *streamID,
 	U8 *destAddr,
 	U32 max_transit_usec,
+	U32 tx_submit_ahead_usec,
+	U32 tx_submit_skew_usec,
 	U32 fwmark,
 	U16 vlanID,
 	U8  vlanPCP,
@@ -201,6 +427,7 @@ openavbRC openavbAvtpTxInit(
 		AVB_RC_LOG_TRACE_RET(AVB_RC(OPENAVB_AVTP_FAILURE | OPENAVB_RC_OUT_OF_MEMORY), AVB_TRACE_AVTP);
 	}
 	pStream->tx = TRUE;
+	pStream->owns_rawsock = TRUE;
 
 	pStream->pMediaQ = pMediaQ;
 	pStream->pMapCB = pMapCB;
@@ -217,6 +444,8 @@ openavbRC openavbAvtpTxInit(
 
 	// and the latency
 	pStream->max_transit_usec = max_transit_usec;
+	pStream->tx_submit_ahead_usec = tx_submit_ahead_usec;
+	pStream->tx_submit_skew_usec = tx_submit_skew_usec;
 
 	// and save other stuff needed to (re)open the socket
 	pStream->ifname = strdup(ifname);
@@ -235,6 +464,7 @@ openavbRC openavbAvtpTxInit(
 	U8 srcAddr[ETH_ALEN];
 	if (openavbRawsockGetAddr(pStream->rawsock, srcAddr)) {
 		hdrInfo.shost = srcAddr;
+		memcpy(pStream->tx_src_addr, srcAddr, ETH_ALEN);
 	}
 	else {
 		openavbRawsockClose(pStream->rawsock);
@@ -244,6 +474,7 @@ openavbRC openavbAvtpTxInit(
 	}
 
 	hdrInfo.dhost = destAddr;
+	memcpy(pStream->tx_dest_addr, destAddr, ETH_ALEN);
 	if (vlanPCP != 0 || vlanID != 0) {
 		hdrInfo.vlan = TRUE;
 		hdrInfo.vlan_pcp = vlanPCP;
@@ -253,6 +484,9 @@ openavbRC openavbAvtpTxInit(
 	else {
 		hdrInfo.vlan = FALSE;
 	}
+	pStream->tx_vlan = hdrInfo.vlan;
+	pStream->tx_vlan_pcp = vlanPCP;
+	pStream->tx_vlan_id = vlanID;
 	openavbRawsockTxSetHdr(pStream->rawsock, &hdrInfo);
 
 	// Remember the AVTP subtype and streamID
@@ -263,6 +497,7 @@ openavbRC openavbAvtpTxInit(
        *pStreamUID = htons(streamID->uniqueID);
 
 	// Set the fwmark - used to steer packets into the right traffic control queue
+	pStream->tx_fwmark = fwmark;
 	openavbRawsockTxSetMark(pStream->rawsock, fwmark);
 
 	*pStream_out = (void *)pStream;
@@ -367,8 +602,59 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 	//   (We keep the TX buf in our stream data, so that if we don't
 	//    get data from the mapping module, we can use the buf next time.)
 	if (!pStream->pBuf) {
+		hdr_info_t hdrInfo;
+		U64 acquireStartNs = 0;
+		U64 hdrDoneNs = 0;
+		U64 markDoneNs = 0;
+		U64 getDoneNs = 0;
+		U64 hdrDurationNs = 0;
+		U64 markDurationNs = 0;
+		U64 getDurationNs = 0;
+		U64 acquireDurationNs = 0;
+		U16 streamUid = 0;
+
+		(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &acquireStartNs);
+		memset(&hdrInfo, 0, sizeof(hdrInfo));
+		hdrInfo.shost = pStream->tx_src_addr;
+		hdrInfo.dhost = pStream->tx_dest_addr;
+		hdrInfo.vlan = pStream->tx_vlan;
+		hdrInfo.vlan_pcp = pStream->tx_vlan_pcp;
+		hdrInfo.vlan_vid = pStream->tx_vlan_id;
+
+		openavbRawsockTxSetHdr(pStream->rawsock, &hdrInfo);
+		(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &hdrDoneNs);
+		openavbRawsockTxSetMark(pStream->rawsock, pStream->tx_fwmark);
+		(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &markDoneNs);
 
 		pStream->pBuf = (U8 *)openavbRawsockGetTxFrame(pStream->rawsock, TRUE, &frameLen);
+		(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &getDoneNs);
+		if (hdrDoneNs >= acquireStartNs) {
+			hdrDurationNs = hdrDoneNs - acquireStartNs;
+		}
+		if (markDoneNs >= hdrDoneNs) {
+			markDurationNs = markDoneNs - hdrDoneNs;
+		}
+		if (getDoneNs >= markDoneNs) {
+			getDurationNs = getDoneNs - markDoneNs;
+		}
+		if (getDoneNs >= acquireStartNs) {
+			acquireDurationNs = getDoneNs - acquireStartNs;
+		}
+		if (acquireDurationNs >= AVTP_TX_ACQUIRE_WARN_NS && pStream->tx_acquire_log_count < 64) {
+			memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+			streamUid = ntohs(streamUid);
+			AVB_LOGF_WARNING(
+				"AVTP TX ACQUIRE SLOW uid=%u subtype=0x%02x hdr=%lluns mark=%lluns get=%lluns total=%lluns fwmark=%u has_buf=%d",
+				streamUid,
+				pStream->subtype,
+				(unsigned long long)hdrDurationNs,
+				(unsigned long long)markDurationNs,
+				(unsigned long long)getDurationNs,
+				(unsigned long long)acquireDurationNs,
+				pStream->tx_fwmark,
+				pStream->pBuf ? 1 : 0);
+			pStream->tx_acquire_log_count++;
+		}
 		if (pStream->pBuf) {
 			assert(frameLen >= pStream->frameLen);
 			// Fill in the Ethernet header
@@ -388,10 +674,19 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 		}
 
 		U64 timeNsec = 0;
+		U64 intfStartNs = 0;
+		U64 intfDoneNs = 0;
+		U64 mapDoneNs = 0;
+		U64 intfDurationNs = 0;
+		U64 mapDurationNs = 0;
+		U64 buildDurationNs = 0;
+
+		(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &intfStartNs);
 
 		if (!txBlockingInIntf) {
 			// Call interface module to read data
 			pStream->pIntfCB->intf_tx_cb(pStream->pMediaQ);
+			(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &intfDoneNs);
 
 #if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
 			// Prefer mapping-provided launch time when available (e.g. CRF),
@@ -415,6 +710,7 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 
 			// Call mapping module to move data into AVTP frame
 			txCBResult = pStream->pMapCB->map_tx_cb(pStream->pMediaQ, pAvtpFrame, &avtpFrameLen);
+			(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &mapDoneNs);
 
 			pStream->bytes += avtpFrameLen;
 		}
@@ -440,19 +736,73 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 
 			// Blocking in interface mode. Pull from media queue for tx first
 			if ((txCBResult = pStream->pMapCB->map_tx_cb(pStream->pMediaQ, pAvtpFrame, &avtpFrameLen)) == TX_CB_RET_PACKET_NOT_READY) {
+				(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &mapDoneNs);
 				// Call interface module to read data
 				pStream->pIntfCB->intf_tx_cb(pStream->pMediaQ);
+				(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &intfDoneNs);
 			}
 			else {
+				(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &mapDoneNs);
+				intfDoneNs = mapDoneNs;
 				pStream->bytes += avtpFrameLen;
 			}
 		}
+
+		if (intfDoneNs >= intfStartNs) {
+			intfDurationNs = intfDoneNs - intfStartNs;
+		}
+		if (mapDoneNs >= intfDoneNs) {
+			mapDurationNs = mapDoneNs - intfDoneNs;
+		}
+		if (mapDoneNs >= intfStartNs) {
+			buildDurationNs = mapDoneNs - intfStartNs;
+		}
+
+		avtpTxPathDiagUpdate(&pStream->tx_path_intf_min_ns, &pStream->tx_path_intf_max_ns,
+			&pStream->tx_path_intf_sum_ns, pStream->tx_path_samples, intfDurationNs);
+		avtpTxPathDiagUpdate(&pStream->tx_path_map_min_ns, &pStream->tx_path_map_max_ns,
+			&pStream->tx_path_map_sum_ns, pStream->tx_path_samples, mapDurationNs);
+		avtpTxPathDiagUpdate(&pStream->tx_path_build_min_ns, &pStream->tx_path_build_max_ns,
+			&pStream->tx_path_build_sum_ns, pStream->tx_path_samples, buildDurationNs);
+		pStream->tx_path_samples++;
+		if ((intfDurationNs >= AVTP_TX_PATH_WARN_NS ||
+				mapDurationNs >= AVTP_TX_PATH_WARN_NS ||
+				buildDurationNs >= AVTP_TX_PATH_WARN_NS) &&
+				pStream->tx_path_log_count < 32) {
+			U16 streamUid = 0;
+			memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+			streamUid = ntohs(streamUid);
+			AVB_LOGF_WARNING(
+				"TX OUTLIER ROW flags=.Y. stage=avtp_path stream=%u subtype=0x%02x intf_ns=%" PRIu64 " map_ns=%" PRIu64 " build_ns=%" PRIu64 " warn_ns=%u packet_ready=%u slow_intf=%u slow_map=%u slow_build=%u",
+				streamUid,
+				pStream->subtype,
+				intfDurationNs,
+				mapDurationNs,
+				buildDurationNs,
+				(unsigned)AVTP_TX_PATH_WARN_NS,
+				(txCBResult != TX_CB_RET_PACKET_NOT_READY) ? 1u : 0u,
+				(intfDurationNs >= AVTP_TX_PATH_WARN_NS) ? 1u : 0u,
+				(mapDurationNs >= AVTP_TX_PATH_WARN_NS) ? 1u : 0u,
+				(buildDurationNs >= AVTP_TX_PATH_WARN_NS) ? 1u : 0u);
+			AVB_LOGF_WARNING(
+				"AVTP TX PATH SLOW uid=%u subtype=0x%02x intf=%lluns map=%lluns build=%lluns packet_ready=%d",
+				streamUid,
+				pStream->subtype,
+				(unsigned long long)intfDurationNs,
+				(unsigned long long)mapDurationNs,
+				(unsigned long long)buildDurationNs,
+				(txCBResult != TX_CB_RET_PACKET_NOT_READY) ? 1 : 0);
+			pStream->tx_path_log_count++;
+		}
+		avtpMaybeLogTxPathDiag(pStream);
 
 		// If we got data from the mapping module and stream is not paused,
 		// notify the raw sockets.
 		if (txCBResult != TX_CB_RET_PACKET_NOT_READY && !pStream->bPause) {
 			bool txTimestampValid = (pAvtpFrame[HIDX_AVTP_HIDE7_TV1] & 0x01) ? TRUE : FALSE;
 			bool txTimestampUncertain = (pAvtpFrame[HIDX_AVTP_HIDE7_TU1] & 0x01) ? TRUE : FALSE;
+			U8 txWireSeq = 0;
+			bool haveTxWireSeq = avtpExtractTxSequence(pStream, pAvtpFrame, &txWireSeq);
 
 			if (pStream->tsEval) {
 				processTimestampEval(pStream, pAvtpFrame);
@@ -477,25 +827,78 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 			#if IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED
 				{
 					U64 launchTimeNs = timeNsec;
+					U64 tsDerivedLaunchNs = 0;
 					U64 tsTimeNs = 0;
 					bool haveMapLaunchTime = FALSE;
+					bool haveTimestampLaunch = FALSE;
 
 				if (pStream->pMapCB->map_lt_calc_cb) {
 					haveMapLaunchTime = pStream->pMapCB->map_lt_calc_cb(pStream->pMediaQ, &launchTimeNs);
 				}
 
-					if (!haveMapLaunchTime) {
-						if (!avtpCalcLaunchTimeFromTimestamp(pStream, pAvtpFrame, &launchTimeNs, &tsTimeNs)) {
-							media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
-							if (item) {
-								launchTimeNs = item->pAvtpTime->timeNsec;
-								openavbMediaQTailUnlock(pStream->pMediaQ);
+					haveTimestampLaunch = avtpCalcLaunchTimeFromTimestamp(
+						pStream,
+						pAvtpFrame,
+						&tsDerivedLaunchNs,
+						&tsTimeNs);
+
+					if (haveTimestampLaunch) {
+						if (haveMapLaunchTime) {
+							S64 observedOffsetNs = avtpSignedDeltaNs(launchTimeNs, tsDerivedLaunchNs);
+							if (llabs(observedOffsetNs) <= 1000000LL) {
+								pStream->tx_map_launch_offset_ns = observedOffsetNs;
+								pStream->tx_map_launch_offset_valid = TRUE;
 							}
+							else {
+								S64 fallbackOffsetNs = pStream->tx_map_launch_offset_valid
+									? pStream->tx_map_launch_offset_ns
+									: 0LL;
+								U64 correctedLaunchNs = avtpApplySignedOffsetNs(tsDerivedLaunchNs, fallbackOffsetNs);
+								if (pStream->tx_map_launch_mismatch_log_count < 32) {
+									U16 streamUid = 0;
+									memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+									streamUid = ntohs(streamUid);
+									AVB_LOGF_WARNING(
+										"TX OUTLIER ROW flags=.Y. stage=avtp stream=%u map_launch=%" PRIu64 " ts_launch=%" PRIu64 " final_launch=%" PRIu64 " ts=%" PRIu64 " now=0 observed_offset_ns=%" PRId64 " fallback_offset_ns=%" PRId64 " clamp=0 event=map_mismatch",
+										streamUid,
+										launchTimeNs,
+										tsDerivedLaunchNs,
+										correctedLaunchNs,
+										tsTimeNs,
+										observedOffsetNs,
+										fallbackOffsetNs);
+									AVB_LOGF_WARNING(
+										"AVTP TX map launch mismatch: uid=%u subtype=0x%02x map_launch=%" PRIu64 " ts_launch=%" PRIu64 " observed_offset=%" PRId64 "ns fallback_offset=%" PRId64 "ns corrected_launch=%" PRIu64,
+										streamUid,
+										pStream->subtype,
+										launchTimeNs,
+										tsDerivedLaunchNs,
+										observedOffsetNs,
+										fallbackOffsetNs,
+										correctedLaunchNs);
+									pStream->tx_map_launch_mismatch_log_count++;
+								}
+								launchTimeNs = correctedLaunchNs;
+							}
+						}
+						else {
+							S64 fallbackOffsetNs = pStream->tx_map_launch_offset_valid
+								? pStream->tx_map_launch_offset_ns
+								: 0LL;
+							launchTimeNs = avtpApplySignedOffsetNs(tsDerivedLaunchNs, fallbackOffsetNs);
+						}
+					}
+					else if (!haveMapLaunchTime) {
+						media_q_item_t* item = openavbMediaQTailLock(pStream->pMediaQ, true);
+						if (item) {
+							launchTimeNs = item->pAvtpTime->timeNsec;
+							openavbMediaQTailUnlock(pStream->pMediaQ);
 						}
 					}
 
 					{
 						U64 nowNs = 0;
+						U64 originalLaunchTimeNs = launchTimeNs;
 						CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
 						U64 tsLeadNs = (tsTimeNs > 0 && tsTimeNs >= nowNs) ? (tsTimeNs - nowNs) :
 							(tsTimeNs > 0 ? 0ULL : 0ULL);
@@ -514,6 +917,38 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 						if (deltaLaunchNs < -5000000LL || deltaLaunchNs > ((int64_t)safeLeadNs + 50000000LL)) {
 							launchTimeNs = nowNs + safeLeadNs;
 							deltaLaunchNs = (int64_t)(launchTimeNs - nowNs);
+							pStream->tx_path_clamp_count++;
+							if (pStream->tx_path_log_count < 64) {
+								U16 streamUid = 0;
+								memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+								streamUid = ntohs(streamUid);
+								AVB_LOGF_WARNING(
+									"TX OUTLIER ROW flags=.Y. stage=avtp stream=%u map_launch=%" PRIu64 " ts_launch=%" PRIu64 " final_launch=%" PRIu64 " ts=%" PRIu64 " now=%" PRIu64 " observed_offset_ns=%" PRId64 " fallback_offset_ns=0 clamp=1 event=launch_clamp",
+									streamUid,
+									originalLaunchTimeNs,
+									tsDerivedLaunchNs,
+									launchTimeNs,
+									tsTimeNs,
+									nowNs,
+									(int64_t)(originalLaunchTimeNs - nowNs),
+									0LL);
+								AVB_LOGF_WARNING(
+									"AVTP TX launch clamped: uid=%u subtype=0x%02x original_launch=%" PRIu64 " clamped_launch=%" PRIu64 " now=%" PRIu64 " original_delta=%" PRId64 "ns final_delta=%" PRId64 "ns ts=%" PRIu64 " ts_lead=%" PRIu64 "ns safe_lead=%" PRIu64 "ns intf=%lluns map=%lluns build=%lluns",
+									streamUid,
+									pStream->subtype,
+									originalLaunchTimeNs,
+									launchTimeNs,
+									nowNs,
+									(int64_t)(originalLaunchTimeNs - nowNs),
+									deltaLaunchNs,
+									tsTimeNs,
+									tsLeadNs,
+									safeLeadNs,
+									(unsigned long long)intfDurationNs,
+									(unsigned long long)mapDurationNs,
+									(unsigned long long)buildDurationNs);
+								pStream->tx_path_log_count++;
+							}
 						}
 
 						if (pStream->tx_launch_log_count < 16 ||
@@ -535,15 +970,127 @@ openavbRC openavbAvtpTx(void *pv, bool bSend, bool txBlockingInIntf)
 								haveMapLaunchTime ? 1 : 0);
 							pStream->tx_launch_log_count++;
 						}
+
+						if (pStream->subtype == AVTP_CRF_SUBTYPE) {
+							U64 submitAdvanceNs = ((U64)pStream->tx_submit_ahead_usec +
+								(U64)pStream->tx_submit_skew_usec) * 1000ULL;
+							U64 warnLeadNs = submitAdvanceNs / 2ULL;
+							const char *event = NULL;
+
+							if (warnLeadNs < 250000ULL) {
+								warnLeadNs = 250000ULL;
+							}
+
+							if (deltaLaunchNs < 0) {
+								event = "late_launch";
+							}
+							else if ((U64)deltaLaunchNs < warnLeadNs) {
+								event = "low_lead";
+							}
+
+							if (event && avtpShouldLogSparse(pStream->tx_launch_margin_log_count)) {
+								U16 streamUid = 0;
+								memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+								streamUid = ntohs(streamUid);
+								AVB_LOGF_WARNING(
+									"TX OUTLIER ROW flags=.Y. stage=avtp_margin event=%s stream=%u subtype=0x%02x launch=%" PRIu64 " now=%" PRIu64 " launch_lead_ns=%" PRId64 " warn_lead_ns=%" PRIu64 " submit_ahead_ns=%" PRIu64 " submit_skew_ns=%" PRIu64 " ts=%" PRIu64 " ts_lead_ns=%" PRIu64 " map_launch=%" PRIu64 " map_lt=%u intf_ns=%" PRIu64 " map_ns=%" PRIu64 " build_ns=%" PRIu64,
+									event,
+									streamUid,
+									pStream->subtype,
+									launchTimeNs,
+									nowNs,
+									deltaLaunchNs,
+									warnLeadNs,
+									submitAdvanceNs,
+									(U64)pStream->tx_submit_skew_usec * 1000ULL,
+									tsTimeNs,
+									tsLeadNs,
+									originalLaunchTimeNs,
+									haveMapLaunchTime ? 1u : 0u,
+									intfDurationNs,
+									mapDurationNs,
+									buildDurationNs);
+							}
+							if (event) {
+								pStream->tx_launch_margin_log_count++;
+							}
+						}
 					}
-					openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, launchTimeNs);
+					if (pStream->subtype == AVTP_CRF_SUBTYPE && haveTxWireSeq) {
+						if (pStream->tx_emit_seq_valid) {
+							U8 expectedSeq = (U8)(pStream->tx_last_emit_seq + 1);
+							if (txWireSeq != expectedSeq && pStream->tx_emit_gap_log_count < 64) {
+								U16 streamUid = 0;
+								U8 lost = (U8)(txWireSeq - expectedSeq);
+								memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+								streamUid = ntohs(streamUid);
+								AVB_LOGF_WARNING(
+									"TX OUTLIER ROW flags=..Z stage=crf_emit stream=%u subtype=0x%02x seq=%u expected=%u lost=%u launch=%" PRIu64 " packet_ready=1 bSend=%u event=seq_gap_before_send",
+									streamUid,
+									pStream->subtype,
+									(unsigned)txWireSeq,
+									(unsigned)expectedSeq,
+									(unsigned)lost,
+									launchTimeNs,
+									bSend ? 1u : 0u);
+								pStream->tx_emit_gap_log_count++;
+							}
+						}
+						pStream->tx_emit_seq_valid = TRUE;
+						pStream->tx_last_emit_seq = txWireSeq;
+					}
+					{
+						U64 sendStageStartNs = 0;
+						U64 sendStageMidNs = 0;
+						U64 sendStageReadyNs = 0;
+						U64 sendStageEndNs = 0;
+						U64 paceDurationNs = 0;
+						U64 txReadyDurationNs = 0;
+						U64 sendDurationNs = 0;
+
+						(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &sendStageStartNs);
+						paceDurationNs = avtpMaybePaceSubmit(pStream, launchTimeNs);
+						(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &sendStageMidNs);
+						openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, launchTimeNs);
+						(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &sendStageReadyNs);
+						if (sendStageReadyNs >= sendStageMidNs) {
+							txReadyDurationNs = sendStageReadyNs - sendStageMidNs;
+						}
+						if (bSend) {
+							openavbRawsockSend(pStream->rawsock);
+						}
+						(void)CLOCK_GETTIME64(OPENAVB_TIMER_CLOCK, &sendStageEndNs);
+						if (sendStageEndNs >= sendStageReadyNs) {
+							sendDurationNs = sendStageEndNs - sendStageReadyNs;
+						}
+						if ((paceDurationNs >= 5000000ULL ||
+								txReadyDurationNs >= 5000000ULL ||
+								sendDurationNs >= 5000000ULL) &&
+								pStream->tx_send_warn_log_count < 32) {
+							U16 streamUid = 0;
+							memcpy(&streamUid, pStream->streamIDnet + ETH_ALEN, sizeof(streamUid));
+							streamUid = ntohs(streamUid);
+							AVB_LOGF_WARNING(
+								"AVTP TX send stage slow: uid=%u subtype=0x%02x pace=%" PRIu64 "ns ready=%" PRIu64 "ns send=%" PRIu64 "ns bSend=%d launch=%" PRIu64,
+								streamUid,
+								pStream->subtype,
+								paceDurationNs,
+								txReadyDurationNs,
+								sendDurationNs,
+								bSend ? 1 : 0,
+								launchTimeNs);
+							pStream->tx_send_warn_log_count++;
+						}
+					}
 				}
 			#else
 			openavbRawsockTxFrameReady(pStream->rawsock, pStream->pBuf, avtpFrameLen + pStream->ethHdrLen, timeNsec);
 			#endif
 			// Send if requested
+			#if !(IGB_LAUNCHTIME_ENABLED || SOCKET_LAUNCHTIME_ENABLED)
 			if (bSend)
 				openavbRawsockSend(pStream->rawsock);
+			#endif
 			// Drop our reference to it
 			pStream->pBuf = NULL;
 		}
@@ -967,10 +1514,10 @@ void openavbAvtpShutdownTalker(void *pv)
 		pStream->pMapCB->map_end_cb(pStream->pMediaQ);
 
 		// close the rawsock
-		if (pStream->rawsock) {
+		if (pStream->rawsock && pStream->owns_rawsock) {
 			openavbRawsockClose(pStream->rawsock);
-			pStream->rawsock = NULL;
 		}
+		pStream->rawsock = NULL;
 
 		if (pStream->ifname)
 			free(pStream->ifname);
@@ -990,10 +1537,10 @@ void openavbAvtpShutdownListener(void *pv)
 	avtp_stream_t *pStream = (avtp_stream_t *)pv;
 	if (pStream) {
 		// close the rawsock
-		if (pStream->rawsock) {
+		if (pStream->rawsock && pStream->owns_rawsock) {
 			openavbRawsockClose(pStream->rawsock);
-			pStream->rawsock = NULL;
 		}
+		pStream->rawsock = NULL;
 
 		pStream->pIntfCB->intf_end_cb(pStream->pMediaQ);
 		pStream->pMapCB->map_end_cb(pStream->pMediaQ);

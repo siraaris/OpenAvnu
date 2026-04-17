@@ -191,7 +191,7 @@ That should produce the binaries used by `run_milan_stack_tmux.sh`:
 - `daemons/mrpd/mrpd`
 - `daemons/maap/linux/build/maap_daemon`
 - `daemons/shaper/shaper_daemon`
-- `lib/avtp_pipeline/build/bin/openavb_host`
+- `lib/avtp_pipeline/build/platform/Linux/avb_host/openavb_host`
 - `lib/avtp_pipeline/build_avdecc/platform/Linux/avb_avdecc/openavb_avdecc`
 
 ## 7. Start the split32 Milan stack
@@ -283,9 +283,9 @@ Notes:
 If the stack starts but you do not get audio:
 
 - confirm `sudo ./run_milan_stack_tmux.sh status` shows all core components `proc=up`
-- check `/tmp/openavnu-avb-logs/daemon_cl_current.log`
-- check `/tmp/openavnu-avb-logs/phc2sys_current.log`
-- check `/tmp/openavnu-avb-logs/openavb_host_current.log`
+- check `/var/log/3sb/openavnu/daemon_cl.log`
+- check `/var/log/3sb/openavnu/phc2sys.log`
+- check `/var/log/3sb/openavnu/openavb_host.log`
 - confirm the source is really writing 32-channel `96k/S32_LE` audio into `bus32_play`
 - confirm Hive shows the talker streams and the listener connections as active
 

@@ -54,6 +54,15 @@ void openavbEptClntCheckVerMatchesSrvr(int endpointHandle, U32 AVBVersion)
 {
 }
 
+bool openavbEptClntAttachStream(int h, AVBStreamID_t *streamID, openavbSrpLsnrDeclSubtype_t ld)
+{
+	return TRUE;
+}
+
+void openavbEptClntCloseSrvrConnection(int h)
+{
+}
+
 
 // Talker Listener thread function
 void* openavbTLThreadFn(void *pv)
@@ -132,4 +141,3 @@ bool openavbEptClntService(int h, int timeout)
 {
 	return TRUE;
 }
-

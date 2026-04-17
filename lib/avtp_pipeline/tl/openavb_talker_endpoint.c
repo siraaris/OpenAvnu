@@ -35,6 +35,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "openavb_platform.h"
 #include "openavb_trace.h"
 #include "openavb_tl.h"
@@ -49,6 +50,36 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 
 #define	AVB_LOG_COMPONENT	"Talker"
 #include "openavb_log.h"
+
+typedef struct {
+	pthread_mutex_t lock;
+	U32 readyMask;
+	tl_state_t *readyStates[4];
+} direct_ready_group_t;
+
+typedef struct {
+	tl_state_t *pTLState;
+	U32 uid;
+	bool started;
+} direct_ready_start_ctx_t;
+
+static direct_ready_group_t sDirectReadyGroup = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.readyMask = 0,
+	.readyStates = { NULL, NULL, NULL, NULL },
+};
+
+static void *xStartDirectReadyGroupThread(void *pv)
+{
+	direct_ready_start_ctx_t *pCtx = (direct_ready_start_ctx_t *)pv;
+
+	if (pCtx && pCtx->pTLState) {
+		AVB_LOGF_INFO("Starting grouped direct stream: uid=%u", pCtx->uid);
+		pCtx->started = talkerStartStream(pCtx->pTLState);
+	}
+
+	return NULL;
+}
 
 static void updateTalkerStreamParamsFromEndpoint(openavb_tl_cfg_t *pCfg,
 		talker_data_t *pTalkerData,
@@ -85,6 +116,121 @@ static void updateTalkerStreamParamsFromEndpoint(openavb_tl_cfg_t *pCfg,
 	pCfg->dest_addr.mac = &(pCfg->dest_addr.buffer);
 	pCfg->sr_class = srClass;
 	pCfg->vlan_id = vlanID;
+}
+
+static bool xUseDirectReadyBarrier(tl_state_t *pTLState, const AVBStreamID_t *streamID)
+{
+	openavb_tl_cfg_t *pCfg;
+
+	if (!pTLState || !streamID) {
+		return FALSE;
+	}
+
+	if (pTLState->cfg.role != AVB_ROLE_TALKER) {
+		return FALSE;
+	}
+
+	pCfg = &pTLState->cfg;
+	if (!pCfg->intf_cb.intf_get_tx_start_cycle_cb) {
+		return FALSE;
+	}
+
+	return (streamID->uniqueID < 4u);
+}
+
+static void xClearDirectReadyBarrierSlot(const AVBStreamID_t *streamID, tl_state_t *pTLState)
+{
+	U32 uid;
+	U32 mask;
+
+	if (!xUseDirectReadyBarrier(pTLState, streamID)) {
+		return;
+	}
+
+	uid = (U32)streamID->uniqueID;
+	mask = (1u << uid);
+
+	pthread_mutex_lock(&sDirectReadyGroup.lock);
+	if (sDirectReadyGroup.readyStates[uid] == pTLState) {
+		sDirectReadyGroup.readyStates[uid] = NULL;
+		sDirectReadyGroup.readyMask &= ~mask;
+	}
+	pthread_mutex_unlock(&sDirectReadyGroup.lock);
+}
+
+static bool xStartDirectReadyBarrierGroup(const AVBStreamID_t *streamID, tl_state_t *pTLState)
+{
+	tl_state_t *startStates[4] = { NULL, NULL, NULL, NULL };
+	direct_ready_start_ctx_t startCtx[4];
+	pthread_t startThreads[4];
+	bool threadStarted[4] = { FALSE, FALSE, FALSE, FALSE };
+	U32 uid;
+	U32 mask;
+	U32 startMask = 0;
+	U32 i;
+
+	if (!xUseDirectReadyBarrier(pTLState, streamID)) {
+		return FALSE;
+	}
+
+	uid = (U32)streamID->uniqueID;
+	mask = (1u << uid);
+
+	pthread_mutex_lock(&sDirectReadyGroup.lock);
+	sDirectReadyGroup.readyStates[uid] = pTLState;
+	sDirectReadyGroup.readyMask |= mask;
+	AVB_LOGF_WARNING("Direct talker ready barrier: uid=%u ready_mask=0x%x expected=0x0f",
+		uid,
+		sDirectReadyGroup.readyMask);
+
+	if ((sDirectReadyGroup.readyMask & 0x0f) == 0x0f) {
+		startMask = sDirectReadyGroup.readyMask & 0x0f;
+		for (i = 0; i < 4; i++) {
+			startStates[i] = sDirectReadyGroup.readyStates[i];
+			sDirectReadyGroup.readyStates[i] = NULL;
+		}
+		sDirectReadyGroup.readyMask = 0;
+	}
+	pthread_mutex_unlock(&sDirectReadyGroup.lock);
+
+	if (startMask == 0) {
+		return TRUE;
+	}
+
+	AVB_LOGF_WARNING("Direct talker ready barrier release: start_mask=0x%x", startMask);
+	for (i = 0; i < 4; i++) {
+		if (!startStates[i] || startStates[i]->bStreaming) {
+			continue;
+		}
+		startCtx[i].pTLState = startStates[i];
+		startCtx[i].uid = i;
+		startCtx[i].started = FALSE;
+	}
+
+	for (i = 0; i < 4; i++) {
+		if (!startCtx[i].pTLState) {
+			continue;
+		}
+		if (pthread_create(&startThreads[i], NULL, xStartDirectReadyGroupThread, &startCtx[i]) == 0) {
+			threadStarted[i] = TRUE;
+		}
+		else {
+			AVB_LOGF_WARNING("Direct talker ready barrier thread create failed for uid=%u; starting inline", i);
+			AVB_LOGF_INFO("Starting grouped direct stream: uid=%u", i);
+			startCtx[i].started = talkerStartStream(startCtx[i].pTLState);
+		}
+	}
+
+	for (i = 0; i < 4; i++) {
+		if (threadStarted[i]) {
+			pthread_join(startThreads[i], NULL);
+		}
+		if (startCtx[i].pTLState && !startCtx[i].started) {
+			AVB_LOGF_WARNING("Grouped direct stream failed to start: uid=%u", i);
+		}
+	}
+
+	return TRUE;
 }
 
 /* Talker callback comes from endpoint, to indicate when listeners
@@ -124,6 +270,16 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 	}
 
 	AVB_LOGF_DEBUG("%s streaming=%d, lsnrDecl=%d", __FUNCTION__, pTLState->bStreaming, lsnrDecl);
+	AVB_LOGF_WARNING("Talker endpoint callback: uid=%u decl=%d streaming=%d dest=" ETH_FORMAT " class=%c rate=%u vlan=%u pcp=%u fwmark=%u",
+		streamID->uniqueID,
+		lsnrDecl,
+		pTLState->bStreaming ? 1 : 0,
+		ETH_OCTETS(destAddr),
+		AVB_CLASS_LABEL(srClass),
+		classRate,
+		vlanID,
+		priority,
+		fwmark);
 
 	openavb_tl_cfg_t *pCfg = &pTLState->cfg;
 
@@ -136,9 +292,11 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 			AVB_LOGF_INFO("Talker stream params: uid=%u class=%c classRate=%u vlanID=%u pcp=%u fwmark=%u",
 				streamID->uniqueID, AVB_CLASS_LABEL(srClass), classRate, vlanID, priority, fwmark);
 
-			// We should start streaming
-			AVB_LOGF_INFO("Starting stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
-			talkerStartStream(pTLState);
+			if (!xStartDirectReadyBarrierGroup(streamID, pTLState)) {
+				// We should start streaming
+				AVB_LOGF_INFO("Starting stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
+				talkerStartStream(pTLState);
+			}
 		}
 		else if (lsnrDecl == openavbSrp_LDSt_Stream_Info) {
 			// Stream information is available does NOT mean listener is ready. Stream not started yet.
@@ -151,6 +309,7 @@ void openavbEptClntNotifyTlkrOfSrpCb(int                      endpointHandle,
 	else {
 		if (lsnrDecl == openavbSrp_LDSt_None
 			|| lsnrDecl == openavbSrp_LDSt_Ignore) {
+			xClearDirectReadyBarrierSlot(streamID, pTLState);
 			// Nobody is listening any more
 			AVB_LOGF_INFO("Stopping stream: "STREAMID_FORMAT, STREAMID_ARGS(streamID));
 			talkerStopStream(pTLState);

@@ -145,6 +145,7 @@ typedef struct
 	U16 nbuffers;
 	// The rawsock library handle.  Used to send or receive frames.
 	void *rawsock;
+	bool owns_rawsock;
 	// The streamID - in network form
 	U8 streamIDnet[8];
 	// The destination address for stream
@@ -153,6 +154,16 @@ typedef struct
 	U8 subtype;
 	// Max Transit - value added to current time to get play time
 	U64 max_transit_usec;
+	// Queue-ahead pacing used before submitting the packet into rawsock/qdisc.
+	U32 tx_submit_ahead_usec;
+	U32 tx_submit_skew_usec;
+	bool tx_skip_submit_pacing;
+	U32 tx_fwmark;
+	U8 tx_src_addr[ETH_ALEN];
+	U8 tx_dest_addr[ETH_ALEN];
+	bool tx_vlan;
+	U16 tx_vlan_id;
+	U8 tx_vlan_pcp;
 	// Max frame size
 	U16 frameLen;
 	// AVTP sequence number
@@ -188,6 +199,32 @@ typedef struct
 	U64 bytes;
 	// Per-stream launch debug line count
 	U32 tx_launch_log_count;
+	U32 tx_launch_margin_log_count;
+	// Per-stream submit debug line count
+	U32 tx_submit_log_count;
+	U32 tx_submit_warn_log_count;
+	// Small local launch offset learned from map_lt_calc_cb relative to packet timestamp.
+	bool tx_map_launch_offset_valid;
+	S64 tx_map_launch_offset_ns;
+	U32 tx_map_launch_mismatch_log_count;
+	// Per-stream TX path instrumentation.
+	U32 tx_path_log_count;
+	U32 tx_acquire_log_count;
+	U32 tx_send_warn_log_count;
+	U64 tx_path_samples;
+	U64 tx_path_intf_sum_ns;
+	U64 tx_path_intf_min_ns;
+	U64 tx_path_intf_max_ns;
+	U64 tx_path_map_sum_ns;
+	U64 tx_path_map_min_ns;
+	U64 tx_path_map_max_ns;
+	U64 tx_path_build_sum_ns;
+	U64 tx_path_build_min_ns;
+	U64 tx_path_build_max_ns;
+	U64 tx_path_clamp_count;
+	bool tx_emit_seq_valid;
+	U8 tx_last_emit_seq;
+	U32 tx_emit_gap_log_count;
 
 	// Milan / AECP diagnostic counters for the current AVTP session.
 	openavb_avtp_diag_counters_t diag;
@@ -211,6 +248,8 @@ openavbRC openavbAvtpTxInit(media_q_t *pMediaQ,
 					AVBStreamID_t *streamID,
 					U8* destAddr,
 					U32 max_transit_usec,
+					U32 tx_submit_ahead_usec,
+					U32 tx_submit_skew_usec,
 					U32 fwmark,
 					U16 vlanID,
 					U8  vlanPCP,
