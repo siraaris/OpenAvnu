@@ -10,3 +10,6 @@
 [submodule "lib/atl_avb"]
 	path = lib/atl_avb
 	url = https://github.com/Aquantia/atl_avb
+[submodule "thirdparty/3SBAVBABI"]
+	path = thirdparty/3SBAVBABI
+	url = git@github.com:siraaris/3SBAVBABI.git

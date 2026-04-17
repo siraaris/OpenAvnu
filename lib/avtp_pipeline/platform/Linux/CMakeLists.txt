@@ -276,6 +276,7 @@ include_directories(
 		${AVB_OSAL_DIR}/avdecc_msg
 		${AVB_SRC_DIR}/../common
 		${AVB_SRC_DIR}/mcs
+		${AVB_SRC_DIR}/../../thirdparty/3SBAVBABI/include
 		)
 
 # Need include and link directories for GLIB

@@ -56,7 +56,7 @@ https://github.com/benhoyt/inih/commit/74d2ca064fb293bc60a77b0bd068075b293cf175.
 #include "openavb_clock_source_runtime_pub.h"
 #include "openavb_aem_types_pub.h"
 #include "openavb_time_osal_pub.h"
-#include "../platform/Linux/intf_avb32_direct/openavb_avb32_direct_abi.h"
+#include "openavb_avb32_direct_abi.h"
 
 #define AVB_LOG_COMPONENT "CRF Mapping"
 #include "openavb_log_pub.h"

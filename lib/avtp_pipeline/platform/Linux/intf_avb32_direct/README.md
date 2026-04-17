@@ -20,4 +20,4 @@ Important:
 
 - this does not yet provide the writer/playback-device side
 - current live profiles do not use this path yet
-- the ABI is defined in [openavb_avb32_direct_abi.h](/home/aris/src/3SBController/3rdparty/OpenAvnuMilan/lib/avtp_pipeline/platform/Linux/intf_avb32_direct/openavb_avb32_direct_abi.h)
+- the shared ABI is sourced from [thirdparty/3SBAVBABI/include/openavb_avb32_direct_abi.h](/home/aris/src/3SBController/3rdparty/OpenAvnuMilan/thirdparty/3SBAVBABI/include/openavb_avb32_direct_abi.h)
