@@ -385,6 +385,7 @@ if (NOT AVB_FEATURE_AVDECC)
 	endmacro()
 
 	add_intf_mod_platform ( "intf_alsa" )
+	add_intf_mod_platform ( "intf_avb32_direct" )
 	add_intf_mod_platform ( "intf_bus32split" )
 	if (AVB_FEATURE_GSTREAMER)
 		add_intf_mod_platform ( "intf_mpeg2ts_gst" )

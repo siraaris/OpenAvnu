@@ -188,6 +188,38 @@ typedef void (*openavb_intf_set_stream_uid_t)(media_q_t *pMediaQ, U16 stream_uid
  */
 typedef void (*openavb_intf_enable_fixed_timestamp)(media_q_t *pMediaQ, bool enable, U32 transmitInterval, U32 batchFactor);
 
+/** Query interface for a shared talker start cycle.
+ *
+ * This optional callback allows an interface to provide a common transmit
+ * cadence start time for multiple related talker streams. The returned value
+ * is in the pacing clock domain used by the talker loop, which for direct
+ * launch-time talkers is gPTP walltime.
+ *
+ * \param pMediaQ A pointer to media queue for this stream
+ * \param intervalNS Talker wake interval in nanoseconds
+ * \param pNextCycleNS Output shared next-cycle timestamp
+ * \return TRUE if a shared start cycle was provided, FALSE otherwise
+ */
+typedef bool (*openavb_intf_get_tx_start_cycle_cb_t)(media_q_t *pMediaQ, U64 intervalNS, U64 *pNextCycleNS);
+
+/** Prepare/query the next source-driven talker cycle.
+ *
+ * This optional callback allows an interface to prepare the next transmit
+ * cycle from its source timeline and return the presentation timestamp for
+ * that cycle. Grouped direct-launch talkers can use this to wake from actual
+ * source readiness each cycle instead of marching a synthetic timer forward.
+ *
+ * The interface may cache the prepared cycle internally so subsequent tx_cb
+ * calls for the same cycle reuse the exact same frame/timestamp selection.
+ *
+ * \param pMediaQ A pointer to media queue for this stream
+ * \param intervalNS Talker wake interval in nanoseconds
+ * \param pPresentationTimeNS Output presentation timestamp for the prepared cycle
+ * \return TRUE if a cycle was prepared and a presentation timestamp is valid,
+ *         FALSE if the source is not ready yet
+ */
+typedef bool (*openavb_intf_prepare_tx_cycle_cb_t)(media_q_t *pMediaQ, U64 intervalNS, U64 *pPresentationTimeNS);
+
 /** Interface callbacks structure.
  */
 typedef struct {
@@ -217,6 +249,10 @@ typedef struct {
 	openavb_intf_set_stream_uid_t  intf_set_stream_uid_cb;
 	/// Enable fixed timestamp callback
 	openavb_intf_enable_fixed_timestamp intf_enable_fixed_timestamp;
+	/// Optional callback for a shared talker start cadence
+	openavb_intf_get_tx_start_cycle_cb_t intf_get_tx_start_cycle_cb;
+	/// Optional callback for per-cycle source-driven talker scheduling
+	openavb_intf_prepare_tx_cycle_cb_t intf_prepare_tx_cycle_cb;
 } openavb_intf_cb_t;
 
 /** Main initialization entry point into the interface module.
@@ -247,4 +283,3 @@ typedef bool (*openavb_intf_initialize_fn_t)(media_q_t *pMediaQ, openavb_intf_cb
  * \brief A source code for a complete sample interface module.
  */
 #endif  // OPENAVB_INTF_PUB_H
-

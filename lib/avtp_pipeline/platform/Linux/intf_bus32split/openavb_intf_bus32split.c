@@ -41,6 +41,9 @@ All rights reserved.
 #define BUS32_PCM_DEVICE_DEFAULT          "bus32_cap_hw"
 #define BUS32_PERIOD_TIME_USEC_DEFAULT    2000
 #define BUS32_FIXED_TS_RUNTIME_LEAD_USEC_DEFAULT 1000
+#define BUS32_TX_STARTUP_GOVERN_PACKETS    8000U
+#define BUS32_TX_QUEUE_AGE_HIGH_NS         4000000ULL
+#define BUS32_TX_QUEUE_AGE_TARGET_NS       2000000ULL
 
 #define BUS32_PCM_ACCESS_TYPE             SND_PCM_ACCESS_RW_INTERLEAVED
 
@@ -104,77 +107,6 @@ static void ringReset(bus32_ring_t *r)
 	r->drops = 0;
 }
 
-static void ringDropOldest(bus32_ring_t *r, size_t len)
-{
-	if (!r || len == 0 || r->size == 0) {
-		return;
-	}
-	if (len >= r->fill) {
-		r->drops += r->fill;
-		r->rd = 0;
-		r->wr = 0;
-		r->fill = 0;
-		return;
-	}
-	r->rd = (r->rd + len) % r->size;
-	r->fill -= len;
-	r->drops += len;
-}
-
-static void ringWrite(bus32_ring_t *r, const U8 *src, size_t len)
-{
-	size_t first;
-	size_t second;
-	size_t needDrop;
-	if (!r || !src || len == 0 || r->size == 0) {
-		return;
-	}
-	if (len > r->size) {
-		src += (len - r->size);
-		len = r->size;
-	}
-	if (len > (r->size - r->fill)) {
-		needDrop = len - (r->size - r->fill);
-		ringDropOldest(r, needDrop);
-	}
-
-	first = len;
-	if (first > (r->size - r->wr)) {
-		first = r->size - r->wr;
-	}
-	memcpy(r->data + r->wr, src, first);
-	second = len - first;
-	if (second > 0) {
-		memcpy(r->data, src + first, second);
-	}
-	r->wr = (r->wr + len) % r->size;
-	r->fill += len;
-}
-
-static bool ringRead(bus32_ring_t *r, U8 *dst, size_t len)
-{
-	size_t first;
-	size_t second;
-	if (!r || !dst || len == 0 || r->size == 0) {
-		return FALSE;
-	}
-	if (r->fill < len) {
-		return FALSE;
-	}
-	first = len;
-	if (first > (r->size - r->rd)) {
-		first = r->size - r->rd;
-	}
-	memcpy(dst, r->data + r->rd, first);
-	second = len - first;
-	if (second > 0) {
-		memcpy(dst + first, r->data, second);
-	}
-	r->rd = (r->rd + len) % r->size;
-	r->fill -= len;
-	return TRUE;
-}
-
 static void metaRingReset(bus32_meta_ring_t *r)
 {
 	if (!r) {
@@ -195,61 +127,45 @@ static U64 bytesToDurationNs(size_t bytes, U32 bytesPerFrame, U32 sampleRate)
 	return (frames * NANOSECONDS_PER_SECOND) / sampleRate;
 }
 
-static void metaRingDropOldest(bus32_meta_ring_t *r, size_t len, U32 bytesPerFrame, U32 sampleRate)
+static U64 framesToDurationNs(U64 frames, U32 sampleRate)
 {
-	while (r && len > 0 && r->fill > 0) {
-		bus32_meta_entry_t *pEntry = &r->entry[r->rd];
-		if (len >= pEntry->bytes) {
-			len -= pEntry->bytes;
-			r->rd = (r->rd + 1) % BUS32_META_RING_DEPTH;
-			r->fill--;
-		}
-		else {
-			pEntry->captureStartNs += bytesToDurationNs(len, bytesPerFrame, sampleRate);
-			pEntry->bytes -= len;
-			len = 0;
-		}
+	if (sampleRate == 0) {
+		return 0;
 	}
+	return (frames * NANOSECONDS_PER_SECOND) / sampleRate;
 }
 
-static bool metaRingPush(bus32_meta_ring_t *r, size_t len, U64 captureStartNs)
+static U64 timespecToNs(const struct timespec *ts)
 {
-	if (!r || len == 0) {
+	if (!ts) {
+		return 0;
+	}
+	return ((U64)ts->tv_sec * (U64)NANOSECONDS_PER_SECOND) + (U64)ts->tv_nsec;
+}
+
+static bool monotonicNsToWalltimeNs(U64 monoNs, U64 *pWallNs)
+{
+	U64 monoNowNs = 0;
+	U64 wallNowNs = 0;
+
+	if (!pWallNs) {
 		return FALSE;
 	}
-	if (r->fill >= BUS32_META_RING_DEPTH) {
+	if (!CLOCK_GETTIME64(OPENAVB_CLOCK_MONOTONIC, &monoNowNs)) {
 		return FALSE;
 	}
-	r->entry[r->wr].bytes = len;
-	r->entry[r->wr].captureStartNs = captureStartNs;
-	r->wr = (r->wr + 1) % BUS32_META_RING_DEPTH;
-	r->fill++;
+	if (!CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &wallNowNs)) {
+		return FALSE;
+	}
+
+	if (monoNs >= monoNowNs) {
+		*pWallNs = wallNowNs + (monoNs - monoNowNs);
+	}
+	else {
+		U64 deltaNs = monoNowNs - monoNs;
+		*pWallNs = (wallNowNs > deltaNs) ? (wallNowNs - deltaNs) : 0;
+	}
 	return TRUE;
-}
-
-static bool metaRingConsume(bus32_meta_ring_t *r, size_t len, U32 bytesPerFrame, U32 sampleRate, U64 *pCaptureStartNs)
-{
-	bool haveStart = FALSE;
-
-	while (r && len > 0 && r->fill > 0) {
-		bus32_meta_entry_t *pEntry = &r->entry[r->rd];
-		if (!haveStart && pCaptureStartNs) {
-			*pCaptureStartNs = pEntry->captureStartNs;
-			haveStart = TRUE;
-		}
-		if (len >= pEntry->bytes) {
-			len -= pEntry->bytes;
-			r->rd = (r->rd + 1) % BUS32_META_RING_DEPTH;
-			r->fill--;
-		}
-		else {
-			pEntry->captureStartNs += bytesToDurationNs(len, bytesPerFrame, sampleRate);
-			pEntry->bytes -= len;
-			len = 0;
-		}
-	}
-
-	return (len == 0) && haveStart;
 }
 
 /* ---- Stream private data ---- */
@@ -275,6 +191,18 @@ typedef struct {
 	U16 streamUID;
 	U32 fixedTsRuntimeLeadUsec;
 	bool itemMetaAllocated;
+	U32 txCaptureDiagEveryPackets;
+	U64 txCaptureDiagPacketCounter;
+	U64 txCaptureDiagLogCount;
+	U64 txCaptureStaleCount;
+	U64 txAsyncProducedCount;
+	U64 txAsyncOverwriteCount;
+	U64 txAsyncDropCount;
+	bool txCatchupFlushPending;
+	U64 txCatchupFlushCount;
+	U32 txStartupGovernorPacketsRemaining;
+	U64 txStartupTrimCount;
+	U64 txStartupTrimBytes;
 
 	bool registered;
 } pvt_data_t;
@@ -283,6 +211,7 @@ typedef struct {
 typedef struct {
 	bool active;
 	pvt_data_t *owner;
+	media_q_t *pMediaQ;
 	bus32_ring_t ring;
 	bus32_meta_ring_t meta;
 } bus32_slot_t;
@@ -304,6 +233,16 @@ typedef struct {
 	bool allowResampling;
 	U32 periodTimeUsec;
 	U32 framesPerRead;
+	U32 negotiatedPeriodUsec;
+	U32 negotiatedBufferUsec;
+	U64 negotiatedPeriodFrames;
+	U64 negotiatedBufferFrames;
+	U64 swStartThresholdFrames;
+	U64 swAvailMinFrames;
+	S64 lastPcmDelayFrames;
+	U64 lastPcmDelayNs;
+	S64 lastPcmAvailFrames;
+	U64 lastPcmSnapshotNs;
 
 	/* Shared fixed-timestamp seed so all split streams start from a common epoch. */
 	bool fixedTsSeedValid;
@@ -317,6 +256,34 @@ typedef struct {
 } bus32_mgr_t;
 
 static bus32_mgr_t g_mgr = {0};
+
+static bool deriveCaptureStartNsFromAlsa(U32 framesRead, U32 sampleRate, U64 *pCaptureStartNs)
+{
+	snd_pcm_uframes_t availFrames = 0;
+	snd_htimestamp_t htstamp = {0};
+	U64 htMonoNs = 0;
+	U64 captureStartMonoNs = 0;
+	U64 totalFramesNs = 0;
+	int rslt;
+
+	if (!g_mgr.pcmHandle || !pCaptureStartNs || framesRead == 0 || sampleRate == 0) {
+		return FALSE;
+	}
+
+	rslt = snd_pcm_htimestamp(g_mgr.pcmHandle, &availFrames, &htstamp);
+	if (rslt < 0) {
+		return FALSE;
+	}
+
+	htMonoNs = timespecToNs((const struct timespec *)&htstamp);
+	totalFramesNs = framesToDurationNs((U64)availFrames + (U64)framesRead, sampleRate);
+	captureStartMonoNs = (htMonoNs > totalFramesNs) ? (htMonoNs - totalFramesNs) : 0;
+
+	g_mgr.lastPcmAvailFrames = (S64)availFrames;
+	g_mgr.lastPcmSnapshotNs = htMonoNs;
+
+	return monotonicNsToWalltimeNs(captureStartMonoNs, pCaptureStartNs);
+}
 
 static bool mgrInitIfNeeded(void)
 {
@@ -341,6 +308,66 @@ static bool mgrInitIfNeeded(void)
 	}
 	g_mgr.initDone = TRUE;
 	return TRUE;
+}
+
+static void logCapturePcmNegotiatedLocked(void)
+{
+	snd_pcm_hw_params_t *hwCurrent = NULL;
+	snd_pcm_sw_params_t *swCurrent = NULL;
+	snd_pcm_uframes_t bufferFrames = 0;
+	snd_pcm_uframes_t periodFrames = 0;
+	snd_pcm_uframes_t startThreshold = 0;
+	snd_pcm_uframes_t availMin = 0;
+	unsigned int periodUsec = 0;
+	unsigned int bufferUsec = 0;
+	int dir = 0;
+
+	if (!g_mgr.pcmHandle) {
+		return;
+	}
+
+	if (snd_pcm_get_params(g_mgr.pcmHandle, &bufferFrames, &periodFrames) == 0) {
+		g_mgr.negotiatedBufferFrames = (U64)bufferFrames;
+		g_mgr.negotiatedPeriodFrames = (U64)periodFrames;
+	}
+
+	if (snd_pcm_hw_params_malloc(&hwCurrent) == 0) {
+		if (snd_pcm_hw_params_current(g_mgr.pcmHandle, hwCurrent) == 0) {
+			dir = 0;
+			if (snd_pcm_hw_params_get_period_time(hwCurrent, &periodUsec, &dir) == 0) {
+				g_mgr.negotiatedPeriodUsec = periodUsec;
+			}
+			dir = 0;
+			if (snd_pcm_hw_params_get_buffer_time(hwCurrent, &bufferUsec, &dir) == 0) {
+				g_mgr.negotiatedBufferUsec = bufferUsec;
+			}
+		}
+		snd_pcm_hw_params_free(hwCurrent);
+	}
+
+	if (snd_pcm_sw_params_malloc(&swCurrent) == 0) {
+		if (snd_pcm_sw_params_current(g_mgr.pcmHandle, swCurrent) == 0) {
+			if (snd_pcm_sw_params_get_start_threshold(swCurrent, &startThreshold) == 0) {
+				g_mgr.swStartThresholdFrames = (U64)startThreshold;
+			}
+			if (snd_pcm_sw_params_get_avail_min(swCurrent, &availMin) == 0) {
+				g_mgr.swAvailMinFrames = (U64)availMin;
+			}
+		}
+		snd_pcm_sw_params_free(swCurrent);
+	}
+
+	AVB_LOGF_INFO(
+		"BUS32 split capture params: dev=%s rate=%u period=%lluf/%uus buffer=%lluf/%uus start_threshold=%lluf avail_min=%lluf framesPerRead=%u",
+		g_mgr.deviceName ? g_mgr.deviceName : "(null)",
+		g_mgr.sampleRate,
+		(unsigned long long)g_mgr.negotiatedPeriodFrames,
+		g_mgr.negotiatedPeriodUsec,
+		(unsigned long long)g_mgr.negotiatedBufferFrames,
+		g_mgr.negotiatedBufferUsec,
+		(unsigned long long)g_mgr.swStartThresholdFrames,
+		(unsigned long long)g_mgr.swAvailMinFrames,
+		g_mgr.framesPerRead);
 }
 
 static snd_pcm_format_t avbToAlsaFormat(avb_audio_type_t type,
@@ -507,57 +534,6 @@ static bool cloneSharedFixedTsToStreamLocked(pvt_data_t *pPvtData)
 	return TRUE;
 }
 
-static void slotWriteCaptureLocked(bus32_slot_t *pSlot, const U8 *pSrc, size_t len, U64 captureStartNs,
-						 U32 bytesPerFrame, U32 sampleRate)
-{
-	size_t dropBytes = 0;
-	size_t keptLen = len;
-	U64 keptStartNs = captureStartNs;
-
-	if (!pSlot || !pSrc || len == 0) {
-		return;
-	}
-
-	if (keptLen > pSlot->ring.size) {
-		dropBytes = keptLen - pSlot->ring.size;
-		pSrc += dropBytes;
-		keptLen = pSlot->ring.size;
-		keptStartNs += bytesToDurationNs(dropBytes, bytesPerFrame, sampleRate);
-	}
-
-	if (keptLen > (pSlot->ring.size - pSlot->ring.fill)) {
-		dropBytes = keptLen - (pSlot->ring.size - pSlot->ring.fill);
-		ringDropOldest(&pSlot->ring, dropBytes);
-		metaRingDropOldest(&pSlot->meta, dropBytes, bytesPerFrame, sampleRate);
-	}
-
-	ringWrite(&pSlot->ring, pSrc, keptLen);
-	if (!metaRingPush(&pSlot->meta, keptLen, keptStartNs)) {
-		/*
-		 * Metadata overflow should not happen in normal operation. If it does,
-		 * fall back to dropping the oldest metadata span and retry so data and
-		 * capture context stay aligned.
-		 */
-		metaRingDropOldest(&pSlot->meta, keptLen, bytesPerFrame, sampleRate);
-		(void)metaRingPush(&pSlot->meta, keptLen, keptStartNs);
-	}
-}
-
-static bool slotReadCaptureLocked(bus32_slot_t *pSlot, U8 *pDst, size_t len, U32 bytesPerFrame,
-						U32 sampleRate, U64 *pCaptureStartNs)
-{
-	if (!pSlot || !pDst || len == 0) {
-		return FALSE;
-	}
-	if (!ringRead(&pSlot->ring, pDst, len)) {
-		return FALSE;
-	}
-	if (!metaRingConsume(&pSlot->meta, len, bytesPerFrame, sampleRate, pCaptureStartNs)) {
-		return FALSE;
-	}
-	return TRUE;
-}
-
 static void setTxItemTimestamp(pvt_data_t *pPvtData, media_q_item_t *pItem)
 {
 	bus32_item_meta_t *pItemMeta = NULL;
@@ -597,11 +573,109 @@ static void setTxItemTimestamp(pvt_data_t *pPvtData, media_q_item_t *pItem)
 	openavbAvtpTimeSetToTimestampNS(pItem->pAvtpTime, pPvtData->mcs.edgeTime);
 }
 
+static void slotPushDirectToMediaQLocked(bus32_slot_t *pSlot, U32 idx, const U8 *pSrc, size_t len, U64 captureStartNs)
+{
+	media_q_t *pMediaQ = NULL;
+	pvt_data_t *pPvtData = NULL;
+	media_q_item_t *pItem = NULL;
+	bool droppedOldest = FALSE;
+	U64 nowNs = 0;
+	S64 captureAgeNs = 0;
+	U32 logEveryPackets = 0;
+
+	if (!pSlot || !pSlot->active || !pSlot->owner || !pSlot->pMediaQ || !pSrc || len == 0) {
+		return;
+	}
+
+	pMediaQ = pSlot->pMediaQ;
+	pPvtData = pSlot->owner;
+
+	pItem = openavbMediaQHeadLock(pMediaQ);
+	if (!pItem) {
+		media_q_item_t *pTail = openavbMediaQTailLock(pMediaQ, TRUE);
+		if (pTail) {
+			openavbMediaQTailPull(pMediaQ);
+			droppedOldest = TRUE;
+			pPvtData->txAsyncOverwriteCount++;
+			pItem = openavbMediaQHeadLock(pMediaQ);
+		}
+	}
+
+	if (!pItem) {
+		pPvtData->txAsyncDropCount++;
+		if (pPvtData->txAsyncDropCount <= 16 ||
+				(pPvtData->txAsyncDropCount % 2000ULL) == 0ULL) {
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+			captureAgeNs = (nowNs >= captureStartNs)
+				? (S64)(nowNs - captureStartNs)
+				: -((S64)(captureStartNs - nowNs));
+			AVB_LOGF_WARNING(
+				"BUS32 direct queue drop: stream=%u idx=%u item_bytes=%zu capture=%llu now=%llu age=%lldns produced=%llu overwrites=%llu drops=%llu",
+				pPvtData->streamUID,
+				idx,
+				len,
+				(unsigned long long)captureStartNs,
+				(unsigned long long)nowNs,
+				(long long)captureAgeNs,
+				(unsigned long long)pPvtData->txAsyncProducedCount,
+				(unsigned long long)pPvtData->txAsyncOverwriteCount,
+				(unsigned long long)pPvtData->txAsyncDropCount);
+		}
+		return;
+	}
+
+	if (!pItem->pPubData || pItem->itemSize < len) {
+		openavbMediaQHeadUnlock(pMediaQ);
+		pPvtData->txAsyncDropCount++;
+		AVB_LOGF_ERROR("BUS32 direct queue item too small: stream=%u idx=%u need=%zu item=%u",
+				pPvtData->streamUID, idx, len, pItem->itemSize);
+		return;
+	}
+
+	pItem->readIdx = 0;
+	pItem->dataLen = 0;
+	memcpy(pItem->pPubData, pSrc, len);
+	pItem->dataLen = (U32)len;
+
+	if (pItem->pPvtIntfData) {
+		bus32_item_meta_t *pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
+		pItemMeta->captureTimeValid = TRUE;
+		pItemMeta->captureStartNs = captureStartNs;
+	}
+
+	setTxItemTimestamp(pPvtData, pItem);
+	openavbMediaQHeadPush(pMediaQ);
+
+	pPvtData->txAsyncProducedCount++;
+	logEveryPackets = pPvtData->txCaptureDiagEveryPackets ? pPvtData->txCaptureDiagEveryPackets : 8000U;
+
+	if (droppedOldest ||
+			(pPvtData->txAsyncProducedCount % logEveryPackets) == 0ULL) {
+		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &nowNs);
+		captureAgeNs = (nowNs >= captureStartNs)
+			? (S64)(nowNs - captureStartNs)
+			: -((S64)(captureStartNs - nowNs));
+		AVB_LOGF_INFO(
+			"BUS32 direct queue %s: stream=%u idx=%u item_bytes=%zu capture=%llu now=%llu age=%lldns produced=%llu overwrites=%llu drops=%llu",
+			droppedOldest ? "overwrite" : "diag",
+			pPvtData->streamUID,
+			idx,
+			len,
+			(unsigned long long)captureStartNs,
+			(unsigned long long)nowNs,
+			(long long)captureAgeNs,
+			(unsigned long long)pPvtData->txAsyncProducedCount,
+			(unsigned long long)pPvtData->txAsyncOverwriteCount,
+			(unsigned long long)pPvtData->txAsyncDropCount);
+	}
+}
+
 static bool openCapturePcmLocked(const pvt_data_t *pPvtData,
 					 const media_q_pub_map_uncmp_audio_info_t *pInfo,
 					 const char *pMediaQDataFormat)
 {
 	snd_pcm_hw_params_t *hwParams = NULL;
+	snd_pcm_sw_params_t *swParams = NULL;
 	int rslt;
 	U32 rate;
 	snd_pcm_format_t fmt;
@@ -684,6 +758,33 @@ static bool openCapturePcmLocked(const pvt_data_t *pPvtData,
 		goto err;
 	}
 
+	rslt = snd_pcm_sw_params_malloc(&swParams);
+	if (rslt < 0) {
+		AVB_LOGF_ERROR("BUS32 split: snd_pcm_sw_params_malloc failed: %s", snd_strerror(rslt));
+		goto err;
+	}
+
+	rslt = snd_pcm_sw_params_current(g_mgr.pcmHandle, swParams);
+	if (rslt < 0) {
+		AVB_LOGF_ERROR("BUS32 split: snd_pcm_sw_params_current failed: %s", snd_strerror(rslt));
+		goto err;
+	}
+
+	rslt = snd_pcm_sw_params_set_tstamp_mode(g_mgr.pcmHandle, swParams, SND_PCM_TSTAMP_ENABLE);
+	if (rslt < 0) {
+		AVB_LOGF_WARNING("BUS32 split: set_tstamp_mode(enable) failed: %s", snd_strerror(rslt));
+	}
+	rslt = snd_pcm_sw_params_set_tstamp_type(g_mgr.pcmHandle, swParams, SND_PCM_TSTAMP_TYPE_MONOTONIC);
+	if (rslt < 0) {
+		AVB_LOGF_WARNING("BUS32 split: set_tstamp_type(monotonic) failed: %s", snd_strerror(rslt));
+	}
+
+	rslt = snd_pcm_sw_params(g_mgr.pcmHandle, swParams);
+	if (rslt < 0) {
+		AVB_LOGF_ERROR("BUS32 split: snd_pcm_sw_params failed: %s", snd_strerror(rslt));
+		goto err;
+	}
+
 	rslt = snd_pcm_prepare(g_mgr.pcmHandle);
 	if (rslt < 0) {
 		AVB_LOGF_ERROR("BUS32 split: snd_pcm_prepare failed: %s", snd_strerror(rslt));
@@ -701,6 +802,16 @@ static bool openCapturePcmLocked(const pvt_data_t *pPvtData,
 	g_mgr.bytesPerSample = alsaFormatBytesPerSample(fmt);
 	g_mgr.allowResampling = pPvtData->allowResampling;
 	g_mgr.periodTimeUsec = pPvtData->periodTimeUsec;
+	g_mgr.negotiatedPeriodUsec = 0;
+	g_mgr.negotiatedBufferUsec = 0;
+	g_mgr.negotiatedPeriodFrames = 0;
+	g_mgr.negotiatedBufferFrames = 0;
+	g_mgr.swStartThresholdFrames = 0;
+	g_mgr.swAvailMinFrames = 0;
+	g_mgr.lastPcmDelayFrames = 0;
+	g_mgr.lastPcmDelayNs = 0;
+	g_mgr.lastPcmAvailFrames = 0;
+	g_mgr.lastPcmSnapshotNs = 0;
 	g_mgr.framesPerRead = pInfo->framesPerItem;
 	if (g_mgr.framesPerRead == 0) {
 		g_mgr.framesPerRead = 12;
@@ -711,17 +822,22 @@ static bool openCapturePcmLocked(const pvt_data_t *pPvtData,
 	g_mgr.deviceName = strdup(pPvtData->pDeviceName);
 
 	snd_pcm_hw_params_free(hwParams);
+	snd_pcm_sw_params_free(swParams);
 	AVB_LOGF_INFO("BUS32 split capture ready: dev=%s rate=%u fmt=%d bytesPerSample=%u framesPerRead=%u",
 			g_mgr.deviceName ? g_mgr.deviceName : "(null)",
 			g_mgr.sampleRate,
 			g_mgr.sampleFormat,
 			g_mgr.bytesPerSample,
 			g_mgr.framesPerRead);
+	logCapturePcmNegotiatedLocked();
 	return TRUE;
 
 err:
 	if (hwParams) {
 		snd_pcm_hw_params_free(hwParams);
+	}
+	if (swParams) {
+		snd_pcm_sw_params_free(swParams);
 	}
 	if (g_mgr.pcmHandle) {
 		snd_pcm_close(g_mgr.pcmHandle);
@@ -765,7 +881,6 @@ static void *captureThreadFn(void *arg)
 	U32 frame;
 	U32 s;
 	U8 *srcFrame;
-	U64 captureEndNs;
 	U64 captureStartNs;
 
 	(void)arg;
@@ -839,8 +954,28 @@ static void *captureThreadFn(void *arg)
 			continue;
 		}
 
-		CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &captureEndNs);
-		captureStartNs = captureEndNs - bytesToDurationNs((size_t)rslt * bytesPerFrame, bytesPerFrame, sampleRate);
+		if (!deriveCaptureStartNsFromAlsa((U32)rslt, sampleRate, &captureStartNs)) {
+			U64 captureEndNs = 0;
+			CLOCK_GETTIME64(OPENAVB_CLOCK_WALLTIME, &captureEndNs);
+			captureStartNs = captureEndNs - bytesToDurationNs((size_t)rslt * bytesPerFrame, bytesPerFrame, sampleRate);
+			g_mgr.lastPcmSnapshotNs = captureEndNs;
+		}
+
+		if (g_mgr.pcmHandle) {
+			snd_pcm_sframes_t delayFrames = 0;
+			snd_pcm_sframes_t availFrames = 0;
+
+			if (snd_pcm_delay(g_mgr.pcmHandle, &delayFrames) == 0) {
+				g_mgr.lastPcmDelayFrames = (S64)delayFrames;
+				g_mgr.lastPcmDelayNs = (delayFrames > 0)
+					? framesToDurationNs((U64)delayFrames, sampleRate)
+					: 0;
+			}
+			availFrames = snd_pcm_avail_update(g_mgr.pcmHandle);
+			if (availFrames >= 0) {
+				g_mgr.lastPcmAvailFrames = (S64)availFrames;
+			}
+		}
 
 		/* Split interleaved 32ch -> 4 x interleaved 8ch */
 		for (frame = 0; frame < (U32)rslt; frame++) {
@@ -857,16 +992,14 @@ static void *captureThreadFn(void *arg)
 		pthread_mutex_lock(&g_mgr.lock);
 		for (s = 0; s < BUS32_MAX_STREAMS; s++) {
 			if (g_mgr.slot[s].active) {
-				slotWriteCaptureLocked(
+				slotPushDirectToMediaQLocked(
 					&g_mgr.slot[s],
+					s,
 					splitBuf[s],
 					(size_t)rslt * BUS32_STREAM_CHANNELS * bytesPerSample,
-					captureStartNs,
-					bytesPerFrame,
-					sampleRate);
+					captureStartNs);
 			}
 		}
-		pthread_cond_broadcast(&g_mgr.cond);
 		pthread_mutex_unlock(&g_mgr.lock);
 	}
 
@@ -977,6 +1110,7 @@ static bool registerStream(media_q_t *pMediaQ, pvt_data_t *pPvtData)
 	if (!g_mgr.slot[idx].active) {
 		g_mgr.slot[idx].active = TRUE;
 		g_mgr.slot[idx].owner = pPvtData;
+		g_mgr.slot[idx].pMediaQ = pMediaQ;
 		g_mgr.activeStreamCount++;
 	}
 	pPvtData->registered = TRUE;
@@ -1007,6 +1141,7 @@ static void unregisterStream(pvt_data_t *pPvtData)
 	if (g_mgr.slot[idx].active && g_mgr.slot[idx].owner == pPvtData) {
 		g_mgr.slot[idx].active = FALSE;
 		g_mgr.slot[idx].owner = NULL;
+		g_mgr.slot[idx].pMediaQ = NULL;
 		ringReset(&g_mgr.slot[idx].ring);
 		metaRingReset(&g_mgr.slot[idx].meta);
 		if (g_mgr.activeStreamCount > 0) {
@@ -1185,7 +1320,16 @@ void openavbIntfBus32SplitTxInitCB(media_q_t *pMediaQ)
 		}
 		pPvtData->itemMetaAllocated = TRUE;
 	}
+	openavbMediaQThreadSafeOn(pMediaQ);
 	pPvtData->intervalCounter = 0;
+	pPvtData->txAsyncProducedCount = 0;
+	pPvtData->txAsyncOverwriteCount = 0;
+	pPvtData->txAsyncDropCount = 0;
+	pPvtData->txCatchupFlushPending = TRUE;
+	pPvtData->txCatchupFlushCount = 0;
+	pPvtData->txStartupGovernorPacketsRemaining = 0;
+	pPvtData->txStartupTrimCount = 0;
+	pPvtData->txStartupTrimBytes = 0;
 	if (pPvtData->fixedTimestampEnabled) {
 		pthread_mutex_lock(&g_mgr.lock);
 		if (!ensureSharedFixedTsSeedLocked(pPvtData, pInfo)
@@ -1197,98 +1341,18 @@ void openavbIntfBus32SplitTxInitCB(media_q_t *pMediaQ)
 	if (!registerStream(pMediaQ, pPvtData)) {
 		AVB_LOG_ERROR("BUS32 split: stream registration failed");
 	}
+	else {
+		AVB_LOGF_INFO("BUS32 split direct producer enabled: uid=%u idx=%u framesPerItem=%u itemSize=%u",
+				pPvtData->streamUID,
+				pPvtData->streamIndex,
+				pInfo->framesPerItem,
+				pInfo->itemSize);
+	}
 }
 
 bool openavbIntfBus32SplitTxCB(media_q_t *pMediaQ)
 {
-	pvt_data_t *pPvtData;
-	media_q_pub_map_uncmp_audio_info_t *pInfo;
-	media_q_item_t *pItem;
-	size_t need;
-	U32 idx;
-	U64 captureStartNs = 0;
-	bool done = FALSE;
-
-	if (!pMediaQ) {
-		return TRUE;
-	}
-	pPvtData = (pvt_data_t *)pMediaQ->pPvtIntfInfo;
-	pInfo = (media_q_pub_map_uncmp_audio_info_t *)pMediaQ->pPubMapInfo;
-	if (!pPvtData || !pInfo || !pPvtData->registered || !pPvtData->streamIndexSet) {
-		return TRUE;
-	}
-
-	if ((pPvtData->intervalCounter++ % pInfo->packingFactor) != 0) {
-		return TRUE;
-	}
-
-	idx = pPvtData->streamIndex;
-	if (idx >= BUS32_MAX_STREAMS) {
-		return TRUE;
-	}
-
-	while (!done) {
-		pItem = openavbMediaQHeadLock(pMediaQ);
-		if (!pItem) {
-			break;
-		}
-		if (pItem->itemSize < pInfo->itemSize) {
-			openavbMediaQHeadUnlock(pMediaQ);
-			AVB_LOG_ERROR("BUS32 split: media queue item too small");
-			break;
-		}
-		if (pItem->dataLen == 0 && pItem->pPvtIntfData) {
-			bus32_item_meta_t *pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
-			pItemMeta->captureTimeValid = FALSE;
-			pItemMeta->captureStartNs = 0;
-		}
-
-		need = pInfo->itemSize - pItem->dataLen;
-		if (need == 0) {
-			setTxItemTimestamp(pPvtData, pItem);
-			openavbMediaQHeadPush(pMediaQ);
-			done = TRUE;
-			continue;
-		}
-
-		pthread_mutex_lock(&g_mgr.lock);
-		if (!g_mgr.slot[idx].active || g_mgr.stopThread || g_mgr.slot[idx].ring.fill < need) {
-			pthread_mutex_unlock(&g_mgr.lock);
-			openavbMediaQHeadUnlock(pMediaQ);
-			done = TRUE;
-			continue;
-		}
-
-		if (!slotReadCaptureLocked(&g_mgr.slot[idx],
-						 pItem->pPubData + pItem->dataLen,
-						 need,
-						 BUS32_STREAM_CHANNELS * g_mgr.bytesPerSample,
-						 g_mgr.sampleRate,
-						 &captureStartNs)) {
-			pthread_mutex_unlock(&g_mgr.lock);
-			openavbMediaQHeadUnlock(pMediaQ);
-			done = TRUE;
-			continue;
-		}
-		pthread_mutex_unlock(&g_mgr.lock);
-
-		if (pItem->dataLen == 0 && pItem->pPvtIntfData) {
-			bus32_item_meta_t *pItemMeta = (bus32_item_meta_t *)pItem->pPvtIntfData;
-			pItemMeta->captureTimeValid = TRUE;
-			pItemMeta->captureStartNs = captureStartNs;
-		}
-
-		pItem->dataLen += need;
-		if (pItem->dataLen < pInfo->itemSize) {
-			openavbMediaQHeadUnlock(pMediaQ);
-		}
-		else {
-			setTxItemTimestamp(pPvtData, pItem);
-			openavbMediaQHeadPush(pMediaQ);
-			done = TRUE;
-		}
-	}
-
+	(void)pMediaQ;
 	return TRUE;
 }
 
@@ -1425,6 +1489,18 @@ extern DLL_EXPORT bool openavbIntfBus32SplitInitialize(media_q_t *pMediaQ, opena
 	pPvtData->fixedTimestampEnabled = FALSE;
 	pPvtData->fixedTsRuntimeLeadUsec = BUS32_FIXED_TS_RUNTIME_LEAD_USEC_DEFAULT;
 	pPvtData->itemMetaAllocated = FALSE;
+	pPvtData->txCaptureDiagEveryPackets = 8000;
+	pPvtData->txCaptureDiagPacketCounter = 0;
+	pPvtData->txCaptureDiagLogCount = 0;
+	pPvtData->txCaptureStaleCount = 0;
+	pPvtData->txAsyncProducedCount = 0;
+	pPvtData->txAsyncOverwriteCount = 0;
+	pPvtData->txAsyncDropCount = 0;
+	pPvtData->txCatchupFlushPending = FALSE;
+	pPvtData->txCatchupFlushCount = 0;
+	pPvtData->txStartupGovernorPacketsRemaining = 0;
+	pPvtData->txStartupTrimCount = 0;
+	pPvtData->txStartupTrimBytes = 0;
 	pPvtData->registered = FALSE;
 	pPvtData->streamUID = 0;
 
