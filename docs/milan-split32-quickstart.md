@@ -191,7 +191,7 @@ That should produce the binaries used by `run_milan_stack_tmux.sh`:
 - `daemons/mrpd/mrpd`
 - `daemons/maap/linux/build/maap_daemon`
 - `daemons/shaper/shaper_daemon`
-- `lib/avtp_pipeline/build/bin/openavb_host`
+- `lib/avtp_pipeline/build/platform/Linux/avb_host/openavb_host`
 - `lib/avtp_pipeline/build_avdecc/platform/Linux/avb_avdecc/openavb_avdecc`
 
 ## 7. Start the split32 Milan stack

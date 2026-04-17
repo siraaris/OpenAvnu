@@ -92,9 +92,10 @@ char interface[IFNAMSIZ] = {0};
 int bandwidth_bps = 0;
 int classa_parent = 2, classb_parent=3;
 // mqprio creates classids 1:1..1:4 for num_tc=4.
-// Keep queue 0 for gPTP/control; steer Class A to queue 1 and Class B to queue 2.
+// Use queue 0 for gPTP/control, queue 1 for Class A media, queue 2 for
+// default/general traffic, and queue 3 as the placeholder Class B lane.
 char classa_parent_str[8] = "1:2";
-char classb_parent_str[8] = "1:3";
+char classb_parent_str[8] = "1:4";
 int classa_bw = 0, classb_bw = 0;
 int classa_max_frame_size = 0, classb_max_frame_size = 0;
 int classa_preset_bw = 0, classb_preset_bw = 0;
@@ -109,12 +110,15 @@ int tc_etf_checked = 0;
 int log_tc_commands = 0;
 char modprobe_path[128] = "modprobe";
 int root_qdisc_installed = 0;
+int root_qdisc_reconfigure_failed = 0;
 int exit_received = 0;
 int egress_qmap_enable = 0;
 int qmap_classa = -1;
 int qmap_classb = -1;
-int qmap_default = 3;
+int qmap_classb_explicit = 0;
+int qmap_default = 2;
 int qmap_gptp = 0;
+int qmap_control = -1;
 shaper_qdisc_mode_t classa_qdisc_mode = SHAPER_QDISC_CBS;
 shaper_qdisc_mode_t classb_qdisc_mode = SHAPER_QDISC_CBS;
 int classa_cbs_offload = 0;
@@ -125,13 +129,16 @@ int classb_cbs_offload = 0;
 long long classb_etf_delta_ns = 300000;
 int classb_etf_offload = 0;
 int classb_etf_skip_sock_check = 0;
+unsigned char classa_secondary_streams[256] = {0};
+int classa_secondary_stream_count = 0;
 // Default mqprio traffic-class map:
-//   prio 7/6 -> tc0 (gPTP/control, highest)
-//   prio 3   -> tc1 (Class A)
-//   prio 2   -> tc2 (Class B)
-//   all others -> tc3 (default/best effort)
-// gPTP ethertype is also pinned by flower filter when egress qmap is enabled.
-#define SHAPER_TC_MAP_DEFAULT "3 3 2 1 3 3 0 0 3 3 3 3 3 3 3 3"
+//   prio 7/6 -> tc0 (gPTP/control)
+//   prio 3   -> tc1 (Class A media)
+//   prio 2   -> tc3 (placeholder Class B lane)
+//   all others -> tc2 (default/general traffic)
+// Control-plane ethertypes/subtypes are also pinned to queue 0 when egress
+// queue mapping is enabled.
+#define SHAPER_TC_MAP_DEFAULT "2 2 3 1 2 2 0 0 2 2 2 2 2 2 2 2"
 char shaper_tc_map[64] = SHAPER_TC_MAP_DEFAULT;
 
 static int process_command(int sockfd, char command[]);
@@ -141,6 +148,8 @@ static int compute_cbs_params(int port_rate_bps, int idleslope_bps, int max_fram
 	int *sendslope_bps, int *hicredit, int *locredit);
 static int run_cmd(const char *cmd, int log_failure);
 static const char *qdisc_mode_name(shaper_qdisc_mode_t mode);
+static int class_qdisc_enabled(shaper_class_t class_type);
+static void clear_class_qdisc(int sockfd, const char *ifname, const char *parent, int handle);
 static int ensure_root_qdisc_installed(int sockfd, const char *ifname);
 static void preinit_interface_qdisc(const char *ifname);
 static void preseed_class_qdiscs(const char *ifname);
@@ -153,6 +162,7 @@ static void tc_cbs_etf_command(int sockfd, char interface[], const char *parent,
 	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int cbs_offload,
 	long long delta_ns, int etf_offload, int etf_skip_sock_check);
 static int parse_parent_queue_index(const char *parent);
+static int parse_stream_index_list(const char *text, unsigned char *selected, int selected_len);
 static void apply_egress_qmap_filters(const char *ifname);
 
 static void signal_handler(int signal)
@@ -786,6 +796,15 @@ static int has_mqprio_root(const char *ifname)
 	return run_cmd(cmd, 0) == 0;
 }
 
+static int mqprio_root_matches(const char *ifname)
+{
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd),
+		"%s qdisc show dev %s | tr -s ' ' | grep -Fq \"mqprio 1: root tc 4 map %s \"",
+		tc_path, ifname, shaper_tc_map);
+	return run_cmd(cmd, 0) == 0;
+}
+
 static int has_parent_qdisc(const char *ifname, const char *parent)
 {
 	char cmd[256];
@@ -794,21 +813,51 @@ static int has_parent_qdisc(const char *ifname, const char *parent)
 	return run_cmd(cmd, 0) == 0;
 }
 
+static int parent_qdisc_is_type(const char *ifname, const char *parent, const char *kind)
+{
+	char cmd[320];
+	snprintf(cmd, sizeof(cmd), "%s qdisc show dev %s | grep -Eq \"^qdisc %s [^\\n]* parent %s( |$)\"",
+		tc_path, ifname, kind, parent);
+	return run_cmd(cmd, 0) == 0;
+}
+
 static int ensure_root_qdisc_installed(int sockfd, const char *ifname)
 {
 	char tc_command[1000] = {0};
 	const char *mqprio_hw;
 	int hw = 0;
+	int root_exists = 0;
 
 	if (!ifname || ifname[0] == '\0' || skip_root_qdisc)
 	{
 		return 0;
 	}
+	if (root_qdisc_reconfigure_failed)
+	{
+		return -1;
+	}
 
-	if (root_qdisc_installed || has_mqprio_root(ifname))
+	root_exists = has_mqprio_root(ifname);
+	if ((root_qdisc_installed || root_exists) && mqprio_root_matches(ifname))
 	{
 		root_qdisc_installed = 1;
+		root_qdisc_reconfigure_failed = 0;
 		return 0;
+	}
+	if (root_qdisc_installed && !root_exists)
+	{
+		root_qdisc_installed = 0;
+	}
+	if (root_exists && !mqprio_root_matches(ifname))
+	{
+		SHAPER_LOGF_INFO("Bumping tc root on %s to apply traffic-class map: %s", ifname, shaper_tc_map);
+		cleanup_qdisc(ifname);
+		snprintf(tc_command, sizeof(tc_command), "%s qdisc del dev %s root >/dev/null 2>&1", tc_path, ifname);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+		run_cmd(tc_command, 0);
+		root_exists = 0;
+		root_qdisc_installed = 0;
 	}
 
 	mqprio_hw = getenv("SHAPER_MQPRIO_HW");
@@ -822,23 +871,19 @@ static int ensure_root_qdisc_installed(int sockfd, const char *ifname)
 	log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 	if (run_cmd(tc_command, 0) != 0)
 	{
-		if (has_mqprio_root(ifname))
-		{
-			root_qdisc_installed = 1;
-			return 0;
-		}
-
 		snprintf(tc_command, sizeof(tc_command), "%s qdisc replace dev %s root handle 1: mqprio num_tc 4 map %s queues 1@0 1@1 1@2 1@3 hw %d >/dev/null 2>&1", tc_path, ifname, shaper_tc_map, hw);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
 		if (run_cmd(tc_command, 1) != 0)
 		{
+			root_qdisc_reconfigure_failed = 1;
 			log_client_error_message(sockfd, "command(\"%s\") failed", tc_command);
 			return -1;
 		}
 	}
 
 	root_qdisc_installed = 1;
+	root_qdisc_reconfigure_failed = 0;
 	return 0;
 }
 
@@ -872,7 +917,14 @@ static void preseed_class_qdiscs(const char *ifname)
 	}
 
 	apply_seed_class_qdisc(-1, ifname, SHAPER_CLASS_A);
-	apply_seed_class_qdisc(-1, ifname, SHAPER_CLASS_B);
+	if (class_qdisc_enabled(SHAPER_CLASS_B))
+	{
+		apply_seed_class_qdisc(-1, ifname, SHAPER_CLASS_B);
+	}
+	else
+	{
+		clear_class_qdisc(-1, ifname, classb_parent_str, classb_parent);
+	}
 }
 
 static void apply_seed_class_qdisc(int sockfd, const char *ifname, shaper_class_t class_type)
@@ -894,6 +946,10 @@ static void apply_seed_class_qdisc(int sockfd, const char *ifname, shaper_class_
 	int etf_skip_sock_check = 0;
 
 	if (!ifname || ifname[0] == '\0' || link_speed_mbps <= 0)
+	{
+		return;
+	}
+	if (!class_qdisc_enabled(class_type))
 	{
 		return;
 	}
@@ -993,9 +1049,49 @@ static int parse_parent_queue_index(const char *parent)
 	return (int)class_hex - 1;
 }
 
+static int parse_stream_index_list(const char *text, unsigned char *selected, int selected_len)
+{
+	char *copy = NULL;
+	char *token = NULL;
+	char *saveptr = NULL;
+	int count = 0;
+
+	if (!text || !selected || selected_len <= 0)
+	{
+		return 0;
+	}
+
+	memset(selected, 0, (size_t)selected_len);
+	copy = strdup(text);
+	if (!copy)
+	{
+		return 0;
+	}
+
+	token = strtok_r(copy, ", ", &saveptr);
+	while (token)
+	{
+		char *end = NULL;
+		long value = strtol(token, &end, 10);
+		if (end != token && *end == '\0' && value >= 0 && value < selected_len)
+		{
+			if (!selected[value])
+			{
+				selected[value] = 1;
+				count++;
+			}
+		}
+		token = strtok_r(NULL, ", ", &saveptr);
+	}
+
+	free(copy);
+	return count;
+}
+
 static void apply_egress_qmap_filters(const char *ifname)
 {
 	char tc_command[1000] = {0};
+	int stream_index = 0;
 
 	if (!ifname || ifname[0] == '\0')
 	{
@@ -1021,7 +1117,7 @@ static void apply_egress_qmap_filters(const char *ifname)
 		return;
 	}
 
-	// Keep gPTP (ethertype 0x88f7) on a dedicated queue when configured.
+	// Keep gPTP on a dedicated queue when configured.
 	if (qmap_gptp >= 0)
 	{
 		snprintf(tc_command, sizeof(tc_command),
@@ -1031,12 +1127,61 @@ static void apply_egress_qmap_filters(const char *ifname)
 		run_cmd(tc_command, 0);
 	}
 
+	// Route remaining control-plane traffic explicitly only when requested.
+	if (qmap_control >= 0)
+	{
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x88f5 prio 6 flower action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_control);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x22f0 prio 7 u32 match u8 0x7a 0xff at 0 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_control);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x22f0 prio 8 u32 match u8 0x7b 0xff at 0 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_control);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x22f0 prio 9 u32 match u8 0x7c 0xff at 0 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_control);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+
+		snprintf(tc_command, sizeof(tc_command),
+			"%s filter add dev %s egress protocol 0x22f0 prio 10 u32 match u8 0xfe 0xff at 0 action skbedit queue_mapping %d >/dev/null 2>&1",
+			tc_path, ifname, qmap_control);
+		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+		run_cmd(tc_command, 0);
+	}
+
 	// OpenAvnu Qmgr encodes SR class in fwmark upper byte:
 	// Class A => 0x0100, Class B => 0x0200 (mask 0xff00).
+	if (qmap_classb >= 0 && classa_secondary_stream_count > 0)
+	{
+		for (stream_index = 0; stream_index < 256; ++stream_index)
+		{
+			if (!classa_secondary_streams[stream_index])
+			{
+				continue;
+			}
+			snprintf(tc_command, sizeof(tc_command),
+				"%s filter add dev %s egress protocol all prio 18 u32 match mark 0x%08x 0x0000ffff action skbedit queue_mapping %d >/dev/null 2>&1",
+				tc_path, ifname, 0x00000100 | stream_index, qmap_classb);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+			run_cmd(tc_command, 0);
+		}
+	}
 	if (qmap_classa >= 0)
 	{
 		snprintf(tc_command, sizeof(tc_command),
-			"%s filter add dev %s egress protocol all prio 10 u32 match mark 0x00000100 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
+			"%s filter add dev %s egress protocol all prio 20 u32 match mark 0x00000100 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
 			tc_path, ifname, qmap_classa);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		run_cmd(tc_command, 0);
@@ -1044,7 +1189,7 @@ static void apply_egress_qmap_filters(const char *ifname)
 	if (qmap_classb >= 0)
 	{
 		snprintf(tc_command, sizeof(tc_command),
-			"%s filter add dev %s egress protocol all prio 20 u32 match mark 0x00000200 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
+			"%s filter add dev %s egress protocol all prio 30 u32 match mark 0x00000200 0x0000ff00 action skbedit queue_mapping %d >/dev/null 2>&1",
 			tc_path, ifname, qmap_classb);
 		if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
 		run_cmd(tc_command, 0);
@@ -1074,6 +1219,43 @@ static const char *qdisc_mode_name(shaper_qdisc_mode_t mode)
 	}
 }
 
+static int class_qdisc_enabled(shaper_class_t class_type)
+{
+	if (class_type == SHAPER_CLASS_A)
+	{
+		return 1;
+	}
+
+	return qmap_classb >= 0 || classb_preset_active;
+}
+
+static void clear_class_qdisc(int sockfd, const char *ifname, const char *parent, int handle)
+{
+	char tc_command[1000] = {0};
+	char child_parent[16] = {0};
+	int child_handle = handle * 10;
+
+	if (!ifname || ifname[0] == '\0' || !parent || parent[0] == '\0')
+	{
+		return;
+	}
+
+	snprintf(child_parent, sizeof(child_parent), "%d:1", handle);
+	snprintf(tc_command, sizeof(tc_command),
+		"%s qdisc del dev %s parent %s handle %d: >/dev/null 2>&1",
+		tc_path, ifname, child_parent, child_handle);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+	log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+	run_cmd(tc_command, 0);
+
+	snprintf(tc_command, sizeof(tc_command),
+		"%s qdisc del dev %s parent %s handle %d: >/dev/null 2>&1",
+		tc_path, ifname, parent, handle);
+	if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", tc_command); }
+	log_client_debug_message(sockfd, "tc command:  \"%s\"", tc_command);
+	run_cmd(tc_command, 0);
+}
+
 static void tc_cbs_command(int sockfd, char interface[], const char *parent, int handle,
 	int idleslope_bps, int sendslope_bps, int hicredit, int locredit, int offload)
 {
@@ -1084,7 +1266,16 @@ static void tc_cbs_command(int sockfd, char interface[], const char *parent, int
 	int i;
 	if (has_parent_qdisc(interface, parent))
 	{
+		if (!parent_qdisc_is_type(interface, parent, "cbs"))
+		{
+			SHAPER_LOGF_INFO("Existing qdisc on %s parent %s is not CBS; clearing before CBS install",
+				interface, parent);
+			clear_class_qdisc(sockfd, interface, parent, handle);
+		}
+		else
+		{
 		verbs = verbs_replace_first;
+		}
 	}
 	for (i = 0; i < 3; ++i)
 	{
@@ -1139,11 +1330,6 @@ static void tc_cbs_etf_command(int sockfd, char interface[], const char *parent,
 	tc_cbs_command(sockfd, interface, parent, handle,
 		idleslope_bps, sendslope_bps, hicredit, locredit, cbs_offload);
 	snprintf(child_parent, sizeof(child_parent), "%d:1", handle);
-	if (has_parent_qdisc(interface, child_parent))
-	{
-		// ETF settings are static for the life of the run; avoid redundant reconfigure noise.
-		return;
-	}
 	tc_etf_command(sockfd, interface, child_parent, etf_handle,
 		delta_ns, etf_offload, etf_skip_sock_check);
 }
@@ -1152,9 +1338,29 @@ static void tc_etf_command(int sockfd, char interface[], const char *parent, int
 	long long delta_ns, int offload, int skip_sock_check)
 {
 	char tc_command[1000] = {0};
+	char delete_command[1000] = {0};
 	const char *verbs[] = {"add", "replace"};
 	int i;
 	int appended;
+
+	if (has_parent_qdisc(interface, parent))
+	{
+		if (!parent_qdisc_is_type(interface, parent, "etf"))
+		{
+			SHAPER_LOGF_INFO("Existing qdisc on %s parent %s is not ETF; clearing before ETF install",
+				interface, parent);
+			clear_class_qdisc(sockfd, interface, parent, handle);
+		}
+		else
+		{
+			snprintf(delete_command, sizeof(delete_command),
+				"%s qdisc del dev %s parent %s handle %d: >/dev/null 2>&1",
+				tc_path, interface, parent, handle);
+			if (log_tc_commands) { SHAPER_LOGF_INFO("tc: %s", delete_command); }
+			log_client_debug_message(sockfd, "tc command:  \"%s\"", delete_command);
+			run_cmd(delete_command, 0);
+		}
+	}
 
 	for (i = 0; i < 2; ++i)
 	{
@@ -1727,6 +1933,7 @@ int main (int argc, char *argv[])
 		const char *env_classb_qmap = getenv("SHAPER_CLASSB_QMAP");
 		const char *env_default_qmap = getenv("SHAPER_DEFAULT_QMAP");
 		const char *env_gptp_qmap = getenv("SHAPER_GPTP_QMAP");
+		const char *env_control_qmap = getenv("SHAPER_CONTROL_QMAP");
 		const char *env_classa_qdisc = getenv("SHAPER_CLASSA_QDISC");
 		const char *env_classb_qdisc = getenv("SHAPER_CLASSB_QDISC");
 		const char *env_classa_cbs_offload = getenv("SHAPER_CLASSA_CBS_OFFLOAD");
@@ -1738,6 +1945,7 @@ int main (int argc, char *argv[])
 		const char *env_classb_etf_offload = getenv("SHAPER_CLASSB_ETF_OFFLOAD");
 		const char *env_classb_etf_skip_sock_check = getenv("SHAPER_CLASSB_ETF_SKIP_SOCK_CHECK");
 		const char *env_tc_map = getenv("SHAPER_TC_MAP");
+		const char *env_classa_secondary_streams = getenv("SHAPER_CLASSA_SECONDARY_STREAMS");
 		const char *env_preset_classa_bw = getenv("SHAPER_PRESET_CLASSA_BW");
 		const char *env_preset_classa_max_frame = getenv("SHAPER_PRESET_CLASSA_MAX_FRAME");
 		const char *env_preset_classb_bw = getenv("SHAPER_PRESET_CLASSB_BW");
@@ -1771,6 +1979,7 @@ int main (int argc, char *argv[])
 		if (env_classb_qmap)
 		{
 			qmap_classb = atoi(env_classb_qmap);
+			qmap_classb_explicit = 1;
 		}
 		if (env_default_qmap)
 		{
@@ -1779,6 +1988,10 @@ int main (int argc, char *argv[])
 		if (env_gptp_qmap)
 		{
 			qmap_gptp = atoi(env_gptp_qmap);
+		}
+		if (env_control_qmap)
+		{
+			qmap_control = atoi(env_control_qmap);
 		}
 		if (env_classa_qdisc)
 		{
@@ -1855,6 +2068,15 @@ int main (int argc, char *argv[])
 			strncpy(shaper_tc_map, env_tc_map, sizeof(shaper_tc_map) - 1);
 			shaper_tc_map[sizeof(shaper_tc_map) - 1] = '\0';
 		}
+		if (env_classa_secondary_streams && *env_classa_secondary_streams)
+		{
+			classa_secondary_stream_count = parse_stream_index_list(env_classa_secondary_streams,
+				classa_secondary_streams, sizeof(classa_secondary_streams));
+			if (classa_secondary_stream_count <= 0)
+			{
+				SHAPER_LOGF_WARNING("Ignoring SHAPER_CLASSA_SECONDARY_STREAMS=%s", env_classa_secondary_streams);
+			}
+		}
 		if (env_preset_classa_bw && env_preset_classa_max_frame)
 		{
 			classa_preset_bw = atoi(env_preset_classa_bw);
@@ -1915,12 +2137,17 @@ int main (int argc, char *argv[])
 			{
 				qmap_classa = parse_parent_queue_index(classa_parent_str);
 			}
-			if (qmap_classb < 0)
+			if (!qmap_classb_explicit && qmap_classb < 0 && (classa_secondary_stream_count > 0 || classb_preset_active))
 			{
 				qmap_classb = parse_parent_queue_index(classb_parent_str);
 			}
-			SHAPER_LOGF_INFO("Egress qmap enabled: classA=%d classB=%d default=%d gPTP=%d",
-				qmap_classa, qmap_classb, qmap_default, qmap_gptp);
+			if (classa_secondary_stream_count > 0)
+			{
+				SHAPER_LOGF_INFO("Class A secondary lane: streams=%s qmap=%d",
+					env_classa_secondary_streams, qmap_classb);
+			}
+			SHAPER_LOGF_INFO("Egress qmap enabled: classA=%d classB=%d default=%d gPTP=%d control=%d",
+				qmap_classa, qmap_classb, qmap_default, qmap_gptp, qmap_control);
 		}
 		if (env_init_if && *env_init_if)
 		{
